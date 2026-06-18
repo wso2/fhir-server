@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/terminology"
+	"github.com/wso2/fhir-server/internal/terminology"
 )
 
 func TestClient_Expand(t *testing.T) {

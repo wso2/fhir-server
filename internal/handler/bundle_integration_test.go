@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/handler"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/testutil"
+	"github.com/wso2/fhir-server/internal/handler"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/store"
+	"github.com/wso2/fhir-server/internal/testutil"
 )
 
 // ─── Transaction: create with inter-entry reference resolution ─────────────────

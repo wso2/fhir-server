@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 func def(rt, name, typ string) searchparam.Definition {

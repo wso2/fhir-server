@@ -11,8 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/terminology"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/terminology"
 )
 
 // SearchParams are the parsed query parameters from the HTTP request.

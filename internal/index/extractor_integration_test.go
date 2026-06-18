@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/index"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/testutil"
+	"github.com/wso2/fhir-server/internal/index"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/testutil"
 )
 
 func setup(t *testing.T) (*index.Extractor, *pgxpool.Pool) {

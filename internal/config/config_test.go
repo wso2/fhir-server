@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/config"
+	"github.com/wso2/fhir-server/internal/config"
 )
 
 func TestLoad_Defaults(t *testing.T) {

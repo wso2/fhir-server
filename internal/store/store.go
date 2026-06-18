@@ -12,9 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/index"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/terminology"
+	"github.com/wso2/fhir-server/internal/index"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/terminology"
 )
 
 type Store struct {

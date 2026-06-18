@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
+	"github.com/wso2/fhir-server/internal/store"
 )
 
 // bundle handles POST /fhir/r4 — a system-level transaction or batch Bundle.

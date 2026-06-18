@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/db"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/seed"
+	"github.com/wso2/fhir-server/internal/db"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/seed"
 )
 
 // MustDB starts a PostgreSQL 16 container, runs schema migrations, and returns

@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/handler"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/handler"
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 // BenchmarkMetadata_FullR4 measures the end-to-end /metadata response time

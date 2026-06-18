@@ -6,8 +6,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/seed"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/testutil"
+	"github.com/wso2/fhir-server/internal/seed"
+	"github.com/wso2/fhir-server/internal/testutil"
 )
 
 func TestSeedSearchParams_InsertsRows(t *testing.T) {

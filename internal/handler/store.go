@@ -3,7 +3,7 @@ package handler
 import (
 	"context"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
+	"github.com/wso2/fhir-server/internal/store"
 )
 
 // StoreAPI is satisfied by *store.Store; extracted here so handlers can be

@@ -3,7 +3,7 @@ package fhirpath_test
 import (
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/fhirpath"
+	"github.com/wso2/fhir-server/internal/fhirpath"
 )
 
 // ─── Evaluate ────────────────────────────────────────────────────────────────

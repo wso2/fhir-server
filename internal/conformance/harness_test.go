@@ -32,11 +32,11 @@ import (
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/db"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/handler"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/seed"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
+	"github.com/wso2/fhir-server/internal/db"
+	"github.com/wso2/fhir-server/internal/handler"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/seed"
+	"github.com/wso2/fhir-server/internal/store"
 )
 
 // base is the FHIR base URL (…/fhir/r4) shared by every test. client is reused.

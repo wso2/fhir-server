@@ -6,7 +6,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/testutil"
+	"github.com/wso2/fhir-server/internal/testutil"
 )
 
 func TestMigrate_CreatesExpectedTables(t *testing.T) {

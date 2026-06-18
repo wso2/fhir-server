@@ -1,4 +1,4 @@
-module github.com/wso2/open-healthcare-fhir-server-go
+module github.com/wso2/fhir-server
 
 go 1.25.0
 

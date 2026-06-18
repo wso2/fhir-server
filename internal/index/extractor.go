@@ -13,8 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/fhirpath"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/fhirpath"
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 // Extractor extracts and persists search index rows for a resource.

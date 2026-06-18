@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
+	"github.com/wso2/fhir-server/internal/store"
 )
 
 func TestBundle_RoutesAndShapesTransactionResponse(t *testing.T) {

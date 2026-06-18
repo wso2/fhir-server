@@ -43,7 +43,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 const defaultRegistryURL = "https://packages.fhir.org"

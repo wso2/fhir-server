@@ -14,14 +14,14 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/config"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/db"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/handler"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/ig"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/seed"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/terminology"
+	"github.com/wso2/fhir-server/internal/config"
+	"github.com/wso2/fhir-server/internal/db"
+	"github.com/wso2/fhir-server/internal/handler"
+	"github.com/wso2/fhir-server/internal/ig"
+	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/seed"
+	"github.com/wso2/fhir-server/internal/store"
+	"github.com/wso2/fhir-server/internal/terminology"
 )
 
 func main() {

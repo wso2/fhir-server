@@ -8,8 +8,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/obs"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/obs"
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 // NewRouter constructs the chi router. validateOnWrite enables profile

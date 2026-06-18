@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
+	"github.com/wso2/fhir-server/internal/store"
 )
 
 // everythingType implements type-level $everything (GET /{type}/$everything for

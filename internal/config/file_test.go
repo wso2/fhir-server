@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/config"
+	"github.com/wso2/fhir-server/internal/config"
 )
 
 // writeConfig writes a YAML config to a temp file and returns its path.

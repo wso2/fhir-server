@@ -12,9 +12,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/store"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/terminology"
-	"github.com/wso2/open-healthcare-fhir-server-go/internal/testutil"
+	"github.com/wso2/fhir-server/internal/store"
+	"github.com/wso2/fhir-server/internal/terminology"
+	"github.com/wso2/fhir-server/internal/testutil"
 )
 
 func newStore(t *testing.T) *store.Store {
