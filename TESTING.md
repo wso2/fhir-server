@@ -1,4 +1,4 @@
-# Test Suite — open-healthcare-fhir-server-go
+# Test Suite — WSO2 FHIR Server
 
 ## Quick start
 

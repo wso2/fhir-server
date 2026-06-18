@@ -1367,7 +1367,7 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 		},
 		"implementationGuide": igURLs,
 		"software": map[string]any{
-			"name":    "open-healthcare-fhir-server-go",
+			"name":    "WSO2 FHIR Server",
 			"version": "1.0.0",
 		},
 		"rest": []any{map[string]any{
