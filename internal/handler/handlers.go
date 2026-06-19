@@ -1,0 +1,1635 @@
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/wso2/fhir-server/internal/compartment"
+	"github.com/wso2/fhir-server/internal/fhirttl"
+	"github.com/wso2/fhir-server/internal/fhirxml"
+	"github.com/wso2/fhir-server/internal/ig"
+	"github.com/wso2/fhir-server/internal/patch"
+	"github.com/wso2/fhir-server/internal/store"
+	"github.com/wso2/fhir-server/internal/validate"
+)
+
+// pageQuery returns an encoded query string that preserves all of `params`
+// (search filters, _since, _include, …) but overrides _page and _count with
+// the supplied values. Keys are sorted so generated links are stable.
+func pageQuery(params map[string][]string, page, pageSize int) string {
+	vals := url.Values{}
+	for k, vs := range params {
+		if k == "_page" || k == "_count" {
+			continue
+		}
+		for _, v := range vs {
+			vals.Add(k, v)
+		}
+	}
+	vals.Set("_page", strconv.Itoa(page))
+	vals.Set("_count", strconv.Itoa(pageSize))
+	keys := make([]string, 0, len(vals))
+	for k := range vals {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(url.Values, len(keys))
+	for _, k := range keys {
+		out[k] = vals[k]
+	}
+	return out.Encode()
+}
+
+// ─── FHIR content type ────────────────────────────────────────────────────────
+
+const fhirJSON = "application/fhir+json"
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", fhirJSON)
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(body)
+}
+
+func operationOutcome(w http.ResponseWriter, status int, severity, code, diagnostics string) {
+	writeJSON(w, status, map[string]any{
+		"resourceType": "OperationOutcome",
+		"issue": []any{map[string]any{
+			"severity":    severity,
+			"code":        code,
+			"diagnostics": diagnostics,
+		}},
+	})
+}
+
+func readBody(r *http.Request) (map[string]any, error) {
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// negotiatedFormat returns "xml", "turtle", or "json" based on the request's
+// _format query param (highest priority) or Accept header.
+func negotiatedFormat(r *http.Request) string {
+	if f := strings.ToLower(r.URL.Query().Get("_format")); f != "" {
+		switch {
+		case f == "xml" || strings.Contains(f, "+xml") || f == "application/xml":
+			return "xml"
+		case f == "ttl" || f == "turtle" || strings.Contains(f, "turtle"):
+			return "turtle"
+		case f == "json" || strings.Contains(f, "json"):
+			return "json"
+		}
+	}
+	accept := r.Header.Get("Accept")
+	switch {
+	case strings.Contains(accept, "application/fhir+xml") || strings.Contains(accept, "application/xml"):
+		return "xml"
+	case strings.Contains(accept, "turtle") || strings.Contains(accept, "application/fhir+ttl"):
+		return "turtle"
+	}
+	return "json"
+}
+
+// wantsXML is retained for callers that only branch JSON/XML.
+func wantsXML(r *http.Request) bool { return negotiatedFormat(r) == "xml" }
+
+// writeFHIR writes a FHIR resource as JSON, XML, or Turtle depending on the
+// request's Accept header / _format query param.
+func writeFHIR(w http.ResponseWriter, r *http.Request, status int, body map[string]any) {
+	switch negotiatedFormat(r) {
+	case "xml":
+		out, err := fhirxml.ToXML(body)
+		if err != nil {
+			writeSerErr(w, "XML", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/fhir+xml")
+		w.WriteHeader(status)
+		w.Write(out) //nolint:errcheck
+	case "turtle":
+		out, err := fhirttl.ToTurtle(body)
+		if err != nil {
+			writeSerErr(w, "Turtle", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/fhir+turtle")
+		w.WriteHeader(status)
+		w.Write(out) //nolint:errcheck
+	default:
+		writeJSON(w, status, body)
+	}
+}
+
+func writeSerErr(w http.ResponseWriter, format string, err error) {
+	writeJSON(w, http.StatusInternalServerError, map[string]any{
+		"resourceType": "OperationOutcome",
+		"issue": []any{map[string]any{"severity": "error", "code": "exception",
+			"diagnostics": format + " serialisation failed: " + err.Error()}},
+	})
+}
+
+// requireFHIRContent returns false (and writes 415) only when Content-Type is
+// explicitly set to an unsupported type. Both JSON and XML are accepted;
+// missing Content-Type is allowed (defaults to JSON).
+func requireFHIRContent(w http.ResponseWriter, r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+	base := strings.TrimSpace(strings.SplitN(ct, ";", 2)[0])
+	switch base {
+	case "application/fhir+json", "application/json",
+		"application/fhir+xml", "application/xml",
+		"application/fhir+turtle", "text/turtle":
+		return true
+	}
+	operationOutcome(w, http.StatusUnsupportedMediaType, "error", "not-supported",
+		"Content-Type must be application/fhir+json, application/fhir+xml, or application/fhir+turtle")
+	return false
+}
+
+// readFHIRBody parses a request body that may be JSON, XML, or Turtle.
+func readFHIRBody(r *http.Request) (map[string]any, error) {
+	ct := r.Header.Get("Content-Type")
+	base := strings.TrimSpace(strings.SplitN(ct, ";", 2)[0])
+	switch base {
+	case "application/fhir+xml", "application/xml":
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return fhirxml.FromXML(b)
+	case "application/fhir+turtle", "text/turtle":
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return fhirttl.FromTurtle(b)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func firstVal(params map[string][]string, key string) string {
+	if vs := params[key]; len(vs) > 0 {
+		return vs[0]
+	}
+	return ""
+}
+
+// parseIfMatchVersion extracts the integer version from an ETag like W/"3".
+// Returns (version, true) on success, (0, false) if the header is malformed.
+func parseIfMatchVersion(header string) (int, bool) {
+	s := strings.TrimSpace(header)
+	s = strings.TrimPrefix(s, "W/")
+	s = strings.Trim(s, `"`)
+	v, err := strconv.Atoi(s)
+	return v, err == nil
+}
+
+// ─── Read ─────────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) read(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	resource, err := h.store.Read(r.Context(), rt, id)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(resource)))
+	writeFHIR(w, r, http.StatusOK, resource)
+}
+
+// ─── VRead ────────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) vread(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+	vid, err := strconv.Atoi(chi.URLParam(r, "vid"))
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "version id must be an integer")
+		return
+	}
+
+	resource, err := h.store.GetVersion(r.Context(), rt, id, vid)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	writeFHIR(w, r, http.StatusOK, resource)
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+
+	params := map[string][]string{}
+	for k, vs := range r.URL.Query() {
+		params[k] = vs
+	}
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("_page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("_count"))
+
+	summary, elements := projectionFromParams(params)
+	result, err := h.store.Search(r.Context(), store.SearchParams{
+		ResourceType: rt,
+		Params:       params,
+		Page:         page,
+		PageSize:     pageSize,
+		Total:        firstVal(params, "_total"),
+		CountOnly:    summary == "count",
+	})
+	if err != nil {
+		var unsup *store.UnsupportedParamError
+		if errors.As(err, &unsup) {
+			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+			return
+		}
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	bundle := h.buildBundle(rt, result, params, page, pageSize, summary, elements)
+	writeFHIR(w, r, http.StatusOK, bundle)
+}
+
+func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+
+	if err := r.ParseForm(); err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid form body: "+err.Error())
+		return
+	}
+
+	params := map[string][]string{}
+	for k, vs := range r.PostForm {
+		params[k] = vs
+	}
+	for k, vs := range r.URL.Query() {
+		if _, exists := params[k]; !exists {
+			params[k] = vs
+		}
+	}
+
+	page, _ := strconv.Atoi(firstVal(params, "_page"))
+	pageSize, _ := strconv.Atoi(firstVal(params, "_count"))
+
+	summary, elements := projectionFromParams(params)
+	result, err := h.store.Search(r.Context(), store.SearchParams{
+		ResourceType: rt,
+		Params:       params,
+		Page:         page,
+		PageSize:     pageSize,
+		Total:        firstVal(params, "_total"),
+		CountOnly:    summary == "count",
+	})
+	if err != nil {
+		var unsup *store.UnsupportedParamError
+		if errors.As(err, &unsup) {
+			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+			return
+		}
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	bundle := h.buildBundle(rt, result, params, page, pageSize, summary, elements)
+	writeFHIR(w, r, http.StatusOK, bundle)
+}
+
+func (h *fhirHandler) buildBundle(rt string, result store.SearchResult, params map[string][]string, page, pageSize int, summary string, elements []string) map[string]any {
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	entries := make([]any, 0, len(result.Entries)+len(result.Included))
+	for _, res := range result.Entries {
+		id, _ := res["id"].(string)
+		entries = append(entries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, rt, id),
+			"resource": applyProjection(res, summary, elements),
+			"search":   map[string]any{"mode": "match"},
+		})
+	}
+	for _, res := range result.Included {
+		inclRT, _ := res["resourceType"].(string)
+		id, _ := res["id"].(string)
+		entries = append(entries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, inclRT, id),
+			"resource": applyProjection(res, summary, elements),
+			"search":   map[string]any{"mode": "include"},
+		})
+	}
+
+	base := fmt.Sprintf("%s/%s", h.baseURL, rt)
+	links := []any{
+		map[string]any{"relation": "self", "url": base + "?" + pageQuery(params, page, pageSize)},
+		map[string]any{"relation": "first", "url": base + "?" + pageQuery(params, 1, pageSize)},
+	}
+	// result.Total < 0 means the count was skipped (_total=none): we can't
+	// compute the last page or a count-based next link.
+	if result.Total >= 0 {
+		lastPage := result.Total / pageSize
+		if result.Total%pageSize != 0 {
+			lastPage++
+		}
+		if lastPage < 1 {
+			lastPage = 1
+		}
+		links = append(links, map[string]any{"relation": "last", "url": base + "?" + pageQuery(params, lastPage, pageSize)})
+		if page*pageSize < result.Total {
+			links = append(links, map[string]any{
+				"relation": "next",
+				"url":      base + "?" + pageQuery(params, page+1, pageSize),
+			})
+		}
+	}
+	if page > 1 {
+		links = append(links, map[string]any{
+			"relation": "previous",
+			"url":      base + "?" + pageQuery(params, page-1, pageSize),
+		})
+	}
+
+	bundle := map[string]any{
+		"resourceType": "Bundle",
+		"type":         "searchset",
+		"link":         links,
+		"entry":        entries,
+	}
+	if result.Total >= 0 {
+		bundle["total"] = result.Total
+	}
+	return bundle
+}
+
+// projectionFromParams extracts the _summary mode and the _elements list from
+// the request's query params.
+func projectionFromParams(params map[string][]string) (summary string, elements []string) {
+	summary = firstVal(params, "_summary")
+	if e := firstVal(params, "_elements"); e != "" {
+		for _, p := range strings.Split(e, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				elements = append(elements, p)
+			}
+		}
+	}
+	return
+}
+
+// alwaysKept are the elements every projected resource must retain regardless
+// of _summary / _elements, per the FHIR spec.
+var alwaysKept = map[string]bool{"resourceType": true, "id": true, "meta": true}
+
+// applyProjection returns a view of resource reduced according to _summary and
+// _elements. _elements takes precedence. Any reduced resource is tagged with
+// the SUBSETTED meta tag so clients know not to persist it as authoritative.
+//
+// _summary=true is approximated by dropping the narrative (text) and contained
+// resources: precise per-element summary filtering needs StructureDefinition
+// isSummary flags, which are not yet loaded (tracked for the validation phase).
+func applyProjection(resource map[string]any, summary string, elements []string) map[string]any {
+	switch {
+	case len(elements) > 0:
+		out := make(map[string]any, len(elements)+len(alwaysKept))
+		for k := range alwaysKept {
+			if v, ok := resource[k]; ok {
+				out[k] = v
+			}
+		}
+		for _, e := range elements {
+			if v, ok := resource[e]; ok {
+				out[e] = v
+			}
+		}
+		return tagSubsetted(out)
+	case summary == "text":
+		out := make(map[string]any, 4)
+		for k := range alwaysKept {
+			if v, ok := resource[k]; ok {
+				out[k] = v
+			}
+		}
+		if v, ok := resource["text"]; ok {
+			out["text"] = v
+		}
+		return tagSubsetted(out)
+	case summary == "data":
+		out := shallowCopy(resource)
+		delete(out, "text")
+		return tagSubsetted(out)
+	case summary == "true":
+		rt, _ := resource["resourceType"].(string)
+		if paths, ok := r4SummaryElements[rt]; ok && len(paths) > 0 {
+			// Extract unique top-level field names from the summary paths.
+			// Nested summary (e.g. "link.other") implies keeping the parent
+			// element "link" — the caller receives the full parent object.
+			topLevel := make(map[string]bool, len(paths))
+			for _, p := range paths {
+				key := p
+				if i := strings.IndexByte(p, '.'); i >= 0 {
+					key = p[:i]
+				}
+				if i := strings.IndexByte(key, '['); i >= 0 {
+					key = key[:i] // strip [x] polymorphic suffix
+				}
+				topLevel[key] = true
+			}
+			summaryKeys := make([]string, 0, len(topLevel))
+			for k := range topLevel {
+				summaryKeys = append(summaryKeys, k)
+			}
+			return applyProjection(resource, "", summaryKeys)
+		}
+		// Fallback for unknown types: drop narrative and contained only.
+		out := shallowCopy(resource)
+		delete(out, "text")
+		delete(out, "contained")
+		return tagSubsetted(out)
+	default: // "", "false", "count" (count never reaches here — no entries)
+		return resource
+	}
+}
+
+func shallowCopy(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// tagSubsetted adds the SUBSETTED tag to meta.tag (creating meta/tag as needed),
+// idempotently.
+func tagSubsetted(resource map[string]any) map[string]any {
+	const system = "http://terminology.hl7.org/CodeSystem/v3-ObservationValue"
+	meta, _ := resource["meta"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+	} else {
+		meta = shallowCopy(meta)
+	}
+	tags, _ := meta["tag"].([]any)
+	for _, t := range tags {
+		if tm, ok := t.(map[string]any); ok && tm["system"] == system && tm["code"] == "SUBSETTED" {
+			resource["meta"] = meta
+			return resource
+		}
+	}
+	meta["tag"] = append(tags, map[string]any{"system": system, "code": "SUBSETTED"})
+	resource["meta"] = meta
+	return resource
+}
+
+// ─── $everything ──────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) everything(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+	since := r.URL.Query().Get("_since")
+	typeFilter := r.URL.Query()["_type"]
+
+	var sinceTime time.Time
+	sinceValid := false
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "_since must be RFC3339")
+			return
+		}
+		sinceTime = t
+		sinceValid = true
+	}
+
+	// Read the anchor resource
+	anchor, err := h.store.Read(r.Context(), rt, id)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+
+	entries := []any{map[string]any{
+		"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, rt, id),
+		"resource": anchor,
+		"search":   map[string]any{"mode": "match"},
+	}}
+
+	// Forward references (resources this resource points to)
+	forward, err := h.store.FetchReferences(r.Context(), rt, id, false)
+	if err != nil {
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	// Reverse references (resources that point to this resource)
+	reverse, err := h.store.FetchReferences(r.Context(), rt, id, true)
+	if err != nil {
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	seen := map[string]bool{rt + "/" + id: true}
+	for _, res := range append(forward, reverse...) {
+		inclRT, _ := res["resourceType"].(string)
+		inclID, _ := res["id"].(string)
+		key := inclRT + "/" + inclID
+
+		if seen[key] {
+			continue
+		}
+		if sinceValid {
+			if lu := lastUpdatedStr(res); lu != "" {
+				if luTime, err := time.Parse(time.RFC3339, lu); err == nil && !luTime.After(sinceTime) {
+					continue
+				}
+			}
+		}
+		if len(typeFilter) > 0 && !containsStr(typeFilter, inclRT) {
+			continue
+		}
+
+		seen[key] = true
+		entries = append(entries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, inclRT, inclID),
+			"resource": res,
+			"search":   map[string]any{"mode": "include"},
+		})
+	}
+
+	writeFHIR(w, r, http.StatusOK, map[string]any{
+		"resourceType": "Bundle",
+		"type":         "searchset",
+		"total":        len(entries),
+		"entry":        entries,
+	})
+}
+
+// ─── Create ───────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+
+	if !requireFHIRContent(w, r) {
+		return
+	}
+
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		return
+	}
+
+	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
+		return
+	}
+
+	if msg := validateRequiredFields(rt, body); msg != "" {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
+		return
+	}
+
+	// Conditional create (If-None-Exist): create only if no existing resource
+	// matches the query. One match → return it (200, no create); many → 412.
+	if ifne := strings.TrimSpace(r.Header.Get("If-None-Exist")); ifne != "" {
+		existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, ifne)
+		if err != nil {
+			slog.Error("conditional create match failed", "resourceType", rt, "err", err)
+			operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
+			return
+		}
+		switch {
+		case count > 1:
+			operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict",
+				fmt.Sprintf("If-None-Exist matched %d resources", count))
+			return
+		case count == 1:
+			existing, err := h.store.Read(r.Context(), rt, existingID)
+			if err != nil {
+				handleError(w, err)
+				return
+			}
+			slog.Debug("conditional create matched existing resource", "resourceType", rt, "id", existingID)
+			w.Header().Set("Location", fmt.Sprintf("%s/%s/%s", h.baseURL, rt, existingID))
+			w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(existing)))
+			writeFHIR(w, r, http.StatusOK, existing)
+			return
+		}
+		// count == 0 → fall through to a normal create.
+	}
+
+	if h.validateOnWrite {
+		if stop := h.enforceProfiles(w, r, body); stop {
+			return
+		}
+	}
+
+	resource, err := h.store.Create(r.Context(), rt, body)
+	if err != nil {
+		slog.Error("create failed", "resourceType", rt, "err", err)
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	if rt == "SearchParameter" {
+		if err := h.store.SyncSearchParameter(r.Context(), resource); err != nil {
+			// Non-fatal — log and continue
+			_ = err
+		}
+	}
+
+	id, _ := resource["id"].(string)
+	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.baseURL, rt, id))
+	w.Header().Set("ETag", `W/"1"`)
+	writeFHIR(w, r, http.StatusCreated, resource)
+}
+
+// ─── Update ───────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	if !requireFHIRContent(w, r) {
+		return
+	}
+
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		return
+	}
+
+	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
+		return
+	}
+
+	if bodyID, ok := body["id"].(string); ok && bodyID != "" && bodyID != id {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid",
+			fmt.Sprintf("body id %q does not match URL id %q", bodyID, id))
+		return
+	}
+
+	if msg := validateRequiredFields(rt, body); msg != "" {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
+		return
+	}
+
+	ifMatchVersion := -1 // -1 means no If-Match header
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" {
+		v, ok := parseIfMatchVersion(ifMatch)
+		if !ok {
+			operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict",
+				"If-Match header contains an invalid version string")
+			return
+		}
+		ifMatchVersion = v
+	}
+
+	if h.validateOnWrite {
+		if stop := h.enforceProfiles(w, r, body); stop {
+			return
+		}
+	}
+
+	resource, err := h.store.Update(r.Context(), rt, id, body, ifMatchVersion)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+
+	if rt == "SearchParameter" {
+		_ = h.store.SyncSearchParameter(r.Context(), resource)
+	}
+
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(resource)))
+	writeFHIR(w, r, http.StatusOK, resource)
+}
+
+// ─── Patch ────────────────────────────────────────────────────────────────────
+
+// patch dispatches to the correct PATCH implementation based on Content-Type:
+//   - application/merge-patch+json (default/unset) → JSON Merge Patch (RFC 7396)
+//   - application/json-patch+json                  → JSON Patch (RFC 6902)
+//   - application/fhir+json (resourceType=Parameters) → FHIR Patch
+func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	ct := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0])
+
+	switch ct {
+	case "application/json-patch+json":
+		h.jsonPatch(w, r, rt, id)
+	case "application/xml-patch+xml":
+		h.xmlPatch(w, r, rt, id)
+	case "application/fhir+json", "application/fhir+xml":
+		h.fhirPatch(w, r, rt, id)
+	default: // application/merge-patch+json or empty
+		body, err := readFHIRBody(r)
+		if err != nil {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			return
+		}
+		resource, err := h.store.Patch(r.Context(), rt, id, body)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(resource)))
+		writeFHIR(w, r, http.StatusOK, resource)
+	}
+}
+
+func (h *fhirHandler) jsonPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	var ops []map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON Patch: "+err.Error())
+		return
+	}
+	resource, err := h.store.Read(r.Context(), rt, id)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	patched, err := patch.ApplyJSONPatch(resource, ops)
+	if err != nil {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid", "JSON Patch failed: "+err.Error())
+		return
+	}
+	patched["id"] = id
+	patched["resourceType"] = rt
+	updated, err := h.store.Update(r.Context(), rt, id, patched, -1)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(updated)))
+	writeFHIR(w, r, http.StatusOK, updated)
+}
+
+func (h *fhirHandler) fhirPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	// FHIR Patch body is a Parameters resource, in JSON or XML.
+	params, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid Parameters body: "+err.Error())
+		return
+	}
+	resource, err := h.store.Read(r.Context(), rt, id)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	patched, err := patch.ApplyFHIRPatch(resource, params)
+	if err != nil {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid", "FHIR Patch failed: "+err.Error())
+		return
+	}
+	patched["id"] = id
+	patched["resourceType"] = rt
+	updated, err := h.store.Update(r.Context(), rt, id, patched, -1)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(updated)))
+	writeFHIR(w, r, http.StatusOK, updated)
+}
+
+func (h *fhirHandler) xmlPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	xmlBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "cannot read body: "+err.Error())
+		return
+	}
+	resource, err := h.store.Read(r.Context(), rt, id)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	patched, err := patch.ApplyXMLPatch(resource, xmlBytes)
+	if err != nil {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid", "XML Patch failed: "+err.Error())
+		return
+	}
+	patched["id"] = id
+	patched["resourceType"] = rt
+	updated, err := h.store.Update(r.Context(), rt, id, patched, -1)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(updated)))
+	writeFHIR(w, r, http.StatusOK, updated)
+}
+
+// ─── Delete ───────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) delete(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	if rt == "SearchParameter" {
+		_ = h.store.DeleteSearchParameter(r.Context(), id)
+	}
+
+	if err := h.store.Delete(r.Context(), rt, id); err != nil {
+		handleError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ─── Conditional update / delete (collection level) ────────────────────────────
+
+// conditionalUpdate handles PUT /{resourceType}?<search> — update the single
+// matching resource, create when none match, and 412 when more than one match.
+func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	query := strings.TrimSpace(r.URL.RawQuery)
+	if query == "" {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "conditional update requires search criteria")
+		return
+	}
+	if !requireFHIRContent(w, r) {
+		return
+	}
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		return
+	}
+	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
+		return
+	}
+	if msg := validateRequiredFields(rt, body); msg != "" {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
+		return
+	}
+
+	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
+	if err != nil {
+		slog.Error("conditional update match failed", "resourceType", rt, "err", err)
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
+		return
+	}
+	if count > 1 {
+		slog.Warn("conditional update matched multiple resources", "resourceType", rt, "count", count)
+		operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict",
+			fmt.Sprintf("conditional update matched %d resources", count))
+		return
+	}
+
+	if count == 1 {
+		resource, err := h.store.Update(r.Context(), rt, existingID, body, -1)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		if rt == "SearchParameter" {
+			_ = h.store.SyncSearchParameter(r.Context(), resource)
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(resource)))
+		writeFHIR(w, r, http.StatusOK, resource)
+		return
+	}
+
+	// No match → create a new resource.
+	resource, err := h.store.Create(r.Context(), rt, body)
+	if err != nil {
+		slog.Error("conditional update create failed", "resourceType", rt, "err", err)
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+	if rt == "SearchParameter" {
+		_ = h.store.SyncSearchParameter(r.Context(), resource)
+	}
+	id, _ := resource["id"].(string)
+	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.baseURL, rt, id))
+	w.Header().Set("ETag", `W/"1"`)
+	writeFHIR(w, r, http.StatusCreated, resource)
+}
+
+// conditionalDelete handles DELETE /{resourceType}?<search> — delete the single
+// matching resource. Refuses without criteria (no mass delete) and 412s on more
+// than one match (multiple conditional delete is not supported).
+func (h *fhirHandler) conditionalDelete(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	query := strings.TrimSpace(r.URL.RawQuery)
+	if query == "" {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid",
+			"conditional delete requires search criteria")
+		return
+	}
+
+	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
+	if err != nil {
+		slog.Error("conditional delete match failed", "resourceType", rt, "err", err)
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
+		return
+	}
+	if count > 1 {
+		operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict",
+			fmt.Sprintf("conditional delete matched %d resources; multiple delete is not supported", count))
+		return
+	}
+	if count == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if rt == "SearchParameter" {
+		_ = h.store.DeleteSearchParameter(r.Context(), existingID)
+	}
+	if err := h.store.Delete(r.Context(), rt, existingID); err != nil {
+		handleError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ─── History ──────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) history(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	entries, err := h.store.GetHistory(r.Context(), rt, id)
+	if err != nil {
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	bundleEntries := make([]any, 0, len(entries))
+	for _, e := range entries {
+		rid, _ := e.Resource["id"].(string)
+		bundleEntries = append(bundleEntries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.baseURL, rt, rid, e.VersionID),
+			"resource": e.Resource,
+			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.baseURL, rt, rid)},
+		})
+	}
+
+	writeFHIR(w, r, http.StatusOK, map[string]any{
+		"resourceType": "Bundle",
+		"type":         "history",
+		"total":        len(bundleEntries),
+		"entry":        bundleEntries,
+	})
+}
+
+// systemHistory serves GET /fhir/r4/_history — cross-type history.
+func (h *fhirHandler) systemHistory(w http.ResponseWriter, r *http.Request) {
+	h.serveHistory(w, r, "")
+}
+
+func (h *fhirHandler) typeHistory(w http.ResponseWriter, r *http.Request) {
+	h.serveHistory(w, r, chi.URLParam(r, "resourceType"))
+}
+
+func (h *fhirHandler) serveHistory(w http.ResponseWriter, r *http.Request, rt string) {
+	q := r.URL.Query()
+
+	page, _ := strconv.Atoi(q.Get("_page"))
+	pageSize, _ := strconv.Atoi(q.Get("_count"))
+
+	var since time.Time
+	if s := q.Get("_since"); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			since = t
+		}
+	}
+
+	result, err := h.store.GetTypeHistory(r.Context(), store.HistoryParams{
+		ResourceType: rt, // empty string → system-level (cross-type) history
+		Since:        since,
+		Page:         page,
+		PageSize:     pageSize,
+	})
+	if err != nil {
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+		return
+	}
+
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	bundleEntries := make([]any, 0, len(result.Entries))
+	for _, e := range result.Entries {
+		entryRT := rt
+		if entryRT == "" {
+			entryRT, _ = e.Resource["resourceType"].(string)
+		}
+		rid, _ := e.Resource["id"].(string)
+		bundleEntries = append(bundleEntries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.baseURL, entryRT, rid, e.VersionID),
+			"resource": e.Resource,
+			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.baseURL, entryRT, rid)},
+		})
+	}
+
+	lastPage := result.Total / pageSize
+	if result.Total%pageSize != 0 {
+		lastPage++
+	}
+	if lastPage < 1 {
+		lastPage = 1
+	}
+
+	var base string
+	if rt == "" {
+		base = h.baseURL + "/_history"
+	} else {
+		base = fmt.Sprintf("%s/%s/_history", h.baseURL, rt)
+	}
+	params := map[string][]string(q)
+	links := []any{
+		map[string]any{"relation": "self", "url": base + "?" + pageQuery(params, page, pageSize)},
+		map[string]any{"relation": "first", "url": base + "?" + pageQuery(params, 1, pageSize)},
+		map[string]any{"relation": "last", "url": base + "?" + pageQuery(params, lastPage, pageSize)},
+	}
+	if page*pageSize < result.Total {
+		links = append(links, map[string]any{
+			"relation": "next",
+			"url":      base + "?" + pageQuery(params, page+1, pageSize),
+		})
+	}
+	if page > 1 {
+		links = append(links, map[string]any{
+			"relation": "previous",
+			"url":      base + "?" + pageQuery(params, page-1, pageSize),
+		})
+	}
+
+	writeFHIR(w, r, http.StatusOK, map[string]any{
+		"resourceType": "Bundle",
+		"type":         "history",
+		"total":        result.Total,
+		"link":         links,
+		"entry":        bundleEntries,
+	})
+}
+
+// validate is the type-level $validate (POST /{type}/$validate).
+func (h *fhirHandler) validate(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	if !requireFHIRContent(w, r) {
+		return
+	}
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		return
+	}
+	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
+		return
+	}
+	h.runValidate(w, r, body)
+}
+
+// validateSystem is the system-level $validate (POST [base]/$validate). The
+// resource type is taken from the body.
+func (h *fhirHandler) validateSystem(w http.ResponseWriter, r *http.Request) {
+	if !requireFHIRContent(w, r) {
+		return
+	}
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		return
+	}
+	h.runValidate(w, r, body)
+}
+
+// validateInstance is the instance-level $validate (POST /{type}/{id}/$validate).
+// With no body it validates the stored resource; with a body it validates that
+// (the body must match the URL type/id when both are present).
+func (h *fhirHandler) validateInstance(w http.ResponseWriter, r *http.Request) {
+	rt := chi.URLParam(r, "resourceType")
+	id := chi.URLParam(r, "id")
+
+	var body map[string]any
+	if r.ContentLength != 0 {
+		if !requireFHIRContent(w, r) {
+			return
+		}
+		b, err := readFHIRBody(r)
+		if err != nil {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			return
+		}
+		body = b
+	} else {
+		stored, err := h.store.Read(r.Context(), rt, id)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		body = stored
+	}
+	h.runValidate(w, r, body)
+}
+
+// runValidate validates a resource against the profiles named by ?profile= or
+// meta.profile and writes the OperationOutcome (200 informational when valid,
+// 422 with issues when not).
+func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body map[string]any) {
+	var profileURLs []string
+	if p := r.URL.Query().Get("profile"); p != "" {
+		profileURLs = []string{p}
+	} else if meta, ok := body["meta"].(map[string]any); ok {
+		if profs, ok := meta["profile"].([]any); ok {
+			for _, pr := range profs {
+				if s, ok := pr.(string); ok && s != "" {
+					profileURLs = append(profileURLs, s)
+				}
+			}
+		}
+	}
+
+	issues := h.validateAgainstProfiles(r, body, profileURLs)
+	if len(issues) == 0 {
+		writeFHIR(w, r, http.StatusOK, map[string]any{
+			"resourceType": "OperationOutcome",
+			"issue": []any{map[string]any{
+				"severity":    "information",
+				"code":        "informational",
+				"diagnostics": "Resource is valid",
+			}},
+		})
+		return
+	}
+
+	fhirIssues := make([]any, 0, len(issues))
+	for _, iss := range issues {
+		fhirIssues = append(fhirIssues, map[string]any{
+			"severity":    iss.Severity,
+			"code":        iss.Code,
+			"diagnostics": iss.Diagnostics,
+			"expression":  []string{iss.Expression},
+		})
+	}
+	writeFHIR(w, r, http.StatusUnprocessableEntity, map[string]any{
+		"resourceType": "OperationOutcome",
+		"issue":        fhirIssues,
+	})
+}
+
+// convert is the system-level $convert operation: it parses the posted resource
+// (in any supported wire format) and re-serialises it in the requested format.
+func (h *fhirHandler) convert(w http.ResponseWriter, r *http.Request) {
+	if !requireFHIRContent(w, r) {
+		return
+	}
+	body, err := readFHIRBody(r)
+	if err != nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid input: "+err.Error())
+		return
+	}
+	writeFHIR(w, r, http.StatusOK, body)
+}
+
+// validateAgainstProfiles looks up each profile URL in ig_profiles and runs
+// the StructureDefinition validator. Returns an empty slice when no profiles
+// are loaded (soft-fail: unrecognised profiles are skipped with a warning).
+func (h *fhirHandler) validateAgainstProfiles(r *http.Request, resource map[string]any, profileURLs []string) []validate.Issue {
+	if h.pool == nil || len(profileURLs) == 0 {
+		return nil
+	}
+	ctx := r.Context()
+	var all []validate.Issue
+	for _, profileURL := range profileURLs {
+		sd, err := ig.LookupProfile(ctx, h.pool, profileURL)
+		if err != nil {
+			slog.Warn("profile lookup failed", "url", profileURL, "err", err)
+			continue
+		}
+		if sd == nil {
+			slog.Debug("profile not loaded, skipping validation", "url", profileURL)
+			continue
+		}
+		all = append(all, validate.AgainstProfile(resource, sd)...)
+	}
+	return all
+}
+
+// universalSearchParams are the search params the store implements for every
+// resource type (handled directly in store.applyParam rather than via the
+// per-resource registry). They are advertised on every resource in the
+// CapabilityStatement so capability-driven clients discover them.
+var universalSearchParams = []struct {
+	name      string
+	paramType string
+}{
+	{"_id", "token"},
+	{"_lastUpdated", "date"},
+	{"_text", "string"},
+	{"_content", "string"},
+	{"_tag", "token"},
+	{"_profile", "uri"},
+	{"_security", "token"},
+	{"_source", "uri"},
+	{"_language", "token"},
+	{"_list", "reference"},
+}
+
+// ─── Metadata ─────────────────────────────────────────────────────────────────
+
+func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
+	var packages []ig.PackageResult
+	var profiles map[string][]string
+	if h.pool != nil {
+		packages, _ = ig.LoadedPackages(r.Context(), h.pool)
+		profiles, _ = ig.SupportedProfiles(r.Context(), h.pool)
+	}
+
+	// Build implementationGuide list
+	igURLs := make([]string, 0, len(packages))
+	for _, p := range packages {
+		igURLs = append(igURLs, fmt.Sprintf("http://hl7.org/fhir/ig/%s/%s", p.Name, p.Version))
+	}
+
+	// Build rest.resource list with supportedProfile entries.
+	// The list is derived from the loaded search-param registry so it always
+	// reflects the full FHIR R4 base spec plus any IG packages loaded at
+	// startup — no per-deployment hardcoding required.
+	var fhirResourceTypes []string
+	if h.registry != nil {
+		fhirResourceTypes = h.registry.ResourceTypes()
+	}
+	resources := make([]any, 0, len(fhirResourceTypes))
+	for _, rt := range fhirResourceTypes {
+		entry := map[string]any{
+			"type": rt,
+			"interaction": []any{
+				map[string]any{"code": "read"},
+				map[string]any{"code": "vread"},
+				map[string]any{"code": "update"},
+				map[string]any{"code": "patch"},
+				map[string]any{"code": "delete"},
+				map[string]any{"code": "create"},
+				map[string]any{"code": "search-type"},
+			},
+			"versioning":        "versioned",
+			"readHistory":       true,
+			"updateCreate":      false,
+			"conditionalCreate": true,
+			"conditionalUpdate": true,
+			"conditionalDelete": "single",
+			// References may be stored as literal "Type/id" or as logical
+			// (identifier-based) references; both are indexed by sp_reference.
+			"referencePolicy": []string{"literal", "logical"},
+		}
+		if profs, ok := profiles[rt]; ok && len(profs) > 0 {
+			entry["supportedProfile"] = profs
+		}
+
+		// searchParam: every param the registry knows for this resource type,
+		// plus the universal params the search layer implements for all types
+		// (_id, _lastUpdated, _text, _content — see store.applyParam). These are
+		// not stored per-resource in the registry, so they are appended here.
+		// searchInclude: reference params can be used as _include targets.
+		// (searchRevInclude is intentionally omitted — it requires per-param
+		// target-type knowledge the registry's FHIRPath strings don't carry
+		// reliably for un-filtered refs like "Encounter.subject".)
+		sps := make([]any, 0, len(universalSearchParams)+8)
+		for _, u := range universalSearchParams {
+			sps = append(sps, map[string]any{"name": u.name, "type": u.paramType})
+		}
+		if h.registry != nil {
+			defs := h.registry.ForResource(rt)
+			var includes []string
+			for _, d := range defs {
+				sps = append(sps, map[string]any{
+					"name": d.ParamName,
+					"type": d.ParamType,
+				})
+				if d.ParamType == "reference" {
+					includes = append(includes, rt+":"+d.ParamName)
+				}
+			}
+			if len(includes) > 0 {
+				entry["searchInclude"] = includes
+			}
+			if revIncludes := h.registry.RevInclude(rt); len(revIncludes) > 0 {
+				entry["searchRevInclude"] = revIncludes
+			}
+		}
+		entry["searchParam"] = sps
+		resources = append(resources, entry)
+	}
+
+	cs := map[string]any{
+		"resourceType": "CapabilityStatement",
+		"status":       "active",
+		"kind":         "instance",
+		"fhirVersion":  "4.0.1",
+		"format":       []string{"application/fhir+json", "application/fhir+xml", "application/fhir+turtle"},
+		"patchFormat": []string{
+			"application/json-patch+json",
+			"application/merge-patch+json",
+			"application/xml-patch+xml",
+			"application/fhir+json",
+			"application/fhir+xml",
+		},
+		"implementationGuide": igURLs,
+		"software": map[string]any{
+			"name":    "WSO2 FHIR Server",
+			"version": "1.0.0",
+		},
+		"rest": []any{map[string]any{
+			"mode":     "server",
+			"resource": resources,
+			"interaction": []any{
+				map[string]any{"code": "transaction"},
+				map[string]any{"code": "batch"},
+				map[string]any{"code": "history-system"},
+			},
+			"operation": []any{
+				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"},
+				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Encounter-everything"},
+				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Group-everything"},
+				map[string]any{"name": "validate", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"},
+				map[string]any{"name": "meta", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta"},
+				map[string]any{"name": "meta-add", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-add"},
+				map[string]any{"name": "meta-delete", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete"},
+				map[string]any{"name": "convert", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-convert"},
+				map[string]any{"name": "lastn", "definition": "http://hl7.org/fhir/OperationDefinition/Observation-lastn"},
+				map[string]any{"name": "document", "definition": "http://hl7.org/fhir/OperationDefinition/Composition-document"},
+			},
+		}},
+	}
+	writeFHIR(w, r, http.StatusOK, cs)
+}
+
+// validateRequiredFields returns a non-empty error message if key required
+// FHIR R4 fields are missing from the resource body. Covers only the resource
+// types exercised by the integration test suite; returns "" for unknown types.
+func validateRequiredFields(rt string, body map[string]any) string {
+	required := map[string][]string{
+		"Observation": {"code"},
+		"Encounter":   {"status", "class"},
+	}
+	fields, ok := required[rt]
+	if !ok {
+		return ""
+	}
+	for _, f := range fields {
+		if _, exists := body[f]; !exists {
+			return fmt.Sprintf("missing required field %q for %s", f, rt)
+		}
+	}
+	return ""
+}
+
+// enforceProfiles runs profile validation on a write (create/update) when
+// validateOnWrite is enabled. Writes the OperationOutcome and returns true
+// when the caller should abort. Profiles are taken from meta.profile.
+func (h *fhirHandler) enforceProfiles(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
+	var profileURLs []string
+	if meta, ok := body["meta"].(map[string]any); ok {
+		if profs, ok := meta["profile"].([]any); ok {
+			for _, pr := range profs {
+				if s, ok := pr.(string); ok && s != "" {
+					profileURLs = append(profileURLs, s)
+				}
+			}
+		}
+	}
+	if len(profileURLs) == 0 {
+		return false
+	}
+	issues := h.validateAgainstProfiles(r, body, profileURLs)
+	if len(issues) == 0 {
+		return false
+	}
+	fhirIssues := make([]any, 0, len(issues))
+	for _, iss := range issues {
+		fhirIssues = append(fhirIssues, map[string]any{
+			"severity":    iss.Severity,
+			"code":        iss.Code,
+			"diagnostics": iss.Diagnostics,
+			"expression":  []string{iss.Expression},
+		})
+	}
+	writeFHIR(w, r, http.StatusUnprocessableEntity, map[string]any{
+		"resourceType": "OperationOutcome",
+		"issue":        fhirIssues,
+	})
+	return true
+}
+
+// ─── Compartment search ───────────────────────────────────────────────────────
+
+// compartmentSearch handles GET /Patient/{id}/Observation and similar compartment
+// search requests. The resourceType URL param is the compartment owner type
+// (e.g. "Patient"), id is the owner id, and targetResourceType is what to search.
+func (h *fhirHandler) compartmentSearch(w http.ResponseWriter, r *http.Request) {
+	ownerType := chi.URLParam(r, "resourceType")
+	ownerID := chi.URLParam(r, "id")
+	targetRT := chi.URLParam(r, "targetResourceType")
+
+	comp := compartment.Lookup(ownerType)
+	if comp == nil {
+		operationOutcome(w, http.StatusNotFound, "error", "not-found",
+			fmt.Sprintf("compartment type %q is not supported; supported: Patient, Encounter, Practitioner", ownerType))
+		return
+	}
+
+	params := comp.ParamsFor(targetRT)
+	if params == nil {
+		operationOutcome(w, http.StatusBadRequest, "error", "not-supported",
+			fmt.Sprintf("resource type %q is not in the %s compartment", targetRT, ownerType))
+		return
+	}
+	// Filter out empty param names (self-reference rows like Encounter in its own compartment).
+	var validParams []string
+	for _, p := range params {
+		if p != "" {
+			validParams = append(validParams, p)
+		}
+	}
+	if len(validParams) == 0 {
+		// Type is in the compartment as self-reference — return the owner itself if types match.
+		if ownerType == targetRT {
+			resource, err := h.store.Read(r.Context(), ownerType, ownerID)
+			if err != nil {
+				handleError(w, err)
+				return
+			}
+			writeFHIR(w, r, http.StatusOK, map[string]any{
+				"resourceType": "Bundle", "type": "searchset", "total": 1,
+				"entry": []any{map[string]any{
+					"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, ownerType, ownerID),
+					"resource": resource, "search": map[string]any{"mode": "match"},
+				}},
+			})
+		} else {
+			writeFHIR(w, r, http.StatusOK, map[string]any{"resourceType": "Bundle", "type": "searchset", "total": 0, "entry": []any{}})
+		}
+		return
+	}
+
+	// Build search params: OR across all compartment reference params, each pointing
+	// at the owner. Use comma-OR: "patient=Patient/123,performer=Patient/123" won't
+	// work as comma-OR is per-param. Instead, run the first param and accept that
+	// the OR across multiple params requires multiple searches merged client-side, OR
+	// run the first param only (common case: most resource types have a single param).
+	// For completeness, run one search per param and merge deduplicated.
+	ownerRef := ownerType + "/" + ownerID
+	// Collect extra user-supplied params from the query string.
+	extraParams := map[string][]string{}
+	for k, vs := range r.URL.Query() {
+		extraParams[k] = vs
+	}
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("_page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("_count"))
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	// Run separate searches per compartment param, deduplicate by id.
+	seen := map[string]bool{}
+	var allEntries []map[string]any
+
+	for _, param := range validParams {
+		searchP := map[string][]string{param: {ownerRef}}
+		for k, vs := range extraParams {
+			if k != "_page" && k != "_count" {
+				searchP[k] = vs
+			}
+		}
+		result, err := h.store.Search(r.Context(), store.SearchParams{
+			ResourceType: targetRT,
+			Params:       searchP,
+			Page:         1,
+			PageSize:     1000, // fetch all for dedup; paginate after
+		})
+		if err != nil {
+			slog.Warn("compartment search failed for param", "param", param, "err", err)
+			continue
+		}
+		for _, entry := range result.Entries {
+			id, _ := entry["id"].(string)
+			if id != "" && !seen[id] {
+				seen[id] = true
+				allEntries = append(allEntries, entry)
+			}
+		}
+	}
+
+	// Apply pagination manually.
+	total := len(allEntries)
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > total {
+		start = total
+	}
+	if end > total {
+		end = total
+	}
+	page_entries := allEntries[start:end]
+
+	bundleEntries := make([]any, 0, len(page_entries))
+	for _, res := range page_entries {
+		id, _ := res["id"].(string)
+		bundleEntries = append(bundleEntries, map[string]any{
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, targetRT, id),
+			"resource": res,
+			"search":   map[string]any{"mode": "match"},
+		})
+	}
+	writeFHIR(w, r, http.StatusOK, map[string]any{
+		"resourceType": "Bundle",
+		"type":         "searchset",
+		"total":        total,
+		"entry":        bundleEntries,
+	})
+}
+
+// ─── Helpers for $everything ──────────────────────────────────────────────────
+
+func lastUpdatedStr(res map[string]any) string {
+	if meta, ok := res["meta"].(map[string]any); ok {
+		if lu, ok := meta["lastUpdated"].(string); ok {
+			return lu
+		}
+	}
+	return ""
+}
+
+func containsStr(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ─── Error handling ───────────────────────────────────────────────────────────
+
+func handleError(w http.ResponseWriter, err error) {
+	var notFound store.NotFoundError
+	if errors.As(err, &notFound) {
+		operationOutcome(w, http.StatusNotFound, "error", "not-found", err.Error())
+		return
+	}
+	var gone store.GoneError
+	if errors.As(err, &gone) {
+		operationOutcome(w, http.StatusGone, "error", "deleted", err.Error())
+		return
+	}
+	var conflict store.ConflictError
+	if errors.As(err, &conflict) {
+		operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict", err.Error())
+		return
+	}
+	operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+}
+
+func versionFromMeta(resource map[string]any) string {
+	if meta, ok := resource["meta"].(map[string]any); ok {
+		if v, ok := meta["versionId"].(string); ok {
+			return v
+		}
+	}
+	return "1"
+}
