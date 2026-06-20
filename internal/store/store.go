@@ -101,9 +101,15 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 		_ = br.Close()
 		return nil, fmt.Errorf("insert resource: %w", err)
 	}
-	for i := 0; i < spCount; i++ { // sp_* INSERTs (non-fatal)
+	for i := 0; i < spCount; i++ { // sp_* INSERTs
 		if _, err := br.Exec(); err != nil {
-			slog.Warn("index insert", "type", resourceType, "i", i, "err", err)
+			// Index inserts share this transaction with the resource and history
+			// writes, so a failure here must abort the whole create — otherwise the
+			// transaction is left poisoned (the history insert below would fail with
+			// a misleading error) and a resource could be persisted with an
+			// incomplete search index.
+			_ = br.Close()
+			return nil, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
 		}
 	}
 	if _, err := br.Exec(); err != nil { // history INSERT
@@ -213,9 +219,13 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 		}
 	}
 	spInsertCount := spInsertEnd - 1 - nDeletes // 1 UPDATE + nDeletes DELETEs precede the sp_* INSERTs
-	for i := 0; i < spInsertCount; i++ {        // sp_* INSERTs (non-fatal)
+	for i := 0; i < spInsertCount; i++ {        // sp_* INSERTs
 		if _, err := br.Exec(); err != nil {
-			slog.Warn("index insert", "type", resourceType, "i", i, "err", err)
+			// Fatal for the same reason as in createInTx: a failed index insert
+			// poisons this transaction, so the update must roll back atomically
+			// rather than persist a resource with a stale/incomplete index.
+			_ = br.Close()
+			return nil, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
 		}
 	}
 	if _, err := br.Exec(); err != nil { // history INSERT
@@ -315,9 +325,13 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 		}
 	}
 	spInsertCount := spInsertEnd - 1 - nDeletes
-	for i := 0; i < spInsertCount; i++ { // sp_* INSERTs (non-fatal)
+	for i := 0; i < spInsertCount; i++ { // sp_* INSERTs
 		if _, err := br.Exec(); err != nil {
-			slog.Warn("index insert", "type", resourceType, "i", i, "err", err)
+			// Fatal for the same reason as in createInTx: a failed index insert
+			// poisons this transaction, so the patch must roll back atomically
+			// rather than persist a resource with a stale/incomplete index.
+			_ = br.Close()
+			return nil, 0, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
 		}
 	}
 	if _, err := br.Exec(); err != nil { // history INSERT
