@@ -1,0 +1,4 @@
+# Code owners for wso2/fhir-server.
+# Owners are automatically requested for review on PRs that touch matching paths.
+
+* @nirmal070125 @sameeragunarathne

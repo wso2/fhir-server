@@ -1,3 +1,19 @@
+// Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
+//
+// WSO2 LLC. licenses this file to you under the Apache License,
+// Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // Package validate walks a FHIR StructureDefinition's snapshot.element list
 // and checks a resource map against the constraints it encodes:
 //
@@ -199,7 +215,6 @@ func checkSlicing(resource map[string]any, elements []any, sd map[string]any) []
 		min     int
 	}
 	sliceGroups := map[string][]sliceEntry{}
-	slicedPaths := map[string]bool{}
 
 	for _, raw := range elements {
 		el, _ := raw.(map[string]any)
@@ -210,23 +225,15 @@ func checkSlicing(resource map[string]any, elements []any, sd map[string]any) []
 		if path == "" {
 			continue
 		}
-		// Element has slicing definition — mark the path as sliced.
-		if _, hasSlicing := el["slicing"]; hasSlicing {
-			slicedPaths[path] = true
-		}
 		// Element is a named slice (has sliceName).
 		sliceName, _ := el["sliceName"].(string)
 		if sliceName == "" {
 			continue
 		}
-		// Find base path (strip slice name suffix — path for a slice is the
-		// same as its parent path, e.g. "Observation.category").
-		// Slices share the path with their parent; we use the parent path as key.
+		// A slice shares the path with its parent element (e.g. a slice of
+		// "Observation.category" also has path "Observation.category"), so we
+		// group slices by that shared path.
 		basePath := path
-		if !slicedPaths[basePath] {
-			// Find the parent by stripping the last segment if it looks like a slice.
-			// In practice the path IS the parent path — just collect by path.
-		}
 		se := sliceEntry{name: sliceName}
 		if m, ok := el["min"].(float64); ok {
 			se.min = int(m)

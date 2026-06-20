@@ -1,0 +1,44 @@
+# golangci-lint configuration for wso2/fhir-server.
+# Run locally with `make lint` (or `golangci-lint run`).
+version: "2"
+
+linters:
+  # Curated default set (errcheck, govet, ineffassign, staticcheck, unused)
+  # plus a couple of high-signal additions.
+  default: standard
+  enable:
+    - misspell # common spelling mistakes in comments/strings
+    - unconvert # redundant type conversions
+
+  settings:
+    errcheck:
+      # Bounded allowlist of best-effort calls whose error is conventionally
+      # ignored. errcheck still gates every other call site.
+      exclude-functions:
+        - (github.com/jackc/pgx/v5.Tx).Rollback # deferred rollback after commit
+        - (*encoding/xml.Encoder).EncodeToken # buffer-backed; cannot fail in practice
+        - (*encoding/xml.Decoder).Skip
+        - fmt.Sscanf # parse helpers fall back to a default on failure
+        # writeJSON encodes to the ResponseWriter; surfacing this error is the
+        # proper fix (tracked as a follow-up) rather than crashing the response.
+        - (*encoding/json.Encoder).Encode
+
+  exclusions:
+    # Built-in preset that ignores the conventional best-effort calls
+    # (deferred Close/Rollback, fmt.Print*, etc.) which are idiomatic to leave
+    # unchecked. Tighten later if desired.
+    presets:
+      - std-error-handling
+    rules:
+      # QF1002/QF1012 are staticcheck's opinionated "quickfix" style hints;
+      # cosmetic and not worth gating CI on. All correctness checks stay on.
+      - linters: [staticcheck]
+        text: "QF1002|QF1012"
+      # Test code routinely ignores errors from best-effort calls (response
+      # encode/decode, fixture writes, CRUD in arrange steps); don't gate on it.
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt
