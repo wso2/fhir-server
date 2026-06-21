@@ -1,3 +1,19 @@
+// Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
+//
+// WSO2 LLC. licenses this file to you under the Apache License,
+// Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // Package patch implements JSON Patch (RFC 6902) and FHIR Patch applied to
 // FHIR resource maps.
 //
@@ -171,7 +187,7 @@ func ApplyFHIRPatch(doc map[string]any, params map[string]any) (map[string]any, 
 			// insert: add value at a specific array index. parts["index"] is the
 			// position (integer), parts["value"] is the value to insert.
 			val := fhirParamValue(parts)
-			idxRaw, _ := parts["index"]
+			idxRaw := parts["index"]
 			var idx int
 			switch v := idxRaw.(type) {
 			case float64:
@@ -187,8 +203,8 @@ func ApplyFHIRPatch(doc map[string]any, params map[string]any) (map[string]any, 
 		case "reorder":
 			// reorder: parts["index"] is the new position for the element currently
 			// at parts["source"] index. Move from source to destination index.
-			srcIdxRaw, _ := parts["source"]
-			dstIdxRaw, _ := parts["index"]
+			srcIdxRaw := parts["source"]
+			dstIdxRaw := parts["index"]
 			var srcIdx, dstIdx int
 			switch v := srcIdxRaw.(type) {
 			case float64:
