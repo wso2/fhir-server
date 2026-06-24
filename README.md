@@ -71,9 +71,19 @@ docker-compose down -v
 **Prerequisites:** Go 1.25+, PostgreSQL 13+ running locally
 
 ```bash
-# Create the database
-psql -U postgres -c "CREATE USER fhir WITH PASSWORD 'fhir';"
-psql -U postgres -c "CREATE DATABASE fhirdb OWNER fhir;"
+# Create the role and database as a PostgreSQL superuser.
+# Pick the block that matches how you installed PostgreSQL:
+
+# --- macOS (Homebrew) ---
+# Your OS user is the superuser; there is no "postgres" role, so connect
+# with `psql postgres`. (Using `-U postgres` fails: role "postgres" does not exist.)
+psql postgres -c "CREATE USER fhir WITH PASSWORD 'fhir';"
+psql postgres -c "CREATE DATABASE fhirdb OWNER fhir;"
+
+# --- Debian / Ubuntu / RHEL (apt/yum packages) ---
+# The superuser is the "postgres" OS/DB role; run psql via sudo -u postgres.
+sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
+sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
 
 # Option A — point the server at a YAML config file
 cp config.example.yaml config.yaml      # then edit as needed
