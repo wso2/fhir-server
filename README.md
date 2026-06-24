@@ -14,13 +14,14 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 2. [Running Without Docker](#2-running-without-docker)
 3. [Configuration Reference](#3-configuration-reference)
 4. [Architecture](#4-architecture)
-5. [Database Schema](#5-database-schema)
-6. [API Reference](#6-api-reference)
-7. [Search Parameters](#7-search-parameters)
-8. [Terminology](#8-terminology)
-9. [Implementation Guides](#9-implementation-guides)
-10. [Testing](#10-testing)
-11. [Extending the Server](#11-extending-the-server)
+5. [Multi-Tenancy](#5-multi-tenancy)
+6. [Database Schema](#6-database-schema)
+7. [API Reference](#7-api-reference)
+8. [Search Parameters](#8-search-parameters)
+9. [Terminology](#9-terminology)
+10. [Implementation Guides](#10-implementation-guides)
+11. [Testing](#11-testing)
+12. [Extending the Server](#12-extending-the-server)
 
 ---
 
@@ -163,7 +164,7 @@ ig:
 | YAML key | Env var | Default | Description |
 |---|---|---|---|
 | `server.port` | `SERVER_PORT` | `9090` | HTTP listen port |
-| `server.baseUrl` | `BASE_URL` | `http://localhost:{port}/fhir/r4` | Canonical server base URL. Written into bundle `link` URLs and the CapabilityStatement. Must match the address clients use. |
+| `server.baseUrl` | `BASE_URL` | `http://localhost:{port}/fhir/r4` | Canonical server base URL. Written into bundle `link` URLs and the CapabilityStatement. Must match the address clients use. For multi-tenant requests the `/t/{tenant}` prefix is inserted automatically (see [Multi-Tenancy](#5-multi-tenancy)), so set this to the bare base path. |
 | `logging.level` | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. Logs are JSON (structured). |
 | `database.url` | `DATABASE_URL` | *(derived)* | Full PostgreSQL DSN. When set, overrides every other `database.*` field. |
 | `database.host` | `DB_HOST` | `localhost` | PostgreSQL host (only used when `database.url` is empty) |
@@ -171,11 +172,11 @@ ig:
 | `database.user` | `DB_USER` | `fhir` | PostgreSQL user |
 | `database.password` | `DB_PASSWORD` | `fhir` | PostgreSQL password |
 | `database.name` | `DB_NAME` | `fhirdb` | PostgreSQL database name |
-| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#9-implementation-guides). |
+| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#10-implementation-guides). |
 | `ig.registryUrl` | `IG_REGISTRY_URL` | `https://packages.fhir.org` | FHIR package registry for resolving `name@version` specs. |
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
-| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#8-terminology). |
+| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#9-terminology). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
@@ -269,9 +270,64 @@ If `IG_PACKAGES` is empty, steps 8–9 are skipped and the server is ready immed
 
 ---
 
-## 5. Database Schema
+## 5. Multi-Tenancy
 
-Migrations run automatically at startup via `db.Migrate()`. The SQL is embedded in the binary (`internal/db/schema.sql`, schema version 3). All statements are idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), so re-running against an existing database is safe.
+The server supports two ways to serve multiple tenants from one deployment. They can be used independently or together (a gateway can route some tenants to dedicated instances and the rest to a shared one).
+
+### Option 1 — Physical separation (a dedicated server **and** database per tenant)
+
+Give each tenant its own full deployment — a server instance **and** its own database — and put a gateway in front that routes each tenant to its backend:
+
+```text
+                          ┌────────────────┐   ┌─────────────┐
+   /t/acme/...    ─────▶  │ fhir-server    │──▶│ acme  DB    │
+                          └────────────────┘   └─────────────┘
+                          ┌────────────────┐   ┌─────────────┐
+   /t/globex/...  ─────▶  │ fhir-server    │──▶│ globex DB   │
+                          └────────────────┘   └─────────────┘
+```
+
+This needs **no application configuration** — each instance is a normal single-tenant server pointed at its own `DATABASE_URL`. It gives the strongest isolation (separate data, backups, and blast radius) and is the recommended model for a small number of larger tenants or strict compliance/data-residency requirements. The trade-off is operational overhead that grows with the number of tenants.
+
+> A **single server fronting one database per tenant** (a connection pool per tenant inside one process) is intentionally **not** supported: each tenant's pool consumes connections, so one process can only serve a small, fixed number of tenants before exhausting them. For many tenants on shared infrastructure, use Option 2 instead.
+
+### Option 2 — Logical separation (shared server and database)
+
+All tenants share one server and one database; every row is tagged with a `tenant_id` and isolation is enforced by PostgreSQL **Row-Level Security**. The active tenant is taken from the **URL**:
+
+```text
+POST /t/{tenant}/fhir/r4/Patient        # tenant "{tenant}"
+GET  /t/acme/fhir/r4/Patient?name=smith # tenant "acme"
+GET  /fhir/r4/Patient/123               # the "default" tenant (no prefix)
+```
+
+- **Tenant in the URL.** Requests under `/t/{tenant}/…` act on that tenant; requests on the bare `/fhir/r4/…` base act on the `default` tenant, so **existing single-tenant deployments keep working unchanged**. Each tenant therefore has its own FHIR base URL (`…/t/{tenant}/fhir/r4`), and generated absolute URLs (`Location`, Bundle `fullUrl`, pagination links) carry the prefix so clients stay within their tenant.
+- **Enforced by the database, not just the query.** On every request the server sets the `app.current_tenant` Postgres setting (via `SET LOCAL` inside write transactions; per-connection for reads). RLS policies on `resources`, `resource_history`, and the `sp_*` index tables restrict every read and write to the matching `tenant_id`. A query that forgets to filter — or a bug in the application layer — still cannot cross tenants. New rows derive their `tenant_id` from the same setting, and an unset tenant fails closed.
+- **Tenant identifiers** must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`; anything else is rejected with `404`.
+
+> **⚠️ The database role must NOT be a superuser.** PostgreSQL superusers — and any role with `BYPASSRLS` — ignore Row-Level Security, which would silently disable tenant isolation. Create a dedicated least-privilege role for the server and connect as it:
+>
+> ```sql
+> CREATE ROLE fhir_app LOGIN PASSWORD '…';            -- NOT a superuser
+> GRANT USAGE ON SCHEMA public TO fhir_app;
+> GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fhir_app;
+> GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fhir_app;
+> ```
+>
+> (Run migrations as the owner/admin role; run the server as `fhir_app`.) Single-tenant deployments that never use the tenant routes are unaffected either way.
+>
+> **Security:** the server trusts the tenant in the URL — it performs no authentication of its own. Deploy it behind a gateway or auth proxy (e.g. WSO2 API Manager) that authenticates the caller and authorizes them for the `{tenant}` they address. Do not expose the tenant routes directly to untrusted clients.
+
+**What is shared vs. isolated.** PHI lives in tenant-scoped tables (`resources`, `resource_history`, `sp_*`) and is isolated per tenant. Server-wide *configuration* is intentionally shared across tenants: the search-parameter registry (including custom `SearchParameter`s) and loaded Implementation Guides. If you need per-tenant search parameters or IGs, use Option 1.
+
+The `resources`, `resource_history`, and `sp_*` indexes lead with `tenant_id`, so tenant-scoped reads and writes stay selective as the number of tenants grows. For a single-tenant (`default`) deployment the leading column is constant and effectively free.
+
+---
+
+
+## 6. Database Schema
+
+The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6) and applied at startup via `db.Migrate()`. It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). Statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` so a fresh database can be (re)initialised safely. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
 
 ### Core tables
 
@@ -279,6 +335,7 @@ Migrations run automatically at startup via `db.Migrate()`. The SQL is embedded 
 
 | Column | Type | Notes |
 |---|---|---|
+| `tenant_id` | `TEXT` | Owning tenant; defaults to `current_setting('app.current_tenant')` (see [Multi-Tenancy](#5-multi-tenancy)) |
 | `fhir_id` | `VARCHAR(64)` | FHIR logical id (UUID or server-assigned) |
 | `resource_type` | `VARCHAR(100)` | e.g. `Patient`, `Observation` |
 | `version_id` | `INT` | Monotonically increasing per resource |
@@ -287,7 +344,7 @@ Migrations run automatically at startup via `db.Migrate()`. The SQL is embedded 
 | `resource_json` | `JSONB` | Full resource body |
 | `search_text` | `TSVECTOR` | Reserved for `_text`/`_content` full-text search — column exists but is not currently populated by the server |
 
-Primary key: `(fhir_id, resource_type)`.
+Primary key: `(tenant_id, resource_type, fhir_id)`.
 
 #### `resource_history` — append-only audit trail
 
@@ -295,12 +352,15 @@ Every create, update, and delete appends a row here. VRead (`GET /{type}/{id}/_h
 
 | Column | Type | Notes |
 |---|---|---|
+| `tenant_id` | `TEXT` | Owning tenant (see [Multi-Tenancy](#5-multi-tenancy)) |
 | `fhir_id` | `VARCHAR(64)` | |
 | `resource_type` | `VARCHAR(100)` | |
 | `version_id` | `INT` | |
 | `operation` | `VARCHAR(10)` | `POST` (create), `PUT` (update), or `DELETE` |
 | `recorded_at` | `TIMESTAMPTZ` | |
 | `resource_json` | `JSONB` | Full snapshot at this version |
+
+Unique key: `(tenant_id, fhir_id, resource_type, version_id)`.
 
 #### `sp_*` — search index tables
 
@@ -317,7 +377,7 @@ One table per FHIR search parameter type. Rows are deleted and re-inserted on ev
 | `sp_reference` | `reference` | `target_type`, `target_id` + identifier columns for `:identifier` modifier |
 | `sp_coords` | `special` | `latitude`, `longitude` (Location.near) |
 
-All `sp_*` tables have `FOREIGN KEY (resource_id, resource_type) REFERENCES resources ON DELETE CASCADE`.
+All `sp_*` tables carry a `tenant_id` column and have `FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources ON DELETE CASCADE`. Their indexes also lead with `tenant_id`.
 
 #### `search_param_definitions` — search parameter registry
 
@@ -336,7 +396,7 @@ Track which IG packages have been loaded (for skip-on-restart) and which profile
 
 ---
 
-## 6. API Reference
+## 7. API Reference
 
 **Base path:** `/fhir/r4`  
 **Content-Type:** All request and response bodies use `application/fhir+json`.  
@@ -622,7 +682,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 
 ---
 
-## 7. Search Parameters
+## 8. Search Parameters
 
 ### Built-in parameters
 
@@ -633,7 +693,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Type | Example | Modifiers | Notes |
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
-| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#8-terminology). |
+| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#9-terminology). |
 | `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge` | `sa`/`eb` parse but fall back to `eq` |
 | `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
 | `reference` | `subject=Patient/abc123` | — | |
@@ -678,7 +738,7 @@ The parameter is available for searching immediately and persists across restart
 
 ---
 
-## 8. Terminology
+## 9. Terminology
 
 The server is **not a terminology server**. It does not host `CodeSystem`, `ValueSet`, or `ConceptMap` resources, it does not expose terminology operations (`$validate-code`, `$lookup`, `$translate`), and resource validation does **not** check coded values against their bound value sets (see [Validation rules](#validation-rules) — validation is structural only: cardinality, fixed values, patterns, FHIRPath invariants, and slicing).
 
@@ -718,7 +778,7 @@ If you need full terminology capabilities — hosting your own code systems and 
 
 ---
 
-## 9. Implementation Guides
+## 10. Implementation Guides
 
 IGs extend the server with additional SearchParameters and profiles without code changes.
 
@@ -758,7 +818,7 @@ curl http://localhost:9090/fhir/r4/metadata | jq '.implementationGuide'
 
 ---
 
-## 10. Testing
+## 11. Testing
 
 See [TESTING.md](TESTING.md) for the full test inventory. Quick reference:
 
@@ -800,7 +860,7 @@ go test -tags integration ./...
 
 ---
 
-## 11. Extending the Server
+## 12. Extending the Server
 
 ### Adding a required-field validation rule
 

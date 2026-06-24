@@ -46,7 +46,7 @@ func insertResource(t *testing.T, pool *pgxpool.Pool, resourceType, resourceID s
 	_, err = pool.Exec(context.Background(),
 		`INSERT INTO resources (fhir_id, resource_type, resource_json)
 		 VALUES ($1, $2, $3)
-		 ON CONFLICT (fhir_id, resource_type) DO NOTHING`,
+		 ON CONFLICT (tenant_id, resource_type, fhir_id) DO NOTHING`,
 		resourceID, resourceType, raw,
 	)
 	if err != nil {

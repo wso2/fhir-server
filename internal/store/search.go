@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2/fhir-server/internal/searchparam"
 	"github.com/wso2/fhir-server/internal/terminology"
 )
@@ -108,9 +107,18 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		return SearchResult{}, b.err
 	}
 
+	// Acquire a tenant-scoped connection for the search query. _include /
+	// _revinclude below resolve on their own connections (FetchReferences),
+	// so this one is released as soon as the primary result set is fetched.
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	defer c.Release()
+
 	// _summary=count: only the total is needed, no rows to fetch.
 	if sp.CountOnly {
-		n, err := b.count(ctx, s.pool)
+		n, err := b.count(ctx, c)
 		if err != nil {
 			slog.Error("search count failed", "resourceType", sp.ResourceType, "err", err)
 			return SearchResult{}, err
@@ -123,7 +131,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 	if sp.Total == "none" {
 		// _total=none: skip the count entirely, just fetch rows.
 		var err error
-		entries, err = b.fetch(ctx, s.pool, sp.PageSize, offset)
+		entries, err = b.fetch(ctx, c, sp.PageSize, offset)
 		if err != nil {
 			slog.Error("search failed", "resourceType", sp.ResourceType, "err", err)
 			return SearchResult{}, err
@@ -132,7 +140,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 	} else {
 		// Default: fetch rows and total in a single query via COUNT(*) OVER().
 		var err error
-		total, entries, err = b.fetchWithCount(ctx, s.pool, sp.PageSize, offset)
+		total, entries, err = b.fetchWithCount(ctx, c, sp.PageSize, offset)
 		if err != nil {
 			slog.Error("search failed", "resourceType", sp.ResourceType, "err", err)
 			return SearchResult{}, err
@@ -257,8 +265,11 @@ func (b *queryBuilder) next(v any) string {
 
 func (b *queryBuilder) writeBase() {
 	rtP := b.next(b.rt)
+	// Tenant scope (defence in depth alongside Row-Level Security): restrict to
+	// the request's tenant via the app.current_tenant setting the store applies
+	// to the connection/transaction. Holds even if the DB role bypasses RLS.
 	b.where.WriteString(fmt.Sprintf(
-		"r.resource_type = %s AND r.is_deleted = FALSE", rtP,
+		"r.tenant_id = current_setting('app.current_tenant', true) AND r.resource_type = %s AND r.is_deleted = FALSE", rtP,
 	))
 }
 
@@ -1240,7 +1251,7 @@ func (b *queryBuilder) spExists(table, param, _ string) string {
 	return fmt.Sprintf("SELECT 1 FROM %s s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s", table, rtP, pP)
 }
 
-func (b *queryBuilder) count(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+func (b *queryBuilder) count(ctx context.Context, pool querier) (int, error) {
 	q := fmt.Sprintf(`SELECT COUNT(*) FROM resources r WHERE %s`, b.where.String())
 	var n int
 	err := pool.QueryRow(ctx, q, b.args...).Scan(&n)
@@ -1291,7 +1302,13 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 		b.where.String(), nP,
 	)
 
-	rows, err := s.pool.Query(ctx, q, b.args...)
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	defer c.Release()
+
+	rows, err := c.Query(ctx, q, b.args...)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -1325,7 +1342,7 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 	return SearchResult{Total: len(entries), Entries: entries}, nil
 }
 
-func (b *queryBuilder) fetch(ctx context.Context, pool *pgxpool.Pool, limit, offset int) ([]map[string]any, error) {
+func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset int) ([]map[string]any, error) {
 	// Build the ORDER BY before binding LIMIT/OFFSET so the positional args line
 	// up: [where args…, order-by param args…, limit, offset].
 	orderBy := b.orderByClause()
@@ -1369,7 +1386,7 @@ func (b *queryBuilder) fetch(ctx context.Context, pool *pgxpool.Pool, limit, off
 // page size. This saves a round-trip compared to the previous pattern of a
 // separate SELECT COUNT(*) followed by a paginated SELECT; when ORDER BY
 // requires a sort (no covering index), it also halves the scan work.
-func (b *queryBuilder) fetchWithCount(ctx context.Context, pool *pgxpool.Pool, limit, offset int) (int, []map[string]any, error) {
+func (b *queryBuilder) fetchWithCount(ctx context.Context, pool querier, limit, offset int) (int, []map[string]any, error) {
 	orderBy := b.orderByClause()
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
@@ -1488,17 +1505,25 @@ func (s *Store) FetchReferences(ctx context.Context, resourceType, resourceID st
 		q = `SELECT DISTINCT r.resource_json, r.version_id, r.last_updated
 			 FROM sp_reference sr
 			 JOIN resources r ON r.fhir_id = sr.target_id AND r.resource_type = sr.target_type
-			 WHERE sr.resource_id = $1 AND sr.resource_type = $2 AND r.is_deleted = FALSE`
+			 WHERE sr.resource_id = $1 AND sr.resource_type = $2 AND r.is_deleted = FALSE
+			   AND r.tenant_id = current_setting('app.current_tenant', true)`
 		args = []any{resourceID, resourceType}
 	} else {
 		q = `SELECT DISTINCT r.resource_json, r.version_id, r.last_updated
 			 FROM sp_reference sr
 			 JOIN resources r ON r.fhir_id = sr.resource_id AND r.resource_type = sr.resource_type
-			 WHERE sr.target_id = $1 AND sr.target_type = $2 AND r.is_deleted = FALSE`
+			 WHERE sr.target_id = $1 AND sr.target_type = $2 AND r.is_deleted = FALSE
+			   AND r.tenant_id = current_setting('app.current_tenant', true)`
 		args = []any{resourceID, resourceType}
 	}
 
-	rows, err := s.pool.Query(ctx, q, args...)
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+
+	rows, err := c.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

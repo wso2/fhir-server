@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2/fhir-server/internal/index"
 	"github.com/wso2/fhir-server/internal/searchparam"
+	"github.com/wso2/fhir-server/internal/tenant"
 	"github.com/wso2/fhir-server/internal/terminology"
 )
 
@@ -57,6 +58,52 @@ func WithTerminology(tc *terminology.Client) func(*Store) {
 	return func(s *Store) { s.terminology = tc }
 }
 
+// ─── Tenant scoping ─────────────────────────────────────────────────────────
+// Every PHI table (resources, resource_history, sp_*) is guarded by Postgres
+// Row-Level Security keyed on the `app.current_tenant` runtime setting. The
+// store must set it before any such table is touched, otherwise RLS fails
+// closed (reads return nothing; writes violate NOT NULL on tenant_id).
+//
+//   - writes run in a transaction, so they SET LOCAL (scoped to the tx);
+//   - reads run on a pooled connection acquired via tenantConn.
+//
+// The tenant id comes from the request context (tenant.From), defaulting to
+// the "default" tenant for single-tenant deployments.
+
+const (
+	setTenantLocalSQL   = `SELECT set_config('app.current_tenant', $1, true)`  // tx-scoped
+	setTenantSessionSQL = `SELECT set_config('app.current_tenant', $1, false)` // connection-scoped
+)
+
+// setTenantTx applies the request's tenant to a write transaction.
+func setTenantTx(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, setTenantLocalSQL, tenant.From(ctx))
+	return err
+}
+
+// tenantConn acquires a pooled connection with the request's tenant applied,
+// for read paths that run outside a transaction. The caller must Release it;
+// the next acquirer overwrites app.current_tenant before use, so the value
+// never leaks across tenants.
+func (s *Store) tenantConn(ctx context.Context) (*pgxpool.Conn, error) {
+	c, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.Exec(ctx, setTenantSessionSQL, tenant.From(ctx)); err != nil {
+		c.Release()
+		return nil, err
+	}
+	return c, nil
+}
+
+// querier is satisfied by both *pgxpool.Pool and *pgxpool.Conn, letting the
+// search query builder run against a tenant-scoped connection.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error) {
@@ -65,6 +112,10 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	result, err := s.createInTx(ctx, tx, resourceType, body)
 	if err != nil {
@@ -147,10 +198,16 @@ func (s *Store) Read(ctx context.Context, resourceType, resourceID string) (map[
 	var lastUpdated time.Time
 	var isDeleted bool
 
-	err := s.pool.QueryRow(ctx, `
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+
+	err = c.QueryRow(ctx, `
 		SELECT resource_json, version_id, last_updated, is_deleted
 		FROM resources
-		WHERE fhir_id = $1 AND resource_type = $2`,
+		WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`,
 		resourceID, resourceType,
 	).Scan(&raw, &versionID, &lastUpdated, &isDeleted)
 	if err != nil {
@@ -177,6 +234,10 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	result, err := s.updateInTx(ctx, tx, resourceType, resourceID, body, ifMatchVersion)
 	if err != nil {
@@ -215,7 +276,7 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	batch := &pgx.Batch{}
 	batch.Queue(
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
-		 WHERE fhir_id = $4 AND resource_type = $5`,
+		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
 		newVersion, lastUpdated, raw, resourceID, resourceType,
 	)
 	nDeletes := index.QueueDelete(batch, resourceType, resourceID) // nDeletes DELETEs at positions 1-nDeletes
@@ -267,6 +328,10 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 	}
 	defer tx.Rollback(ctx)
 
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, err
+	}
+
 	merged, newVersion, err := s.patchInTx(ctx, tx, resourceType, resourceID, patch)
 	if err != nil {
 		return nil, err
@@ -289,7 +354,7 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	var isDeleted bool
 	if err := tx.QueryRow(ctx, `
 		SELECT resource_json, version_id, last_updated, is_deleted
-		FROM resources WHERE fhir_id = $1 AND resource_type = $2 FOR UPDATE`,
+		FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true) FOR UPDATE`,
 		resourceID, resourceType,
 	).Scan(&raw, &versionID, &lastUpdated, &isDeleted); err != nil {
 		if isNoRows(err) {
@@ -321,7 +386,7 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	batch := &pgx.Batch{}
 	batch.Queue(
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
-		 WHERE fhir_id = $4 AND resource_type = $5`,
+		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
 		newVersion, now, mergedRaw, resourceID, resourceType,
 	)
 	nDeletes := index.QueueDelete(batch, resourceType, resourceID)
@@ -392,6 +457,10 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 	}
 	defer tx.Rollback(ctx)
 
+	if err := setTenantTx(ctx, tx); err != nil {
+		return err
+	}
+
 	if err := s.deleteInTx(ctx, tx, resourceType, resourceID); err != nil {
 		return err
 	}
@@ -417,7 +486,7 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	var isDeleted bool
 	if err := tx.QueryRow(ctx, `
 		SELECT resource_json, version_id, last_updated, is_deleted
-		FROM resources WHERE fhir_id = $1 AND resource_type = $2 FOR UPDATE`,
+		FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true) FOR UPDATE`,
 		resourceID, resourceType,
 	).Scan(&raw, &versionID, &lastUpdated, &isDeleted); err != nil {
 		if isNoRows(err) {
@@ -439,7 +508,7 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	nDeletes := index.QueueDelete(batch, resourceType, resourceID) // nDeletes DELETEs
 	batch.Queue(
 		`UPDATE resources SET is_deleted = TRUE, version_id = $1, last_updated = $2
-		 WHERE fhir_id = $3 AND resource_type = $4`,
+		 WHERE fhir_id = $3 AND resource_type = $4 AND tenant_id = current_setting('app.current_tenant', true)`,
 		deleteVersion, now, resourceID, resourceType,
 	)
 
@@ -470,7 +539,13 @@ type HistoryEntry struct {
 }
 
 func (s *Store) GetHistory(ctx context.Context, resourceType, resourceID string) ([]HistoryEntry, error) {
-	rows, err := s.pool.Query(ctx, `
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+
+	rows, err := c.Query(ctx, `
 		SELECT version_id, operation, resource_json, recorded_at
 		FROM resource_history
 		WHERE resource_type = $1 AND fhir_id = $2
@@ -543,7 +618,13 @@ func (s *Store) GetTypeHistory(ctx context.Context, p HistoryParams) (HistoryRes
 		args = []any{p.ResourceType, p.Since}
 	}
 
-	if err := s.pool.QueryRow(ctx, countQ, args...).Scan(&total); err != nil {
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	defer c.Release()
+
+	if err := c.QueryRow(ctx, countQ, args...).Scan(&total); err != nil {
 		return HistoryResult{}, err
 	}
 
@@ -551,7 +632,7 @@ func (s *Store) GetTypeHistory(ctx context.Context, p HistoryParams) (HistoryRes
 	fetchArgs := make([]any, len(args), len(args)+2)
 	copy(fetchArgs, args)
 	fetchArgs = append(fetchArgs, p.PageSize, offset)
-	rows, err := s.pool.Query(ctx, fetchQ, fetchArgs...)
+	rows, err := c.Query(ctx, fetchQ, fetchArgs...)
 	if err != nil {
 		return HistoryResult{}, err
 	}
@@ -567,7 +648,12 @@ func (s *Store) GetTypeHistory(ctx context.Context, p HistoryParams) (HistoryRes
 func (s *Store) GetVersion(ctx context.Context, resourceType, resourceID string, versionID int) (map[string]any, error) {
 	var raw []byte
 	var recordedAt time.Time
-	err := s.pool.QueryRow(ctx, `
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Release()
+	err = c.QueryRow(ctx, `
 		SELECT resource_json, recorded_at FROM resource_history
 		WHERE resource_type = $1 AND fhir_id = $2 AND version_id = $3`,
 		resourceType, resourceID, versionID,
@@ -614,7 +700,7 @@ func (s *Store) readInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceI
 	var isDeleted bool
 	if err := tx.QueryRow(ctx, `
 		SELECT resource_json, version_id, last_updated, is_deleted
-		FROM resources WHERE fhir_id = $1 AND resource_type = $2`,
+		FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`,
 		resourceID, resourceType,
 	).Scan(&raw, &versionID, &lastUpdated, &isDeleted); err != nil {
 		if isNoRows(err) {
@@ -630,7 +716,7 @@ func (s *Store) readInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceI
 
 func bumpVersion(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) (newVersion, currentVersion int, lastUpdated time.Time, err error) {
 	if err = tx.QueryRow(ctx, `
-		SELECT version_id FROM resources WHERE fhir_id = $1 AND resource_type = $2 FOR UPDATE`,
+		SELECT version_id FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true) FOR UPDATE`,
 		resourceID, resourceType,
 	).Scan(&currentVersion); err != nil {
 		if isNoRows(err) {
@@ -811,8 +897,13 @@ func (s *Store) SyncSearchParameter(ctx context.Context, body map[string]any) er
 // DeleteSearchParameter removes a custom SearchParameter by resource ID.
 func (s *Store) DeleteSearchParameter(ctx context.Context, resourceID string) error {
 	var raw []byte
-	err := s.pool.QueryRow(ctx,
-		`SELECT resource_json FROM resources WHERE fhir_id = $1 AND resource_type = 'SearchParameter'`,
+	c, err := s.tenantConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Release()
+	err = c.QueryRow(ctx,
+		`SELECT resource_json FROM resources WHERE fhir_id = $1 AND resource_type = 'SearchParameter' AND tenant_id = current_setting('app.current_tenant', true)`,
 		resourceID,
 	).Scan(&raw)
 	if err != nil {

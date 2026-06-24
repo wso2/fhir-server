@@ -62,7 +62,7 @@ func (h *fhirHandler) everythingType(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[key] = true
 		entries = append(entries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, irt, iid),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), irt, iid),
 			"resource": res,
 			"search":   map[string]any{"mode": mode},
 		})
@@ -139,7 +139,7 @@ func (h *fhirHandler) lastN(w http.ResponseWriter, r *http.Request) {
 	for _, obs := range result.Entries {
 		id, _ := obs["id"].(string)
 		entries = append(entries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/Observation/%s", h.baseURL, id),
+			"fullUrl":  fmt.Sprintf("%s/Observation/%s", h.tenantBaseURL(r.Context()), id),
 			"resource": obs,
 			"search":   map[string]any{"mode": "match"},
 		})
@@ -171,7 +171,7 @@ func (h *fhirHandler) document(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entries := []any{map[string]any{
-		"fullUrl":  fmt.Sprintf("%s/Composition/%s", h.baseURL, id),
+		"fullUrl":  fmt.Sprintf("%s/Composition/%s", h.tenantBaseURL(r.Context()), id),
 		"resource": comp,
 	}}
 	seen := map[string]bool{"Composition/" + id: true}
@@ -199,7 +199,7 @@ func (h *fhirHandler) document(w http.ResponseWriter, r *http.Request) {
 			}
 			seen[key] = true
 			entries = append(entries, map[string]any{
-				"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, irt, iid),
+				"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), irt, iid),
 				"resource": res,
 			})
 			queue = append(queue, ref{irt, iid})

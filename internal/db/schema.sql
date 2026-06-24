@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- benefit to the query patterns used here.
 
 CREATE TABLE IF NOT EXISTS resources (
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     fhir_id       VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     version_id    INT          NOT NULL DEFAULT 1,
@@ -26,13 +27,13 @@ CREATE TABLE IF NOT EXISTS resources (
     is_deleted    BOOLEAN      NOT NULL DEFAULT FALSE,
     resource_json JSONB        NOT NULL,
     search_text   TSVECTOR,
-    PRIMARY KEY (fhir_id, resource_type)
+    PRIMARY KEY (tenant_id, resource_type, fhir_id)
 );
 
 -- List all resources of a type ordered by recency (used by GET /{type}).
-CREATE INDEX IF NOT EXISTS idx_res_type_updated ON resources (resource_type, last_updated DESC);
+CREATE INDEX IF NOT EXISTS idx_res_type_updated ON resources (tenant_id, resource_type, last_updated DESC);
 -- Same as above but skips soft-deleted resources (used by most searches).
-CREATE INDEX IF NOT EXISTS idx_res_active       ON resources (resource_type, last_updated DESC) WHERE is_deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_res_active       ON resources (tenant_id, resource_type, last_updated DESC) WHERE is_deleted = FALSE;
 -- Full-text search over search_text (_text / _content search parameters).
 CREATE INDEX IF NOT EXISTS idx_res_search_text  ON resources USING GIN (search_text);
 
@@ -42,21 +43,22 @@ CREATE INDEX IF NOT EXISTS idx_res_search_text  ON resources USING GIN (search_t
 
 CREATE TABLE IF NOT EXISTS resource_history (
     id            BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     fhir_id       VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     version_id    INT          NOT NULL,
     operation     VARCHAR(10)  NOT NULL,   -- CREATE | UPDATE | DELETE
     recorded_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     resource_json JSONB,
-    UNIQUE (fhir_id, resource_type, version_id)
+    UNIQUE (tenant_id, fhir_id, resource_type, version_id)
 );
 
 -- Fetch a specific version of a resource (GET /{type}/{id}/_history/{vid}).
-CREATE INDEX IF NOT EXISTS idx_hist_resource  ON resource_history (resource_type, fhir_id, version_id DESC);
+CREATE INDEX IF NOT EXISTS idx_hist_resource  ON resource_history (tenant_id, resource_type, fhir_id, version_id DESC);
 -- Global history feed ordered by time (GET /_history).
-CREATE INDEX IF NOT EXISTS idx_hist_time      ON resource_history (recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hist_time      ON resource_history (tenant_id, recorded_at DESC);
 -- History feed for a single resource type ordered by time (GET /{type}/_history).
-CREATE INDEX IF NOT EXISTS idx_hist_type_time ON resource_history (resource_type, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hist_type_time ON resource_history (tenant_id, resource_type, recorded_at DESC);
 
 -- ─── String search index ─────────────────────────────────────────────────────
 -- Stores extracted values for FHIR string search parameters (name, address, etc.).
@@ -65,24 +67,25 @@ CREATE INDEX IF NOT EXISTS idx_hist_type_time ON resource_history (resource_type
 
 CREATE TABLE IF NOT EXISTS sp_string (
     id            BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id   VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     param_name    VARCHAR(191) NOT NULL,
     value_exact   VARCHAR(512),
     value_lower   VARCHAR(512),
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
 -- text_pattern_ops is required for LIKE 'prefix%' to use a btree index under
 -- non-C collations (e.g. en_US.utf8). Without it, prefix scans fall back to
 -- a sequential scan. The operator class also serves equality lookups.
-CREATE INDEX IF NOT EXISTS idx_sp_str_lower_pattern ON sp_string (resource_type, param_name, value_lower text_pattern_ops);
-CREATE INDEX IF NOT EXISTS idx_sp_str_exact         ON sp_string (resource_type, param_name, value_exact);
+CREATE INDEX IF NOT EXISTS idx_sp_str_lower_pattern ON sp_string (tenant_id, resource_type, param_name, value_lower text_pattern_ops);
+CREATE INDEX IF NOT EXISTS idx_sp_str_exact         ON sp_string (tenant_id, resource_type, param_name, value_exact);
 -- Narrow re-index/cascade index. Serves per-resource re-index DELETEs
 -- (WHERE resource_id, resource_type) and FK ON DELETE CASCADE. Slimmed from the
 -- former wide form (…param_name, value_lower) to cut ingest write amplification;
 -- the wide form's only extra benefit was index-only multi-param search joins.
-CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (tenant_id, resource_id, resource_type);
 -- Uncomment for :contains support (requires pg_trgm extension):
 -- CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- CREATE INDEX idx_sp_str_trgm ON sp_string USING GIN (value_lower gin_trgm_ops);
@@ -94,24 +97,25 @@ CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (resource_id, r
 
 CREATE TABLE IF NOT EXISTS sp_token (
     id            BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id   VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     param_name    VARCHAR(191) NOT NULL,
     system        VARCHAR(512),
     code          VARCHAR(191),
     display       VARCHAR(512),
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
 -- Primary lookup: system|code pairs (the most common token search pattern).
-CREATE INDEX IF NOT EXISTS idx_sp_tok_sys_code ON sp_token (resource_type, param_name, system, code);
+CREATE INDEX IF NOT EXISTS idx_sp_tok_sys_code ON sp_token (tenant_id, resource_type, param_name, system, code);
 -- (idx_sp_tok_system dropped: it was a strict prefix of idx_sp_tok_sys_code
 --  above, which the planner already uses for system-only lookups — the separate
 --  index only added write cost on the heaviest sp_* table.)
 -- Lookup by code alone when the search omits system.
-CREATE INDEX IF NOT EXISTS idx_sp_tok_code ON sp_token (resource_type, param_name, code) WHERE code IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sp_tok_code ON sp_token (tenant_id, resource_type, param_name, code) WHERE code IS NOT NULL;
 -- Narrow re-index/cascade index (slimmed from …param_name, system, code).
-CREATE INDEX IF NOT EXISTS idx_sp_tok_source ON sp_token (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_tok_source ON sp_token (tenant_id, resource_id, resource_type);
 
 -- ─── Date search index ────────────────────────────────────────────────────────
 -- Stores extracted values for FHIR date / dateTime / Period / instant parameters.
@@ -122,18 +126,19 @@ CREATE INDEX IF NOT EXISTS idx_sp_tok_source ON sp_token (resource_id, resource_
 
 CREATE TABLE IF NOT EXISTS sp_date (
     id              BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id     VARCHAR(64)  NOT NULL,
     resource_type   VARCHAR(100) NOT NULL,
     param_name      VARCHAR(191) NOT NULL,
     value_low       TIMESTAMPTZ  NOT NULL,
     value_high      TIMESTAMPTZ  NOT NULL,
     value_precision VARCHAR(10)  NOT NULL DEFAULT 'SECOND',
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_date_range  ON sp_date (resource_type, param_name, value_low, value_high);
+CREATE INDEX IF NOT EXISTS idx_sp_date_range  ON sp_date (tenant_id, resource_type, param_name, value_low, value_high);
 -- Narrow re-index/cascade index (slimmed from …param_name, value_low, value_high).
-CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type);
 
 -- ─── Number search index ──────────────────────────────────────────────────────
 -- Stores extracted values for FHIR number search parameters.
@@ -143,18 +148,19 @@ CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (resource_id, resource_
 
 CREATE TABLE IF NOT EXISTS sp_number (
     id            BIGSERIAL     PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id   VARCHAR(64)   NOT NULL,
     resource_type VARCHAR(100)  NOT NULL,
     param_name    VARCHAR(191)  NOT NULL,
     value         DECIMAL(20,6) NOT NULL,
     value_low     DECIMAL(20,6) NOT NULL,
     value_high    DECIMAL(20,6) NOT NULL,
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (resource_type, param_name, value_low, value_high);
+CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high);
 -- Narrow re-index/cascade index (slimmed from …param_name, value_low, value_high).
-CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (tenant_id, resource_id, resource_type);
 
 -- ─── Quantity search index ────────────────────────────────────────────────────
 -- Stores extracted values for FHIR quantity search parameters.
@@ -164,6 +170,7 @@ CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (resource_id, resource
 
 CREATE TABLE IF NOT EXISTS sp_quantity (
     id               BIGSERIAL     PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id      VARCHAR(64)   NOT NULL,
     resource_type    VARCHAR(100)  NOT NULL,
     param_name       VARCHAR(191)  NOT NULL,
@@ -174,15 +181,15 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
     code             VARCHAR(64),
     canonical_value  DECIMAL(20,6),
     canonical_units  VARCHAR(64),
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
 -- Raw value range search (same system+code, no unit conversion needed).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (resource_type, param_name, value_low, value_high, system, code);
+CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code);
 -- Narrow re-index/cascade index (slimmed from …param_name).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resource_id, resource_type);
 -- Canonical search (cross-unit comparison via UCUM normalisation).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (resource_type, param_name, canonical_value, canonical_units)
+CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (tenant_id, resource_type, param_name, canonical_value, canonical_units)
     WHERE canonical_value IS NOT NULL;
 
 -- ─── URI search index ─────────────────────────────────────────────────────────
@@ -191,18 +198,19 @@ CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (resource_type, p
 
 CREATE TABLE IF NOT EXISTS sp_uri (
     id            BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id   VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     param_name    VARCHAR(191) NOT NULL,
     value         VARCHAR(512) NOT NULL,
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_uri_exact  ON sp_uri (resource_type, param_name, value);
+CREATE INDEX IF NOT EXISTS idx_sp_uri_exact  ON sp_uri (tenant_id, resource_type, param_name, value);
 -- text_pattern_ops enables efficient LIKE 'prefix%' for the :below modifier.
-CREATE INDEX IF NOT EXISTS idx_sp_uri_prefix ON sp_uri (resource_type, param_name, value text_pattern_ops);
+CREATE INDEX IF NOT EXISTS idx_sp_uri_prefix ON sp_uri (tenant_id, resource_type, param_name, value text_pattern_ops);
 -- Narrow re-index/cascade index (slimmed from …param_name, value).
-CREATE INDEX IF NOT EXISTS idx_sp_uri_source ON sp_uri (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_uri_source ON sp_uri (tenant_id, resource_id, resource_type);
 
 -- ─── Reference search index ───────────────────────────────────────────────────
 -- Stores extracted values for FHIR reference search parameters.
@@ -213,6 +221,7 @@ CREATE INDEX IF NOT EXISTS idx_sp_uri_source ON sp_uri (resource_id, resource_ty
 
 CREATE TABLE IF NOT EXISTS sp_reference (
     id                BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id       VARCHAR(64)  NOT NULL,
     resource_type     VARCHAR(100) NOT NULL,
     param_name        VARCHAR(191) NOT NULL,
@@ -223,16 +232,16 @@ CREATE TABLE IF NOT EXISTS sp_reference (
     identifier_system VARCHAR(512),
     identifier_value  VARCHAR(255),
     display           VARCHAR(255),
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
 -- Narrow re-index/cascade index (slimmed from …param_name, target_id).
-CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (resource_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, resource_id, resource_type);
 -- Used when searching by target (e.g. ?patient=123): leading on target_id
 -- serves bare-id lookups; extra columns allow the predicate to resolve index-only.
-CREATE INDEX IF NOT EXISTS idx_sp_ref_target_full ON sp_reference (target_id, target_type, param_name, resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_sp_ref_target_full ON sp_reference (tenant_id, target_id, target_type, param_name, resource_type, resource_id);
 -- Used for the :identifier modifier (find references by Identifier value).
-CREATE INDEX IF NOT EXISTS idx_sp_ref_ident       ON sp_reference (target_type, identifier_system, identifier_value)
+CREATE INDEX IF NOT EXISTS idx_sp_ref_ident       ON sp_reference (tenant_id, target_type, identifier_system, identifier_value)
     WHERE identifier_value IS NOT NULL;
 
 -- ─── Coordinates search index ─────────────────────────────────────────────────
@@ -242,15 +251,16 @@ CREATE INDEX IF NOT EXISTS idx_sp_ref_ident       ON sp_reference (target_type, 
 
 CREATE TABLE IF NOT EXISTS sp_coords (
     id            BIGSERIAL    PRIMARY KEY,
+    tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
     resource_id   VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     param_name    VARCHAR(191) NOT NULL,
     latitude      DECIMAL(9,6) NOT NULL,
     longitude     DECIMAL(9,6) NOT NULL,
-    FOREIGN KEY (resource_id, resource_type) REFERENCES resources (fhir_id, resource_type) ON DELETE CASCADE
+    FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_coords ON sp_coords (resource_type, param_name, latitude, longitude);
+CREATE INDEX IF NOT EXISTS idx_sp_coords ON sp_coords (tenant_id, resource_type, param_name, latitude, longitude);
 
 -- ─── Search parameter definitions ────────────────────────────────────────────
 -- Registry of all known search parameters for each resource type.
@@ -383,3 +393,43 @@ ALTER TABLE sp_coords    SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_
 -- installs get the lean form; existing DBs need a migration to DROP+recreate
 -- (CREATE INDEX IF NOT EXISTS won't alter an index that already exists).
 INSERT INTO schema_version (version) VALUES (5) ON CONFLICT DO NOTHING;
+
+-- ─── Multi-tenancy: Row-Level Security ────────────────────────────────────────
+-- Every PHI-bearing table (resources, resource_history, sp_*) carries a
+-- tenant_id column (declared inline in the definitions above) that defaults to
+-- the app.current_tenant runtime setting the server applies per request. Their
+-- primary / foreign keys and the resource_history version-uniqueness all lead
+-- with tenant_id, so two tenants may hold resources with the same id. The
+-- global configuration tables (search_param_definitions, ig_*, the closure
+-- tables, schema_version) are intentionally SHARED across tenants and carry no
+-- tenant_id.
+--
+-- Isolation is enforced by Row-Level Security: each policy restricts rows to
+-- the current tenant. FORCE makes the policy apply to the table owner too. An
+-- unset tenant fails CLOSED — NULL matches no rows and violates the NOT NULL
+-- tenant_id on write.
+--
+-- NOTE: the server (and any tooling that touches these tables at runtime) MUST
+-- connect as a NON-superuser role — superusers and roles with BYPASSRLS ignore
+-- Row-Level Security entirely.
+DO $rls$
+DECLARE
+    t             text;
+    tenant_tables text[] := ARRAY['resources','resource_history','sp_string','sp_token',
+                                  'sp_date','sp_number','sp_quantity','sp_uri',
+                                  'sp_reference','sp_coords'];
+BEGIN
+    FOREACH t IN ARRAY tenant_tables LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('ALTER TABLE %I FORCE  ROW LEVEL SECURITY', t);
+        EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
+        EXECUTE format(
+            'CREATE POLICY tenant_isolation ON %I '
+            || 'USING (tenant_id = current_setting(''app.current_tenant'', true)) '
+            || 'WITH CHECK (tenant_id = current_setting(''app.current_tenant'', true))',
+            t);
+    END LOOP;
+END
+$rls$;
+
+INSERT INTO schema_version (version) VALUES (6) ON CONFLICT DO NOTHING;

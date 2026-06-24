@@ -57,7 +57,7 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := h.store.ExecuteBundle(r.Context(), bundleType, h.baseURL, entries)
+	results, err := h.store.ExecuteBundle(r.Context(), bundleType, h.tenantBaseURL(r.Context()), entries)
 	if err != nil {
 		var be *store.BundleError
 		if errors.As(err, &be) {
@@ -108,16 +108,16 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 	if bundleType == "batch" {
 		responseType = "batch-response"
 	}
-	writeJSON(w, http.StatusOK, h.buildBundleResponse(responseType, results))
+	writeJSON(w, http.StatusOK, h.buildBundleResponse(h.tenantBaseURL(r.Context()), responseType, results))
 }
 
 // buildBundleResponse assembles the transaction-response / batch-response Bundle.
-func (h *fhirHandler) buildBundleResponse(responseType string, results []store.BundleEntryResult) map[string]any {
+func (h *fhirHandler) buildBundleResponse(base, responseType string, results []store.BundleEntryResult) map[string]any {
 	entries := make([]any, 0, len(results))
 	for _, res := range results {
 		response := map[string]any{"status": res.Status}
 		if res.Location != "" {
-			response["location"] = h.absoluteLocation(res.Location)
+			response["location"] = h.absoluteLocation(base, res.Location)
 		}
 		if res.ETag != "" {
 			response["etag"] = res.ETag
@@ -142,11 +142,11 @@ func (h *fhirHandler) buildBundleResponse(responseType string, results []store.B
 
 // absoluteLocation turns a relative "Type/id/_history/v" location into an
 // absolute URL under the server base.
-func (h *fhirHandler) absoluteLocation(loc string) string {
+func (h *fhirHandler) absoluteLocation(base, loc string) string {
 	if strings.Contains(loc, "://") {
 		return loc
 	}
-	return strings.TrimRight(h.baseURL, "/") + "/" + strings.TrimLeft(loc, "/")
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(loc, "/")
 }
 
 // parseBundleEntries converts the raw Bundle.entry array into typed store

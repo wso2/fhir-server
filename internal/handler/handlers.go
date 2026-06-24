@@ -281,7 +281,7 @@ func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bundle := h.buildBundle(rt, result, params, page, pageSize, summary, elements)
+	bundle := h.buildBundle(h.tenantBaseURL(r.Context()), rt, result, params, page, pageSize, summary, elements)
 	writeFHIR(w, r, http.StatusOK, bundle)
 }
 
@@ -325,11 +325,11 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bundle := h.buildBundle(rt, result, params, page, pageSize, summary, elements)
+	bundle := h.buildBundle(h.tenantBaseURL(r.Context()), rt, result, params, page, pageSize, summary, elements)
 	writeFHIR(w, r, http.StatusOK, bundle)
 }
 
-func (h *fhirHandler) buildBundle(rt string, result store.SearchResult, params map[string][]string, page, pageSize int, summary string, elements []string) map[string]any {
+func (h *fhirHandler) buildBundle(baseURL, rt string, result store.SearchResult, params map[string][]string, page, pageSize int, summary string, elements []string) map[string]any {
 	if pageSize <= 0 {
 		pageSize = 20
 	}
@@ -341,7 +341,7 @@ func (h *fhirHandler) buildBundle(rt string, result store.SearchResult, params m
 	for _, res := range result.Entries {
 		id, _ := res["id"].(string)
 		entries = append(entries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, rt, id),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", baseURL, rt, id),
 			"resource": applyProjection(res, summary, elements),
 			"search":   map[string]any{"mode": "match"},
 		})
@@ -350,13 +350,13 @@ func (h *fhirHandler) buildBundle(rt string, result store.SearchResult, params m
 		inclRT, _ := res["resourceType"].(string)
 		id, _ := res["id"].(string)
 		entries = append(entries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, inclRT, id),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", baseURL, inclRT, id),
 			"resource": applyProjection(res, summary, elements),
 			"search":   map[string]any{"mode": "include"},
 		})
 	}
 
-	base := fmt.Sprintf("%s/%s", h.baseURL, rt)
+	base := fmt.Sprintf("%s/%s", baseURL, rt)
 	links := []any{
 		map[string]any{"relation": "self", "url": base + "?" + pageQuery(params, page, pageSize)},
 		map[string]any{"relation": "first", "url": base + "?" + pageQuery(params, 1, pageSize)},
@@ -544,7 +544,7 @@ func (h *fhirHandler) everything(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entries := []any{map[string]any{
-		"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, rt, id),
+		"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), rt, id),
 		"resource": anchor,
 		"search":   map[string]any{"mode": "match"},
 	}}
@@ -585,7 +585,7 @@ func (h *fhirHandler) everything(w http.ResponseWriter, r *http.Request) {
 
 		seen[key] = true
 		entries = append(entries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, inclRT, inclID),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), inclRT, inclID),
 			"resource": res,
 			"search":   map[string]any{"mode": "include"},
 		})
@@ -646,7 +646,7 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			slog.Debug("conditional create matched existing resource", "resourceType", rt, "id", existingID)
-			w.Header().Set("Location", fmt.Sprintf("%s/%s/%s", h.baseURL, rt, existingID))
+			w.Header().Set("Location", fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), rt, existingID))
 			w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(existing)))
 			writeFHIR(w, r, http.StatusOK, existing)
 			return
@@ -675,7 +675,7 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id, _ := resource["id"].(string)
-	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.baseURL, rt, id))
+	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.tenantBaseURL(r.Context()), rt, id))
 	w.Header().Set("ETag", `W/"1"`)
 	writeFHIR(w, r, http.StatusCreated, resource)
 }
@@ -945,7 +945,7 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 		_ = h.store.SyncSearchParameter(r.Context(), resource)
 	}
 	id, _ := resource["id"].(string)
-	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.baseURL, rt, id))
+	w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.tenantBaseURL(r.Context()), rt, id))
 	w.Header().Set("ETag", `W/"1"`)
 	writeFHIR(w, r, http.StatusCreated, resource)
 }
@@ -1004,9 +1004,9 @@ func (h *fhirHandler) history(w http.ResponseWriter, r *http.Request) {
 	for _, e := range entries {
 		rid, _ := e.Resource["id"].(string)
 		bundleEntries = append(bundleEntries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.baseURL, rt, rid, e.VersionID),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.tenantBaseURL(r.Context()), rt, rid, e.VersionID),
 			"resource": e.Resource,
-			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.baseURL, rt, rid)},
+			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), rt, rid)},
 		})
 	}
 
@@ -1066,9 +1066,9 @@ func (h *fhirHandler) serveHistory(w http.ResponseWriter, r *http.Request, rt st
 		}
 		rid, _ := e.Resource["id"].(string)
 		bundleEntries = append(bundleEntries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.baseURL, entryRT, rid, e.VersionID),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s/_history/%d", h.tenantBaseURL(r.Context()), entryRT, rid, e.VersionID),
 			"resource": e.Resource,
-			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.baseURL, entryRT, rid)},
+			"request":  map[string]any{"method": e.Operation, "url": fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), entryRT, rid)},
 		})
 	}
 
@@ -1082,9 +1082,9 @@ func (h *fhirHandler) serveHistory(w http.ResponseWriter, r *http.Request, rt st
 
 	var base string
 	if rt == "" {
-		base = h.baseURL + "/_history"
+		base = h.tenantBaseURL(r.Context()) + "/_history"
 	} else {
-		base = fmt.Sprintf("%s/%s/_history", h.baseURL, rt)
+		base = fmt.Sprintf("%s/%s/_history", h.tenantBaseURL(r.Context()), rt)
 	}
 	params := map[string][]string(q)
 	links := []any{
@@ -1506,7 +1506,7 @@ func (h *fhirHandler) compartmentSearch(w http.ResponseWriter, r *http.Request) 
 			writeFHIR(w, r, http.StatusOK, map[string]any{
 				"resourceType": "Bundle", "type": "searchset", "total": 1,
 				"entry": []any{map[string]any{
-					"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, ownerType, ownerID),
+					"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), ownerType, ownerID),
 					"resource": resource, "search": map[string]any{"mode": "match"},
 				}},
 			})
@@ -1584,7 +1584,7 @@ func (h *fhirHandler) compartmentSearch(w http.ResponseWriter, r *http.Request) 
 	for _, res := range page_entries {
 		id, _ := res["id"].(string)
 		bundleEntries = append(bundleEntries, map[string]any{
-			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.baseURL, targetRT, id),
+			"fullUrl":  fmt.Sprintf("%s/%s/%s", h.tenantBaseURL(r.Context()), targetRT, id),
 			"resource": res,
 			"search":   map[string]any{"mode": "match"},
 		})
