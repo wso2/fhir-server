@@ -158,6 +158,10 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	}
 	defer tx.Rollback(ctx)
 
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+	}
+
 	results := make([]BundleEntryResult, len(ops))
 	for _, idx := range order {
 		op := ops[idx]
@@ -336,6 +340,11 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 
 		tx, txerr := s.pool.Begin(ctx)
 		if txerr != nil {
+			results[i] = batchFailure(&BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: txerr.Error()})
+			continue
+		}
+		if txerr := setTenantTx(ctx, tx); txerr != nil {
+			tx.Rollback(ctx)
 			results[i] = batchFailure(&BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: txerr.Error()})
 			continue
 		}

@@ -24,6 +24,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
@@ -59,11 +60,26 @@ func MustDB(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("get connection string: %v", err)
 	}
 
-	pool, err := db.Connect(ctx, connStr)
+	// Default every connection to the "default" tenant. Tests that drive the
+	// store set the tenant per request and override this; tests that write via
+	// raw SQL still need a tenant for the tenant_id column default and the
+	// Row-Level Security policies added in schema v6.
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+		_, err := c.Exec(ctx, "SET app.current_tenant = 'default'")
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
 
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)

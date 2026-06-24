@@ -121,7 +121,7 @@ func Delete(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) err
 	batch := &pgx.Batch{}
 	for _, tbl := range tables {
 		batch.Queue(
-			fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2`, tbl),
+			fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`, tbl),
 			resourceID, resourceType,
 		)
 	}
@@ -152,7 +152,7 @@ func (e *Extractor) Queue(batch *pgx.Batch, resourceType, resourceID string, res
 func QueueDelete(batch *pgx.Batch, resourceType, resourceID string) int {
 	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference"}
 	for _, tbl := range tables {
-		batch.Queue(fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2`, tbl), resourceID, resourceType)
+		batch.Queue(fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`, tbl), resourceID, resourceType)
 	}
 	return len(tables)
 }
