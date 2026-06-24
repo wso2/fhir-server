@@ -34,7 +34,7 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 docker-compose up
 
 # 2. Wait for the server to report healthy (watch the container logs or poll):
-curl -s http://localhost:9090/health/ready   # → 200 OK when ready
+curl -sv http://localhost:9090/health/ready   # → look for "< HTTP/1.1 200 OK" when ready (body is empty)
 
 # 3. Smoke test — create a Patient
 curl -s -X POST http://localhost:9090/fhir/r4/Patient \
