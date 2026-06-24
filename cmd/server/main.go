@@ -78,9 +78,17 @@ func run() error {
 	defer pool.Close()
 	slog.Info("connected to database")
 
-	slog.Info("starting database migration")
-	if err := db.Migrate(ctx, pool); err != nil {
-		return fmt.Errorf("migrate: %w", err)
+	// Table creation is opt-in: it needs a DB role with DDL privileges, which
+	// the runtime role usually should not have. When disabled (the default),
+	// the tables are expected to already exist.
+	if cfg.CreateTables {
+		slog.Info("creating database tables")
+		if err := db.CreateTables(ctx, pool); err != nil {
+			return fmt.Errorf("create tables: %w", err)
+		}
+	} else {
+		slog.Info("skipping database table creation; expecting tables to already exist " +
+			"(set FHIR_CREATE_TABLES=true or database.createTables to create them)")
 	}
 
 	// Seed standard FHIR R4 search parameters (idempotent — ON CONFLICT DO NOTHING)

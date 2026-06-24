@@ -37,6 +37,10 @@ services:
       - "9090:9090"
     environment:
       DATABASE_URL: postgres://fhir:fhir@db:5432/fhirdb?sslmode=disable&pool_max_conns=20
+      # The bundled `fhir` user owns fhirdb and has DDL rights, so let the
+      # server create its tables on first start. In production, create tables
+      # out-of-band with a privileged role and leave this unset (default off).
+      FHIR_CREATE_TABLES: "true"
       SERVER_PORT: "9090"
       BASE_URL: http://localhost:9090/fhir/r4
       LOG_LEVEL: info

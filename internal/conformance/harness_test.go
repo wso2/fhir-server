@@ -102,8 +102,8 @@ func runWithContainer(m *testing.M) int {
 		return 1
 	}
 	defer pool.Close()
-	if err := db.Migrate(ctx, pool); err != nil {
-		fmt.Fprintln(os.Stderr, "migrate:", err)
+	if err := db.CreateTables(ctx, pool); err != nil {
+		fmt.Fprintln(os.Stderr, "create tables:", err)
 		return 1
 	}
 	if err := seed.SeedSearchParams(ctx, pool); err != nil {

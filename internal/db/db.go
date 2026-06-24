@@ -47,7 +47,15 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+// CreateTables applies the embedded schema.sql to the database, creating the
+// tables and indexes the server needs if they do not already exist.
+//
+// This is NOT a migration system: schema.sql is purely additive (CREATE TABLE
+// IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so it cannot perform destructive
+// or altering schema changes. Applying it requires a database role with DDL
+// privileges, so the server only calls it when explicitly opted in (see the
+// CreateTables config / FHIR_CREATE_TABLES env var).
+func CreateTables(ctx context.Context, pool *pgxpool.Pool) error {
 	schema, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
 		return fmt.Errorf("read embedded schema: %w", err)
@@ -58,6 +66,6 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 
-	slog.Info("schema migration complete")
+	slog.Info("database tables created")
 	return nil
 }

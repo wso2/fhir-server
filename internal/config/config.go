@@ -48,6 +48,7 @@ type Config struct {
 	IGCacheDir      string   // local .tgz cache dir (default: .fhir-ig-cache)
 	ValidateOnWrite bool     // enforce profile validation on create/update (default off)
 	TerminologyURL  string   // base URL of the FHIR terminology server for :in/:not-in (empty = disabled)
+	CreateTables    bool     // create database tables on startup (requires a DB role with DDL privileges; default off)
 
 	// HTTP server timeouts. WriteTimeout bounds the WHOLE handler execution in
 	// net/http, so it must accommodate the slowest legitimate request (e.g. a
@@ -80,6 +81,9 @@ type FileConfig struct {
 		User     string `yaml:"user"`
 		Password string `yaml:"password"`
 		Name     string `yaml:"name"`
+		// CreateTables opts in to creating the schema's tables on startup.
+		// Pointer so an absent key is distinguishable from an explicit `false`.
+		CreateTables *bool `yaml:"createTables"`
 	} `yaml:"database"`
 
 	IG struct {
@@ -151,6 +155,14 @@ func resolve(fc *FileConfig) (*Config, error) {
 	validateOnWrite := strings.EqualFold(os.Getenv("FHIR_VALIDATE_ON_WRITE"), "true")
 	terminologyURL := os.Getenv("FHIR_TERMINOLOGY_URL")
 
+	createTables := false
+	if fc.Database.CreateTables != nil {
+		createTables = *fc.Database.CreateTables
+	}
+	if v := os.Getenv("FHIR_CREATE_TABLES"); v != "" {
+		createTables = strings.EqualFold(v, "true")
+	}
+
 	readTimeout, err := resolveTimeout("SERVER_READ_TIMEOUT", "server.readTimeout", fc.Server.ReadTimeout, 30*time.Second)
 	if err != nil {
 		return nil, err
@@ -175,6 +187,7 @@ func resolve(fc *FileConfig) (*Config, error) {
 		IGCacheDir:      igCacheDir,
 		ValidateOnWrite: validateOnWrite,
 		TerminologyURL:  terminologyURL,
+		CreateTables:    createTables,
 		ReadTimeout:     readTimeout,
 		WriteTimeout:    writeTimeout,
 		IdleTimeout:     idleTimeout,

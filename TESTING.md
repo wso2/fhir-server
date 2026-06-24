@@ -41,7 +41,7 @@ Run with `go test -tags integration -timeout 300s <package>`. Requires Docker.
 
 | Package | Tests | What is covered |
 |---|---|---|
-| `internal/db` | 3 | `Migrate` creates all 12 expected tables; `search_param_definitions` has all required columns; migration is idempotent |
+| `internal/db` | 3 | `CreateTables` creates all 12 expected tables; `search_param_definitions` has all required columns; table creation is idempotent |
 | `internal/seed` | 4 | `SeedSearchParams` inserts ≥100 FHIR R4 base params; seeding is idempotent; 8 known params are present; all 5 param types exist |
 | `internal/store` | ~30 | Full CRUD lifecycle (create→read→update→patch→delete); version history; pagination; search by string/token/date params; `_id` search; deleted resources excluded; `FetchReferences` forward and reverse; `SearchParameter` sync and delete |
 | `internal/index` | 6 | `Extractor.Index` writes to `sp_string`, `sp_token`, `sp_date`, `sp_reference`; CodeableConcept token extraction; `Delete` clears all `sp_*` tables for a resource |
@@ -51,7 +51,7 @@ Run with `go test -tags integration -timeout 300s <package>`. Requires Docker.
 
 Integration tests share a test helper in `internal/testutil/postgres.go` (build tag: `integration`):
 
-- **`MustDB(t)`** — starts a fresh `postgres:16-alpine` container, runs `db.Migrate`, returns a pool; container terminates on `t.Cleanup`.
+- **`MustDB(t)`** — starts a fresh `postgres:16-alpine` container, runs `db.CreateTables`, returns a pool; container terminates on `t.Cleanup`.
 - **`MustSeededDB(t)`** — like `MustDB` but also runs `seed.SeedSearchParams`.
 - **`MustRegistry(t, pool)`** — loads a `searchparam.Registry` from the pool.
 
