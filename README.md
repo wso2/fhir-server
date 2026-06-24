@@ -36,7 +36,9 @@ docker-compose up
 # 2. Wait for the server to report healthy (watch the container logs or poll):
 curl -sv http://localhost:9090/health/ready   # → look for "< HTTP/1.1 200 OK" when ready (body is empty)
 
-# 3. Smoke test — create a Patient
+# 3. Smoke test — create a Patient. The server assigns an id and returns the
+#    created resource; piping to `jq .id` prints just the new Patient's id, e.g.:
+#      "abeab77a-34e5-4fd5-b5df-8c2ce4691682"
 curl -s -X POST http://localhost:9090/fhir/r4/Patient \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Patient","name":[{"family":"Smith","given":["Alice"]}]}' \
