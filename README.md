@@ -48,6 +48,17 @@ curl -s -X POST http://localhost:9090/fhir/r4/Patient \
 The server is available at **`http://localhost:9090/fhir/r4`**.  
 PostgreSQL is exposed on `localhost:5432` (user `fhir`, password `fhir`, database `fhirdb`).
 
+**Explore the database:** the compose stack includes [Adminer](https://www.adminer.org/),
+a lightweight web UI, at **`http://localhost:8080`**. Log in with:
+
+| Field    | Value        |
+|----------|--------------|
+| System   | `PostgreSQL` |
+| Server   | `db`         |
+| Username | `fhir`       |
+| Password | `fhir`       |
+| Database | `fhirdb`     |
+
 To stop and remove all data:
 ```bash
 docker-compose down -v
