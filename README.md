@@ -17,9 +17,10 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 5. [Database Schema](#5-database-schema)
 6. [API Reference](#6-api-reference)
 7. [Search Parameters](#7-search-parameters)
-8. [Implementation Guides](#8-implementation-guides)
-9. [Testing](#9-testing)
-10. [Extending the Server](#10-extending-the-server)
+8. [Terminology](#8-terminology)
+9. [Implementation Guides](#9-implementation-guides)
+10. [Testing](#10-testing)
+11. [Extending the Server](#11-extending-the-server)
 
 ---
 
@@ -170,10 +171,11 @@ ig:
 | `database.user` | `DB_USER` | `fhir` | PostgreSQL user |
 | `database.password` | `DB_PASSWORD` | `fhir` | PostgreSQL password |
 | `database.name` | `DB_NAME` | `fhirdb` | PostgreSQL database name |
-| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#8-implementation-guides). |
+| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#9-implementation-guides). |
 | `ig.registryUrl` | `IG_REGISTRY_URL` | `https://packages.fhir.org` | FHIR package registry for resolving `name@version` specs. |
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
+| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#8-terminology). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
@@ -631,7 +633,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Type | Example | Modifiers | Notes |
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
-| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing` | `system\|code`, `\|code` (any system), `system\|` (any code with that system) |
+| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#8-terminology). |
 | `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge` | `sa`/`eb` parse but fall back to `eq` |
 | `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
 | `reference` | `subject=Patient/abc123` | — | |
@@ -676,7 +678,47 @@ The parameter is available for searching immediately and persists across restart
 
 ---
 
-## 8. Implementation Guides
+## 8. Terminology
+
+The server is **not a terminology server**. It does not host `CodeSystem`, `ValueSet`, or `ConceptMap` resources, it does not expose terminology operations (`$validate-code`, `$lookup`, `$translate`), and resource validation does **not** check coded values against their bound value sets (see [Validation rules](#validation-rules) — validation is structural only: cardinality, fixed values, patterns, FHIRPath invariants, and slicing).
+
+What it *does* provide is a thin **client to an external FHIR terminology server**, used purely to support a handful of code-aware search filters. When a search uses one of these token modifiers, the server calls `ValueSet/$expand` on the configured terminology server and filters matched resources against the returned code list:
+
+| Modifier | Meaning | How it expands |
+|---|---|---|
+| `:in` | Code is a member of the named ValueSet | `GET /ValueSet/$expand?url={valueSetUrl}` |
+| `:not-in` | Code is **not** a member of the named ValueSet | Same as `:in`, negated |
+| `:below` | Code is a descendant of the given concept | `POST /ValueSet/$expand` with an `is-a` filter |
+| `:above` | Code is an ancestor of the given concept | `POST /ValueSet/$expand` with a `generalizes` filter |
+
+### Configuration
+
+Set the terminology server base URL via the `FHIR_TERMINOLOGY_URL` environment variable (env only — there is no YAML key):
+
+```bash
+# Point at the public sandbox terminology server
+export FHIR_TERMINOLOGY_URL=https://tx.fhir.org/r4
+```
+
+- **Disabled by default.** If `FHIR_TERMINOLOGY_URL` is empty, the server starts normally and all other features work — but a search using `:in` / `:not-in` / `:below` / `:above` returns an `UnsupportedParamError` rather than failing silently.
+- **Caching.** Expansion results are cached in-memory for 5 minutes per `(ValueSet)` or `(system, op, value)` key to avoid calling the terminology server on every search. The cache is per-instance and not shared across replicas.
+- **No write-time enforcement.** Creating or updating a resource with a code outside its bound value set is **not** rejected; terminology is consulted only during search.
+
+### Example
+
+```bash
+# Find Observations whose code is in a given ValueSet
+curl "http://localhost:9090/fhir/r4/Observation?code:in=http://hl7.org/fhir/ValueSet/observation-vitalsignresult"
+
+# Find Conditions coded below a SNOMED CT concept (descendants)
+curl "http://localhost:9090/fhir/r4/Condition?code:below=http://snomed.info/sct|73211009"
+```
+
+If you need full terminology capabilities — hosting your own code systems and value sets, `$validate-code`/`$lookup`/`$translate`, or binding enforcement on write — run a dedicated terminology server (e.g. HAPI FHIR, Ontoserver, Firely, or `tx.fhir.org`) and point `FHIR_TERMINOLOGY_URL` at it.
+
+---
+
+## 9. Implementation Guides
 
 IGs extend the server with additional SearchParameters and profiles without code changes.
 
@@ -716,7 +758,7 @@ curl http://localhost:9090/fhir/r4/metadata | jq '.implementationGuide'
 
 ---
 
-## 9. Testing
+## 10. Testing
 
 See [TESTING.md](TESTING.md) for the full test inventory. Quick reference:
 
@@ -758,7 +800,7 @@ go test -tags integration ./...
 
 ---
 
-## 10. Extending the Server
+## 11. Extending the Server
 
 ### Adding a required-field validation rule
 
