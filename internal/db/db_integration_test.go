@@ -25,8 +25,8 @@ import (
 	"github.com/wso2/fhir-server/internal/testutil"
 )
 
-func TestMigrate_CreatesExpectedTables(t *testing.T) {
-	pool := testutil.MustDB(t) // MustDB already runs Migrate
+func TestCreateTables_CreatesExpectedTables(t *testing.T) {
+	pool := testutil.MustDB(t) // MustDB already runs CreateTables
 	ctx := context.Background()
 
 	tables := []string{
@@ -56,24 +56,24 @@ func TestMigrate_CreatesExpectedTables(t *testing.T) {
 			t.Fatalf("query table %q: %v", tbl, err)
 		}
 		if !exists {
-			t.Errorf("table %q not created by migration", tbl)
+			t.Errorf("table %q not created by CreateTables", tbl)
 		}
 	}
 }
 
-func TestMigrate_Idempotent(t *testing.T) {
+func TestCreateTables_Idempotent(t *testing.T) {
 	pool := testutil.MustDB(t)
 	ctx := context.Background()
 
-	// MustDB already ran Migrate once; query to confirm tables are usable.
+	// MustDB already ran CreateTables once; query to confirm tables are usable.
 	var n int
 	err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM resources`).Scan(&n)
 	if err != nil {
-		t.Fatalf("query after double migrate: %v", err)
+		t.Fatalf("query after table creation: %v", err)
 	}
 }
 
-func TestMigrate_SearchParamDefinitions_HasColumns(t *testing.T) {
+func TestCreateTables_SearchParamDefinitions_HasColumns(t *testing.T) {
 	pool := testutil.MustDB(t)
 	ctx := context.Background()
 

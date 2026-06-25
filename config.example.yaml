@@ -34,6 +34,11 @@ database:
   # user: fhir
   # password: fhir
   # name: fhirdb
+  # Create the server's tables on startup. Off by default because it needs a
+  # DB role with DDL privileges — the runtime role usually should not have
+  # those. Enable it for a one-off first start, or create tables out-of-band
+  # with a privileged role. Env equivalent: FHIR_CREATE_TABLES=true.
+  # createTables: false
 
 ig:
   # Implementation guides to load at startup.

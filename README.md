@@ -34,9 +34,11 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 docker-compose up
 
 # 2. Wait for the server to report healthy (watch the container logs or poll):
-curl -s http://localhost:9090/health/ready   # → 200 OK when ready
+curl -sv http://localhost:9090/health/ready   # → look for "< HTTP/1.1 200 OK" when ready (body is empty)
 
-# 3. Smoke test — create a Patient
+# 3. Smoke test — create a Patient. The server assigns an id and returns the
+#    created resource; piping to `jq .id` prints just the new Patient's id, e.g.:
+#      "abeab77a-34e5-4fd5-b5df-8c2ce4691682"
 curl -s -X POST http://localhost:9090/fhir/r4/Patient \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Patient","name":[{"family":"Smith","given":["Alice"]}]}' \
@@ -45,6 +47,17 @@ curl -s -X POST http://localhost:9090/fhir/r4/Patient \
 
 The server is available at **`http://localhost:9090/fhir/r4`**.  
 PostgreSQL is exposed on `localhost:5432` (user `fhir`, password `fhir`, database `fhirdb`).
+
+**Explore the database:** the compose stack includes [Adminer](https://www.adminer.org/),
+a lightweight web UI, at **`http://localhost:8080`**. Log in with:
+
+| Field    | Value        |
+|----------|--------------|
+| System   | `PostgreSQL` |
+| Server   | `db`         |
+| Username | `fhir`       |
+| Password | `fhir`       |
+| Database | `fhirdb`     |
 
 To stop and remove all data:
 ```bash
@@ -58,9 +71,19 @@ docker-compose down -v
 **Prerequisites:** Go 1.25+, PostgreSQL 13+ running locally
 
 ```bash
-# Create the database
-psql -U postgres -c "CREATE USER fhir WITH PASSWORD 'fhir';"
-psql -U postgres -c "CREATE DATABASE fhirdb OWNER fhir;"
+# Create the role and database as a PostgreSQL superuser.
+# Pick the block that matches how you installed PostgreSQL:
+
+# --- macOS (Homebrew) ---
+# Your OS user is the superuser; there is no "postgres" role, so connect
+# with `psql postgres`. (Using `-U postgres` fails: role "postgres" does not exist.)
+psql postgres -c "CREATE USER fhir WITH PASSWORD 'fhir';"
+psql postgres -c "CREATE DATABASE fhirdb OWNER fhir;"
+
+# --- Debian / Ubuntu / RHEL (apt/yum packages) ---
+# The superuser is the "postgres" OS/DB role; run psql via sudo -u postgres.
+sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
+sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
 
 # Option A — point the server at a YAML config file
 cp config.example.yaml config.yaml      # then edit as needed
@@ -77,7 +100,17 @@ export DB_PASSWORD="$(cat ~/.fhir-db-password)"
 go run ./cmd/server --config ./config.yaml
 ```
 
-Schema migrations run automatically at startup.
+The server does **not** create database tables by default — that needs a role
+with DDL privileges, which the runtime DB role usually should not have. To
+create the tables (e.g. on first start, when the role owns the database), opt
+in with `FHIR_CREATE_TABLES=true`:
+
+```bash
+FHIR_CREATE_TABLES=true go run ./cmd/server      # creates tables, then serves
+```
+
+Otherwise the server expects the tables to already exist and logs that it is
+skipping table creation. (The `docker-compose` setup sets this for you.)
 
 The server logs a JSON line to stdout when listening:
 ```json
@@ -172,6 +205,7 @@ ig:
 | `database.user` | `DB_USER` | `fhir` | PostgreSQL user |
 | `database.password` | `DB_PASSWORD` | `fhir` | PostgreSQL password |
 | `database.name` | `DB_NAME` | `fhirdb` | PostgreSQL database name |
+| `database.createTables` | `FHIR_CREATE_TABLES` | `false` | Create the server's tables on startup. Requires a DB role with DDL privileges, so it is off by default; enable it for a one-off first start, or create tables out-of-band with a privileged role. |
 | `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#10-implementation-guides). |
 | `ig.registryUrl` | `IG_REGISTRY_URL` | `https://packages.fhir.org` | FHIR package registry for resolving `name@version` specs. |
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
@@ -190,7 +224,7 @@ ig:
 cmd/server/main.go           Entry point: wires all packages, starts HTTP
 │
 ├── internal/config          Reads env vars, validates, provides typed Config struct
-├── internal/db              Opens pgxpool, runs idempotent schema migrations
+├── internal/db              Opens pgxpool, creates schema tables on opt-in (idempotent)
 ├── internal/seed            Inserts 100+ base FHIR R4 search param definitions (idempotent)
 ├── internal/searchparam     Thread-safe registry: resource type + param name → FHIRPath + type
 ├── internal/fhirpath        FHIRPath evaluator (path chains, where(), ofType(), arrays)
@@ -257,7 +291,7 @@ store.Search
 ```
 1. Load config from env
 2. Connect to PostgreSQL (pgxpool)
-3. Run schema migrations (idempotent CREATE TABLE IF NOT EXISTS)
+3. Create schema tables if FHIR_CREATE_TABLES=true (idempotent CREATE TABLE IF NOT EXISTS); otherwise skip
 4. Seed base FHIR R4 search params (ON CONFLICT DO NOTHING)
 5. Load search param registry from DB
 6. Create store + HTTP router
@@ -327,7 +361,7 @@ The `resources`, `resource_history`, and `sp_*` indexes lead with `tenant_id`, s
 
 ## 6. Database Schema
 
-The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6) and applied at startup via `db.Migrate()`. It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). Statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` so a fresh database can be (re)initialised safely. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
+The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Without Docker](#2-running-without-docker)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
 
 ### Core tables
 
@@ -892,4 +926,4 @@ Add a corresponding test case in `internal/handler/handler_test.go`.
 
 ### Updating the schema
 
-Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so the migration is idempotent. Bump the version number in the final `INSERT INTO schema_version` statement.
+Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so table creation stays idempotent. Bump the version number in the final `INSERT INTO schema_version` statement.

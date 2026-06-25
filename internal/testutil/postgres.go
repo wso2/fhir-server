@@ -33,8 +33,8 @@ import (
 	"github.com/wso2/fhir-server/internal/seed"
 )
 
-// MustDB starts a PostgreSQL 16 container, runs schema migrations, and returns
-// a ready pool. The container is terminated when t completes.
+// MustDB starts a PostgreSQL 16 container, creates the schema tables, and
+// returns a ready pool. The container is terminated when t completes.
 func MustDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -81,8 +81,8 @@ func MustDB(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("ping: %v", err)
 	}
 
-	if err := db.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := db.CreateTables(ctx, pool); err != nil {
+		t.Fatalf("create tables: %v", err)
 	}
 
 	return pool
