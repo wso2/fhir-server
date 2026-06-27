@@ -70,7 +70,7 @@ docker-compose down -v
 
 **Prerequisites:** Go 1.25+, PostgreSQL 13+ running locally
 
-### 1. Create the database and role
+### Create the database and role
 
 Create the `fhir` role and `fhirdb` database as a PostgreSQL superuser. Use the block that matches how you installed PostgreSQL.
 
@@ -92,7 +92,7 @@ sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
 sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
 ```
 
-### 2. Configure and run the server
+### Configure and run the server
 
 Choose one of the following approaches.
 
@@ -119,7 +119,7 @@ export DB_PASSWORD="$(cat ~/.fhir-db-password)"
 go run ./cmd/server --config ./config.yaml
 ```
 
-### 3. Create the database tables
+### Create the database tables
 
 The server does **not** create database tables by default — that needs a role
 with DDL privileges, which the runtime DB role usually should not have. To
