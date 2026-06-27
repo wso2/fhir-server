@@ -119,9 +119,31 @@ sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
 sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
 ```
 
+### Create the database tables
+
+Create the tables **before** starting the server. The schema lives in
+`internal/db/schema.sql` and is idempotent (`CREATE TABLE IF NOT EXISTS`), so it
+is safe to re-run. Apply it to the database:
+
+```bash
+psql "postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable" -f internal/db/schema.sql
+```
+
+The server does **not** create tables on its own by default, because that needs a
+role with DDL privileges that the runtime role usually should not have. As an
+alternative to running the schema manually, you can let the server create the
+tables on first start by setting `FHIR_CREATE_TABLES=true` (it creates the
+tables, then serves):
+
+```bash
+FHIR_CREATE_TABLES=true ./fhir-server      # creates tables, then serves
+```
+
+(The `docker-compose` setup sets this for you.)
+
 ### Run the server
 
-Choose one of the following approaches.
+With the tables in place, start the server. Choose one of the following approaches.
 
 **Option A — YAML config file**
 
@@ -151,19 +173,6 @@ The server logs a JSON line to stdout when listening:
 ```json
 {"level":"INFO","msg":"server listening","addr":":9090","baseURL":"http://localhost:9090/fhir/r4"}
 ```
-
-### Create the database tables
-
-The server does **not** create database tables by default — that needs a role
-with DDL privileges, which the runtime DB role usually should not have. On first
-start, when the role owns the database, opt in with `FHIR_CREATE_TABLES=true`:
-
-```bash
-FHIR_CREATE_TABLES=true ./fhir-server      # creates tables, then serves
-```
-
-Otherwise the server expects the tables to already exist and logs that it is
-skipping table creation. (The `docker-compose` setup sets this for you.)
 
 ---
 
