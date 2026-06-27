@@ -70,35 +70,56 @@ docker-compose down -v
 
 **Prerequisites:** Go 1.25+, PostgreSQL 13+ running locally
 
-```bash
-# Create the role and database as a PostgreSQL superuser.
-# Pick the block that matches how you installed PostgreSQL:
+### 1. Create the database and role
 
-# --- macOS (Homebrew) ---
-# Your OS user is the superuser; there is no "postgres" role, so connect
-# with `psql postgres`. (Using `-U postgres` fails: role "postgres" does not exist.)
+Create the `fhir` role and `fhirdb` database as a PostgreSQL superuser. Use the block that matches how you installed PostgreSQL.
+
+**macOS (Homebrew)**
+
+Your OS user is the superuser and there is no `postgres` role, so connect with `psql postgres`. (Using `-U postgres` fails with *role "postgres" does not exist*.)
+
+```bash
 psql postgres -c "CREATE USER fhir WITH PASSWORD 'fhir';"
 psql postgres -c "CREATE DATABASE fhirdb OWNER fhir;"
+```
 
-# --- Debian / Ubuntu / RHEL (apt/yum packages) ---
-# The superuser is the "postgres" OS/DB role; run psql via sudo -u postgres.
+**Debian / Ubuntu / RHEL (apt/yum packages)**
+
+The superuser is the `postgres` OS/DB role, so run `psql` via `sudo -u postgres`.
+
+```bash
 sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
 sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
+```
 
-# Option A — point the server at a YAML config file
+### 2. Configure and run the server
+
+Choose one of the following approaches.
+
+**Option A — YAML config file**
+
+```bash
 cp config.example.yaml config.yaml      # then edit as needed
 go run ./cmd/server --config ./config.yaml
+```
 
-# Option B — drive everything from env vars (no file)
+**Option B — environment variables only (no file)**
+
+```bash
 export DATABASE_URL="postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable"
 export SERVER_PORT=9090
 export BASE_URL=http://localhost:9090/fhir/r4
 go run ./cmd/server
+```
 
-# Option C — both: file for non-secrets, env for secrets
+**Option C — file for non-secrets, env for secrets**
+
+```bash
 export DB_PASSWORD="$(cat ~/.fhir-db-password)"
 go run ./cmd/server --config ./config.yaml
 ```
+
+### 3. Create the database tables
 
 The server does **not** create database tables by default — that needs a role
 with DDL privileges, which the runtime DB role usually should not have. To
@@ -113,6 +134,7 @@ Otherwise the server expects the tables to already exist and logs that it is
 skipping table creation. (The `docker-compose` setup sets this for you.)
 
 The server logs a JSON line to stdout when listening:
+
 ```json
 {"level":"INFO","msg":"server listening","addr":":9090","baseURL":"http://localhost:9090/fhir/r4"}
 ```
