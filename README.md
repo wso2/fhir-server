@@ -11,17 +11,18 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 ## Table of Contents
 
 1. [Quick Start (Docker Compose)](#1-quick-start-docker-compose)
-2. [Running Without Docker](#2-running-without-docker)
-3. [Configuration Reference](#3-configuration-reference)
-4. [Architecture](#4-architecture)
-5. [Multi-Tenancy](#5-multi-tenancy)
-6. [Database Schema](#6-database-schema)
-7. [API Reference](#7-api-reference)
-8. [Search Parameters](#8-search-parameters)
-9. [Terminology](#9-terminology)
-10. [Implementation Guides](#10-implementation-guides)
-11. [Testing](#11-testing)
-12. [Extending the Server](#12-extending-the-server)
+2. [Building](#2-building)
+3. [Running Locally](#3-running-locally)
+4. [Configuration Reference](#4-configuration-reference)
+5. [Architecture](#5-architecture)
+6. [Multi-Tenancy](#6-multi-tenancy)
+7. [Database Schema](#7-database-schema)
+8. [API Reference](#8-api-reference)
+9. [Search Parameters](#9-search-parameters)
+10. [Terminology](#10-terminology)
+11. [Implementation Guides](#11-implementation-guides)
+12. [Testing](#12-testing)
+13. [Extending the Server](#13-extending-the-server)
 
 ---
 
@@ -66,9 +67,35 @@ docker-compose down -v
 
 ---
 
-## 2. Running Without Docker
+## 2. Building
 
-**Prerequisites:** Go 1.25+, PostgreSQL 13+ running locally
+**Prerequisites:** Go 1.25+
+
+### Binary
+
+Compile a self-contained executable into the current directory:
+
+```bash
+go build -o fhir-server ./cmd/server
+```
+
+This produces a `fhir-server` binary you can run directly (see [Running Locally](#3-running-locally)) or copy to another host of the same OS/architecture.
+
+### Docker image
+
+Alternatively, build a container image:
+
+```bash
+docker build -t fhir-server:latest .
+```
+
+---
+
+## 3. Running Locally
+
+Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)); the steps below invoke `./fhir-server`.
+
+**Prerequisites:** PostgreSQL 13+ running locally, and a built `fhir-server` binary
 
 ### Create the database and role
 
@@ -92,7 +119,7 @@ sudo -u postgres psql -c "CREATE USER fhir WITH PASSWORD 'fhir';"
 sudo -u postgres psql -c "CREATE DATABASE fhirdb OWNER fhir;"
 ```
 
-### Configure and run the server
+### Run the server
 
 Choose one of the following approaches.
 
@@ -100,7 +127,7 @@ Choose one of the following approaches.
 
 ```bash
 cp config.example.yaml config.yaml      # then edit as needed
-go run ./cmd/server --config ./config.yaml
+./fhir-server --config ./config.yaml
 ```
 
 **Option B — environment variables only (no file)**
@@ -109,29 +136,15 @@ go run ./cmd/server --config ./config.yaml
 export DATABASE_URL="postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable"
 export SERVER_PORT=9090
 export BASE_URL=http://localhost:9090/fhir/r4
-go run ./cmd/server
+./fhir-server
 ```
 
 **Option C — file for non-secrets, env for secrets**
 
 ```bash
 export DB_PASSWORD="$(cat ~/.fhir-db-password)"
-go run ./cmd/server --config ./config.yaml
+./fhir-server --config ./config.yaml
 ```
-
-### Create the database tables
-
-The server does **not** create database tables by default — that needs a role
-with DDL privileges, which the runtime DB role usually should not have. To
-create the tables (e.g. on first start, when the role owns the database), opt
-in with `FHIR_CREATE_TABLES=true`:
-
-```bash
-FHIR_CREATE_TABLES=true go run ./cmd/server      # creates tables, then serves
-```
-
-Otherwise the server expects the tables to already exist and logs that it is
-skipping table creation. (The `docker-compose` setup sets this for you.)
 
 The server logs a JSON line to stdout when listening:
 
@@ -139,26 +152,22 @@ The server logs a JSON line to stdout when listening:
 {"level":"INFO","msg":"server listening","addr":":9090","baseURL":"http://localhost:9090/fhir/r4"}
 ```
 
-### Build a binary
+### Create the database tables
+
+The server does **not** create database tables by default — that needs a role
+with DDL privileges, which the runtime DB role usually should not have. On first
+start, when the role owns the database, opt in with `FHIR_CREATE_TABLES=true`:
 
 ```bash
-go build -o fhir-server ./cmd/server
-./fhir-server
+FHIR_CREATE_TABLES=true ./fhir-server      # creates tables, then serves
 ```
 
-### Build a Docker image
-
-```bash
-docker build -t fhir-server:latest .
-docker run --rm \
-  -e DATABASE_URL=postgres://fhir:fhir@host.docker.internal:5432/fhirdb?sslmode=disable \
-  -p 9090:9090 \
-  fhir-server:latest
-```
+Otherwise the server expects the tables to already exist and logs that it is
+skipping table creation. (The `docker-compose` setup sets this for you.)
 
 ---
 
-## 3. Configuration Reference
+## 4. Configuration Reference
 
 The server reads configuration from a YAML file, environment variables, or both. When the same key is set in multiple places, the higher-priority source wins:
 
@@ -219,7 +228,7 @@ ig:
 | YAML key | Env var | Default | Description |
 |---|---|---|---|
 | `server.port` | `SERVER_PORT` | `9090` | HTTP listen port |
-| `server.baseUrl` | `BASE_URL` | `http://localhost:{port}/fhir/r4` | Canonical server base URL. Written into bundle `link` URLs and the CapabilityStatement. Must match the address clients use. For multi-tenant requests the `/t/{tenant}` prefix is inserted automatically (see [Multi-Tenancy](#5-multi-tenancy)), so set this to the bare base path. |
+| `server.baseUrl` | `BASE_URL` | `http://localhost:{port}/fhir/r4` | Canonical server base URL. Written into bundle `link` URLs and the CapabilityStatement. Must match the address clients use. For multi-tenant requests the `/t/{tenant}` prefix is inserted automatically (see [Multi-Tenancy](#6-multi-tenancy)), so set this to the bare base path. |
 | `logging.level` | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. Logs are JSON (structured). |
 | `database.url` | `DATABASE_URL` | *(derived)* | Full PostgreSQL DSN. When set, overrides every other `database.*` field. |
 | `database.host` | `DB_HOST` | `localhost` | PostgreSQL host (only used when `database.url` is empty) |
@@ -228,17 +237,17 @@ ig:
 | `database.password` | `DB_PASSWORD` | `fhir` | PostgreSQL password |
 | `database.name` | `DB_NAME` | `fhirdb` | PostgreSQL database name |
 | `database.createTables` | `FHIR_CREATE_TABLES` | `false` | Create the server's tables on startup. Requires a DB role with DDL privileges, so it is off by default; enable it for a one-off first start, or create tables out-of-band with a privileged role. |
-| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#10-implementation-guides). |
+| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#11-implementation-guides). |
 | `ig.registryUrl` | `IG_REGISTRY_URL` | `https://packages.fhir.org` | FHIR package registry for resolving `name@version` specs. |
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
-| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#9-terminology). |
+| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#10-terminology). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
 ---
 
-## 4. Architecture
+## 5. Architecture
 
 ### Package overview
 
@@ -326,7 +335,7 @@ If `IG_PACKAGES` is empty, steps 8–9 are skipped and the server is ready immed
 
 ---
 
-## 5. Multi-Tenancy
+## 6. Multi-Tenancy
 
 The server supports two ways to serve multiple tenants from one deployment. They can be used independently or together (a gateway can route some tenants to dedicated instances and the rest to a shared one).
 
@@ -381,9 +390,9 @@ The `resources`, `resource_history`, and `sp_*` indexes lead with `tenant_id`, s
 ---
 
 
-## 6. Database Schema
+## 7. Database Schema
 
-The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Without Docker](#2-running-without-docker)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
+The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#6-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Locally](#3-running-locally)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
 
 ### Core tables
 
@@ -391,7 +400,7 @@ The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6
 
 | Column | Type | Notes |
 |---|---|---|
-| `tenant_id` | `TEXT` | Owning tenant; defaults to `current_setting('app.current_tenant')` (see [Multi-Tenancy](#5-multi-tenancy)) |
+| `tenant_id` | `TEXT` | Owning tenant; defaults to `current_setting('app.current_tenant')` (see [Multi-Tenancy](#6-multi-tenancy)) |
 | `fhir_id` | `VARCHAR(64)` | FHIR logical id (UUID or server-assigned) |
 | `resource_type` | `VARCHAR(100)` | e.g. `Patient`, `Observation` |
 | `version_id` | `INT` | Monotonically increasing per resource |
@@ -408,7 +417,7 @@ Every create, update, and delete appends a row here. VRead (`GET /{type}/{id}/_h
 
 | Column | Type | Notes |
 |---|---|---|
-| `tenant_id` | `TEXT` | Owning tenant (see [Multi-Tenancy](#5-multi-tenancy)) |
+| `tenant_id` | `TEXT` | Owning tenant (see [Multi-Tenancy](#6-multi-tenancy)) |
 | `fhir_id` | `VARCHAR(64)` | |
 | `resource_type` | `VARCHAR(100)` | |
 | `version_id` | `INT` | |
@@ -452,7 +461,7 @@ Track which IG packages have been loaded (for skip-on-restart) and which profile
 
 ---
 
-## 7. API Reference
+## 8. API Reference
 
 **Base path:** `/fhir/r4`  
 **Content-Type:** All request and response bodies use `application/fhir+json`.  
@@ -738,7 +747,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 
 ---
 
-## 8. Search Parameters
+## 9. Search Parameters
 
 ### Built-in parameters
 
@@ -749,7 +758,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Type | Example | Modifiers | Notes |
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
-| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#9-terminology). |
+| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#10-terminology). |
 | `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge` | `sa`/`eb` parse but fall back to `eq` |
 | `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
 | `reference` | `subject=Patient/abc123` | — | |
@@ -794,7 +803,7 @@ The parameter is available for searching immediately and persists across restart
 
 ---
 
-## 9. Terminology
+## 10. Terminology
 
 The server is **not a terminology server**. It does not host `CodeSystem`, `ValueSet`, or `ConceptMap` resources, it does not expose terminology operations (`$validate-code`, `$lookup`, `$translate`), and resource validation does **not** check coded values against their bound value sets (see [Validation rules](#validation-rules) — validation is structural only: cardinality, fixed values, patterns, FHIRPath invariants, and slicing).
 
@@ -834,7 +843,7 @@ If you need full terminology capabilities — hosting your own code systems and 
 
 ---
 
-## 10. Implementation Guides
+## 11. Implementation Guides
 
 IGs extend the server with additional SearchParameters and profiles without code changes.
 
@@ -874,7 +883,7 @@ curl http://localhost:9090/fhir/r4/metadata | jq '.implementationGuide'
 
 ---
 
-## 11. Testing
+## 12. Testing
 
 See [TESTING.md](TESTING.md) for the full test inventory. Quick reference:
 
@@ -916,7 +925,7 @@ go test -tags integration ./...
 
 ---
 
-## 12. Extending the Server
+## 13. Extending the Server
 
 ### Adding a required-field validation rule
 
