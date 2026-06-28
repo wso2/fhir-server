@@ -78,7 +78,7 @@ func (r *Registry) RevInclude(targetType string) []string {
 
 // Load reads all definitions from the DB and replaces the current cache.
 func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
-	slog.Info("loading search param definitions from database")
+	slog.Debug("loading search param definitions from database")
 	rows, err := pool.Query(ctx, `
 		SELECT resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source,
 		       COALESCE(target_types, ''), COALESCE(components_json, '')
