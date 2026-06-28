@@ -78,7 +78,7 @@ func (r *Registry) RevInclude(targetType string) []string {
 
 // Load reads all definitions from the DB and replaces the current cache.
 func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
-	slog.Debug("loading search param definitions from database")
+	slog.Debug("loading search parameter definitions from database into the in-memory registry")
 	rows, err := pool.Query(ctx, `
 		SELECT resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source,
 		       COALESCE(target_types, ''), COALESCE(components_json, '')
@@ -93,6 +93,7 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 	byRes := make(map[string][]Definition)
 	byKey := make(map[string]Definition)
 	count := 0
+	var base, fromIG, custom int // by source: base FHIR R4 spec / IG package / user-defined
 
 	for rows.Next() {
 		var d Definition
@@ -109,6 +110,14 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 		byRes[d.ResourceType] = append(byRes[d.ResourceType], d)
 		byKey[d.ResourceType+"."+d.ParamName] = d
 		count++
+		switch {
+		case d.IsCustom || d.IGSource == "user":
+			custom++
+		case d.IGSource != "":
+			fromIG++
+		default:
+			base++
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate definitions: %w", err)
@@ -134,7 +143,8 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 	r.revIncl = revIncl
 	r.mu.Unlock()
 
-	slog.Info("loaded search param definitions", "count", count)
+	slog.Info("loaded search parameter definitions into in-memory registry",
+		"total", count, "baseFHIRR4", base, "fromIGs", fromIG, "userDefined", custom)
 	return nil
 }
 
