@@ -211,6 +211,8 @@ ig:
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
 | *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#9-terminology). |
+| *(env only)* | `FHIR_VALIDATE_ON_WRITE` | `false` | Enforce **profile** validation (against `meta.profile`) on create/update. Off by default. See [Validation rules](#validation-rules). |
+| *(env only)* | `FHIR_BASE_VALIDATION` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing). On by default; set to `false` to disable. See [Validation rules](#validation-rules). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
@@ -361,7 +363,7 @@ The `resources`, `resource_history`, and `sp_*` indexes lead with `tenant_id`, s
 
 ## 6. Database Schema
 
-The schema is embedded in the binary (`internal/db/schema.sql`, schema version 6). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Without Docker](#2-running-without-docker)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
+The schema is embedded in the binary (`internal/db/schema.sql`, schema version 7). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#5-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Without Docker](#2-running-without-docker)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
 
 ### Core tables
 
@@ -427,6 +429,10 @@ All `sp_*` tables carry a `tenant_id` column and have `FOREIGN KEY (tenant_id, r
 #### `ig_packages` / `ig_profiles`
 
 Track which IG packages have been loaded (for skip-on-restart) and which profiles they declare (for CapabilityStatement).
+
+#### `base_definitions` — base FHIR R4 StructureDefinitions
+
+Holds the core FHIR R4 resource StructureDefinitions (one row per resource type), shipped embedded in the binary and loaded at startup by `internal/basedef`. They drive base validation (see [Validation rules](#validation-rules)). Like `ig_profiles` this is reference data, not PHI, so it carries no `tenant_id` and is excluded from Row-Level Security.
 
 ---
 
@@ -712,7 +718,12 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Content-Type must be `application/fhir+json` or `application/json` | 415 | Wrong or unsupported `Content-Type` header |
 | `resourceType` in body must match URL resource type | 422 | e.g. sending `{"resourceType":"Observation"}` to `/Patient` |
 | Required fields present | 422 | Observation requires `code`; Encounter requires `status` and `class` |
+| Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
+
+**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#6-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
+
+**Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#10-implementation-guides). It is off by default and is independent of base validation.
 
 ---
 

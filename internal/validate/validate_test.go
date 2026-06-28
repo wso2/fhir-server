@@ -61,6 +61,54 @@ func TestValidate_RequiredMissing(t *testing.T) {
 	}
 }
 
+func TestValidate_RequiredChoicePresent(t *testing.T) {
+	// Immunization.occurrence[x] is required; a concrete variant satisfies it.
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.occurrence[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization", "occurrenceDateTime": "2026-01-01"}
+	if issues := AgainstProfile(resource, sd); hasError(issues, "required") {
+		t.Errorf("choice variant present should satisfy required, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredChoiceMissing(t *testing.T) {
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.occurrence[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization"}
+	if issues := AgainstProfile(resource, sd); !hasError(issues, "required") {
+		t.Errorf("missing required choice should error, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredUnderAbsentParentNotEnforced(t *testing.T) {
+	// doseNumber[x] is required, but only when its optional parent
+	// protocolApplied is present. With protocolApplied absent, no error.
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.protocolApplied", "min": float64(0), "max": "*"},
+		{"path": "Immunization.protocolApplied.doseNumber[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization", "occurrenceDateTime": "2026-01-01"}
+	if issues := AgainstProfile(resource, sd); hasError(issues, "required") {
+		t.Errorf("required child under absent optional parent must not fire, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredUnderPresentParentEnforced(t *testing.T) {
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.protocolApplied", "min": float64(0), "max": "*"},
+		{"path": "Immunization.protocolApplied.doseNumber[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{
+		"resourceType":    "Immunization",
+		"protocolApplied": []any{map[string]any{"series": "A"}},
+	}
+	if issues := AgainstProfile(resource, sd); !hasError(issues, "required") {
+		t.Errorf("required child of a present parent should error, got %v", issues)
+	}
+}
+
 func TestValidate_Forbidden(t *testing.T) {
 	sd := minSD("Patient", []map[string]any{
 		{"path": "Patient.multipleBirthBoolean", "min": float64(0), "max": "0"},

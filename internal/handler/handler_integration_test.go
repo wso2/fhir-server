@@ -542,7 +542,7 @@ func TestIntegration_Validate_ProfileDriven(t *testing.T) {
 	}
 
 	// Auto-validate on write (validateOnWrite=true): create without name → 422.
-	srvStrict := httptest.NewServer(handler.NewRouter(s, pool, reg, "http://test-server/fhir/r4", &ready, true))
+	srvStrict := httptest.NewServer(handler.NewRouter(s, pool, reg, "http://test-server/fhir/r4", &ready, handler.Options{ValidateOnWrite: true}))
 	t.Cleanup(srvStrict.Close)
 
 	resp = iDo(t, srvStrict, http.MethodPost, "/fhir/r4/Patient",

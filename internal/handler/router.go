@@ -26,15 +26,28 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/wso2/fhir-server/internal/basedef"
 	"github.com/wso2/fhir-server/internal/obs"
 	"github.com/wso2/fhir-server/internal/searchparam"
 	"github.com/wso2/fhir-server/internal/tenant"
 )
 
-// NewRouter constructs the chi router. validateOnWrite enables profile
-// validation on create/update (default off in production; controlled by
-// FHIR_VALIDATE_ON_WRITE).
-func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, baseURL string, igReady *atomic.Int32, validateOnWrite ...bool) http.Handler {
+// Options tunes the behavior of the router/handler. The zero value is the
+// production default: profile validation off, base FHIR R4 validation on.
+type Options struct {
+	// ValidateOnWrite enforces profile (meta.profile) validation on
+	// create/update. Controlled by FHIR_VALIDATE_ON_WRITE; default off.
+	ValidateOnWrite bool
+	// DisableBaseValidation turns OFF validation against the base FHIR R4
+	// StructureDefinitions on write. Base validation is on by default, so the
+	// zero value keeps it enabled; set via FHIR_BASE_VALIDATION=false.
+	DisableBaseValidation bool
+}
+
+// NewRouter constructs the chi router. An optional Options controls validation
+// behavior; when omitted, profile validation is off and base FHIR R4 validation
+// is on.
+func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, baseURL string, igReady *atomic.Int32, opts ...Options) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RealIP)
 	r.Use(middleware.RequestID)
@@ -45,8 +58,20 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 	// scraped without traversing the FHIR middleware stack.
 	r.Get("/metrics", obs.MetricsHandler().ServeHTTP)
 
-	vow := len(validateOnWrite) > 0 && validateOnWrite[0]
-	h := &fhirHandler{store: s, pool: pool, registry: registry, baseURL: baseURL, igReady: igReady, validateOnWrite: vow}
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	h := &fhirHandler{
+		store:           s,
+		pool:            pool,
+		registry:        registry,
+		baseURL:         baseURL,
+		igReady:         igReady,
+		validateOnWrite: opt.ValidateOnWrite,
+		baseValidation:  !opt.DisableBaseValidation,
+		baseDefs:        basedef.NewCache(pool),
+	}
 
 	// Health probes
 	r.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) {
@@ -177,5 +202,7 @@ type fhirHandler struct {
 	registry        *searchparam.Registry
 	baseURL         string
 	igReady         *atomic.Int32
-	validateOnWrite bool // enforce profile validation on create/update when true
+	validateOnWrite bool           // enforce profile validation on create/update when true
+	baseValidation  bool           // validate writes against base FHIR R4 SDs when true
+	baseDefs        *basedef.Cache // memoized base StructureDefinition lookup by resource type
 }

@@ -159,10 +159,13 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 		// the resource (name.family) by stripping the resource type prefix.
 		relPath := strings.TrimPrefix(path, rootType+".")
 
-		val := getPath(resource, relPath)
+		val := resolveElement(resource, relPath)
 		present := val != nil
 
-		if c.min >= 1 && !present {
+		// A required element only applies when its parent is present: a min>=1
+		// element nested under an absent optional element (e.g. doseNumber[x]
+		// inside an omitted protocolApplied) is not actually required.
+		if c.min >= 1 && !present && parentPresent(resource, relPath) {
 			issues = append(issues, Issue{
 				Severity:    "error",
 				Code:        "required",
@@ -293,6 +296,66 @@ func checkSlicing(resource map[string]any, elements []any, sd map[string]any) []
 		}
 	}
 	return issues
+}
+
+// resolveElement returns the value at a relative element path, additionally
+// resolving a trailing FHIR choice-type segment ("value[x]") to whichever
+// concrete variant is present in the resource ("valueQuantity", "valueString",
+// …). For non-choice paths it is equivalent to getPath.
+func resolveElement(resource map[string]any, relPath string) any {
+	if !strings.HasSuffix(relPath, "[x]") {
+		return getPath(resource, relPath)
+	}
+	base := strings.TrimSuffix(relPath, "[x]")
+
+	// Locate the map that holds the choice element, then match by prefix.
+	parent := resource
+	leaf := base
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		switch p := getPath(resource, base[:i]).(type) {
+		case map[string]any:
+			parent = p
+		case []any:
+			if len(p) == 0 {
+				return nil
+			}
+			m, ok := p[0].(map[string]any)
+			if !ok {
+				return nil
+			}
+			parent = m
+		default:
+			return nil
+		}
+		leaf = base[i+1:]
+	}
+	return matchChoice(parent, leaf)
+}
+
+// matchChoice returns the value of a choice element named leaf (e.g. "value")
+// within m by finding a key of the form "value<Type>" — leaf followed by a
+// type name whose first character is uppercase. Returns nil when absent.
+func matchChoice(m map[string]any, leaf string) any {
+	for k, v := range m {
+		if len(k) > len(leaf) && strings.HasPrefix(k, leaf) {
+			c := k[len(leaf)]
+			if c >= 'A' && c <= 'Z' {
+				return v
+			}
+		}
+	}
+	return nil
+}
+
+// parentPresent reports whether the parent of relPath is present in the
+// resource (top-level elements always qualify). Used to suppress required-
+// cardinality errors for elements nested under an absent optional element.
+func parentPresent(resource map[string]any, relPath string) bool {
+	i := strings.LastIndex(relPath, ".")
+	if i < 0 {
+		return true
+	}
+	return getPath(resource, relPath[:i]) != nil
 }
 
 // getPath navigates a dot-delimited relative path into a resource map.
