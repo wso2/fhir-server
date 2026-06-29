@@ -1191,9 +1191,12 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 	}
 
 	issues := h.validateAgainstProfiles(r, body, profileURLs)
-	// Always include base FHIR R4 validation so $validate reports structural
-	// problems even when the caller names no profile.
-	issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	// Include base FHIR R4 validation (when enabled) so $validate reports
+	// structural problems even when the caller names no profile. Guarded by the
+	// same flag as writes so DisableBaseValidation turns the feature off fully.
+	if h.baseValidation {
+		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	}
 
 	if len(issues) == 0 {
 		writeFHIR(w, r, http.StatusOK, map[string]any{

@@ -45,6 +45,12 @@ var bundleFS embed.FS
 
 const bundleFile = "profiles-resources.min.json.gz"
 
+// expectedDefinitions is the number of base resource StructureDefinitions in
+// the embedded R4 bundle. Load treats the table as fully populated only when it
+// holds at least this many rows, so a partial/interrupted earlier load is not
+// mistaken for a complete one.
+const expectedDefinitions = 147
+
 // Load decompresses the embedded base R4 StructureDefinition bundle and upserts
 // each base resource definition into base_definitions, keyed by resource type.
 //
@@ -55,7 +61,10 @@ const bundleFile = "profiles-resources.min.json.gz"
 func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 	if !force {
 		var n int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions`).Scan(&n); err == nil && n > 0 {
+		// Skip the reload only when the full expected set is already present.
+		// Using a lower bound of expectedDefinitions (rather than > 0) ensures a
+		// previously failed/interrupted partial load is re-applied on restart.
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions`).Scan(&n); err == nil && n >= expectedDefinitions {
 			return n, nil
 		}
 	}
@@ -64,12 +73,21 @@ func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Apply the whole set in one transaction so the table is never left in a
+	// partially-loaded state on failure.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
 	for _, d := range defs {
 		sdJSON, err := json.Marshal(d.sd)
 		if err != nil {
 			return 0, fmt.Errorf("marshal base SD (%s): %w", d.resourceType, err)
 		}
-		_, err = pool.Exec(ctx, `
+		_, err = tx.Exec(ctx, `
 			INSERT INTO base_definitions (resource_type, sd_url, sd_json)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (resource_type)
@@ -78,6 +96,9 @@ func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("upsert base_definitions (%s): %w", d.resourceType, err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit base definitions: %w", err)
 	}
 	return len(defs), nil
 }

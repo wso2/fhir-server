@@ -119,6 +119,16 @@ func TestIntegration_BaseValidation_Disabled(t *testing.T) {
 		t.Fatalf("want 201 when base validation disabled, got %d: %v", resp.StatusCode, body)
 	}
 	resp.Body.Close()
+
+	// $validate must also honor the disable flag: a bare Observation (missing
+	// status) is reported valid because base validation is off.
+	resp = iDo(t, srv, http.MethodPost, "/fhir/r4/Observation/$validate",
+		map[string]any{"resourceType": "Observation"})
+	if resp.StatusCode != http.StatusOK {
+		body := iJSON(t, resp)
+		t.Fatalf("want 200 from $validate when base validation disabled, got %d: %v", resp.StatusCode, body)
+	}
+	resp.Body.Close()
 }
 
 // $validate reports base structural problems without a profile.

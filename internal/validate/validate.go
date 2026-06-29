@@ -159,13 +159,17 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 		// the resource (name.family) by stripping the resource type prefix.
 		relPath := strings.TrimPrefix(path, rootType+".")
 
-		val := resolveElement(resource, relPath)
-		present := val != nil
+		// Collect every value at this path, descending into all repeated
+		// (array) ancestors — not just the first — so constraints are checked
+		// against each occurrence.
+		vals := collectValues(resource, relPath)
+		present := len(vals) > 0
 
-		// A required element only applies when its parent is present: a min>=1
+		// A required element only applies where its parent is present: a min>=1
 		// element nested under an absent optional element (e.g. doseNumber[x]
-		// inside an omitted protocolApplied) is not actually required.
-		if c.min >= 1 && !present && parentPresent(resource, relPath) {
+		// inside an omitted protocolApplied) is not actually required. When the
+		// parent repeats, every entry must carry the required child.
+		if c.min >= 1 && missingRequired(resource, relPath) {
 			issues = append(issues, Issue{
 				Severity:    "error",
 				Code:        "required",
@@ -181,7 +185,7 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 				Diagnostics: fmt.Sprintf("%s: element is not permitted (max=0)", path),
 			})
 		}
-		if c.fixed != nil && present && !deepEqual(val, c.fixed) {
+		if c.fixed != nil && present && anyNotEqual(vals, c.fixed) {
 			issues = append(issues, Issue{
 				Severity:    "error",
 				Code:        "value",
@@ -189,7 +193,7 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 				Diagnostics: fmt.Sprintf("%s: value does not match fixed value", path),
 			})
 		}
-		if c.pattern != nil && present && !matchesPattern(val, c.pattern) {
+		if c.pattern != nil && present && anyNotMatching(vals, c.pattern) {
 			issues = append(issues, Issue{
 				Severity:    "error",
 				Code:        "value",
@@ -298,38 +302,45 @@ func checkSlicing(resource map[string]any, elements []any, sd map[string]any) []
 	return issues
 }
 
-// resolveElement returns the value at a relative element path, additionally
-// resolving a trailing FHIR choice-type segment ("value[x]") to whichever
-// concrete variant is present in the resource ("valueQuantity", "valueString",
-// …). For non-choice paths it is equivalent to getPath.
-func resolveElement(resource map[string]any, relPath string) any {
-	if !strings.HasSuffix(relPath, "[x]") {
-		return getPath(resource, relPath)
-	}
-	base := strings.TrimSuffix(relPath, "[x]")
+// collectValues returns every value at a relative element path, descending into
+// all entries of any repeated (array) ancestor — not just the first — and
+// resolving FHIR choice-type segments ("value[x]") to the concrete variant
+// present. The result is flat across array branches, so a path like
+// "component.code" yields one entry per component that has a code.
+func collectValues(resource map[string]any, relPath string) []any {
+	return collectAt(resource, strings.Split(relPath, "."))
+}
 
-	// Locate the map that holds the choice element, then match by prefix.
-	parent := resource
-	leaf := base
-	if i := strings.LastIndex(base, "."); i >= 0 {
-		switch p := getPath(resource, base[:i]).(type) {
-		case map[string]any:
-			parent = p
-		case []any:
-			if len(p) == 0 {
-				return nil
-			}
-			m, ok := p[0].(map[string]any)
-			if !ok {
-				return nil
-			}
-			parent = m
-		default:
+// collectAt walks parts from node, fanning out across array elements at every
+// level and returning all terminal values reached.
+func collectAt(node any, parts []string) []any {
+	if len(parts) == 0 {
+		if node == nil {
 			return nil
 		}
-		leaf = base[i+1:]
+		return []any{node}
 	}
-	return matchChoice(parent, leaf)
+	switch v := node.(type) {
+	case map[string]any:
+		return collectAt(resolveLeaf(v, parts[0]), parts[1:])
+	case []any:
+		var out []any
+		for _, e := range v {
+			out = append(out, collectAt(e, parts)...)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// resolveLeaf returns the value of a single path segment within m, handling a
+// trailing choice-type marker ("value[x]" → "valueQuantity", …).
+func resolveLeaf(m map[string]any, segment string) any {
+	if strings.HasSuffix(segment, "[x]") {
+		return matchChoice(m, strings.TrimSuffix(segment, "[x]"))
+	}
+	return m[segment]
 }
 
 // matchChoice returns the value of a choice element named leaf (e.g. "value")
@@ -347,15 +358,65 @@ func matchChoice(m map[string]any, leaf string) any {
 	return nil
 }
 
-// parentPresent reports whether the parent of relPath is present in the
-// resource (top-level elements always qualify). Used to suppress required-
-// cardinality errors for elements nested under an absent optional element.
-func parentPresent(resource map[string]any, relPath string) bool {
+// missingRequired reports whether a required element at relPath is absent where
+// it applies. A top-level element is required outright; a nested element is
+// required only when its parent is present, and when the parent repeats it must
+// be present in every entry.
+func missingRequired(resource map[string]any, relPath string) bool {
 	i := strings.LastIndex(relPath, ".")
 	if i < 0 {
-		return true
+		return len(collectValues(resource, relPath)) == 0
 	}
-	return getPath(resource, relPath[:i]) != nil
+	parentPath, leaf := relPath[:i], relPath[i+1:]
+	parents := mapsAt(resource, parentPath)
+	if len(parents) == 0 {
+		return false // parent absent → not applicable
+	}
+	for _, p := range parents {
+		if resolveLeaf(p, leaf) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// mapsAt returns every object reached at parentPath, flattening repeated
+// (array) ancestors into their individual element maps.
+func mapsAt(resource map[string]any, parentPath string) []map[string]any {
+	var out []map[string]any
+	for _, v := range collectAt(resource, strings.Split(parentPath, ".")) {
+		switch t := v.(type) {
+		case map[string]any:
+			out = append(out, t)
+		case []any:
+			for _, e := range t {
+				if m, ok := e.(map[string]any); ok {
+					out = append(out, m)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// anyNotEqual reports whether any value fails to equal the fixed value.
+func anyNotEqual(vals []any, fixed any) bool {
+	for _, v := range vals {
+		if !deepEqual(v, fixed) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyNotMatching reports whether any value fails to satisfy the pattern.
+func anyNotMatching(vals []any, pattern any) bool {
+	for _, v := range vals {
+		if !matchesPattern(v, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // getPath navigates a dot-delimited relative path into a resource map.

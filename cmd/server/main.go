@@ -98,13 +98,16 @@ func run() error {
 	}
 
 	// Load the base FHIR R4 StructureDefinitions used for base validation
-	// (idempotent — skips the decompress/parse when already populated).
+	// (idempotent — skips the decompress/parse when already populated). When
+	// base validation is enabled, a load failure is fatal: continuing would
+	// silently serve writes without the validation the operator asked for.
+	// Disable with FHIR_BASE_VALIDATION=false if base definitions are unwanted.
 	if cfg.BaseValidation {
-		if n, err := basedef.Load(ctx, pool, false); err != nil {
-			slog.Warn("base definition load failed (non-fatal)", "err", err)
-		} else {
-			slog.Info("base FHIR R4 definitions ready", "resourceTypes", n)
+		n, err := basedef.Load(ctx, pool, false)
+		if err != nil {
+			return fmt.Errorf("load base FHIR R4 definitions (set FHIR_BASE_VALIDATION=false to disable): %w", err)
 		}
+		slog.Info("base FHIR R4 definitions ready", "resourceTypes", n)
 	}
 
 	// Search param registry — loads base + already-recorded IG params from DB

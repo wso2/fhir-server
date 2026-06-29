@@ -26,9 +26,10 @@ func TestDecode(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	// R4 has 140+ base resource types; guard against a truncated/empty asset.
-	if len(defs) < 140 {
-		t.Fatalf("expected 140+ base definitions, got %d", len(defs))
+	// The shipped bundle must contain the full base resource set; an exact
+	// check catches a truncated asset where a lower bound would not.
+	if len(defs) != expectedDefinitions {
+		t.Fatalf("expected exactly %d base definitions, got %d", expectedDefinitions, len(defs))
 	}
 
 	byType := make(map[string]def, len(defs))

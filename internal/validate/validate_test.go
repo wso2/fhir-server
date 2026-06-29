@@ -109,6 +109,34 @@ func TestValidate_RequiredUnderPresentParentEnforced(t *testing.T) {
 	}
 }
 
+func TestValidate_RequiredChildAcrossRepeatedParents(t *testing.T) {
+	// Observation.component.code is required; every component entry must carry it.
+	sd := minSD("Observation", []map[string]any{
+		{"path": "Observation.component", "min": float64(0), "max": "*"},
+		{"path": "Observation.component.code", "min": float64(1), "max": "1"},
+	})
+	ok := map[string]any{
+		"resourceType": "Observation",
+		"component": []any{
+			map[string]any{"code": map[string]any{"text": "a"}},
+			map[string]any{"code": map[string]any{"text": "b"}},
+		},
+	}
+	if issues := AgainstProfile(ok, sd); hasError(issues, "required") {
+		t.Errorf("all components have code; expected no required error, got %v", issues)
+	}
+	bad := map[string]any{
+		"resourceType": "Observation",
+		"component": []any{
+			map[string]any{"code": map[string]any{"text": "a"}},
+			map[string]any{"note": "missing code"},
+		},
+	}
+	if issues := AgainstProfile(bad, sd); !hasError(issues, "required") {
+		t.Errorf("a later component lacks code; expected required error, got %v", issues)
+	}
+}
+
 func TestValidate_Forbidden(t *testing.T) {
 	sd := minSD("Patient", []map[string]any{
 		{"path": "Patient.multipleBirthBoolean", "min": float64(0), "max": "0"},
