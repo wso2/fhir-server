@@ -48,25 +48,22 @@ const bundleFile = "profiles-resources.min.json.gz"
 // Load decompresses the embedded base R4 StructureDefinition bundle and upserts
 // each base resource definition into base_definitions, keyed by resource type.
 //
-// It is idempotent. The decompress-and-parse step is comparatively expensive
-// (~35 MB of JSON), so when force is false and the table is already populated,
-// Load skips that work and returns the existing count. Pass force=true to
-// re-apply the embedded definitions (e.g. after upgrading the server).
+// It is idempotent. The embedded bundle is the source of truth: when force is
+// false, Load skips the upserts only when the table already contains every base
+// resource type the bundle ships (a set derived from the bundle, not a hardcoded
+// count). A partial earlier load (missing types) or a changed bundle (new types)
+// therefore triggers a full reload. Pass force=true to re-apply unconditionally.
 func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
-	if !force {
-		var n int
-		// The load below is transactional (all-or-nothing), so any existing rows
-		// mean a previous load committed in full — a partial load can never be
-		// observed. In that case skip the expensive decompress/parse. (A failed
-		// load rolls back to zero rows and is retried on the next start.)
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions`).Scan(&n); err == nil && n > 0 {
-			return n, nil
-		}
-	}
-
 	defs, err := decode()
 	if err != nil {
 		return 0, err
+	}
+
+	if !force {
+		have, err := loadedTypes(ctx, pool)
+		if err == nil && containsAll(have, defs) {
+			return len(have), nil
+		}
 	}
 
 	// Apply the whole set in one transaction so the table is never left in a
@@ -96,6 +93,34 @@ func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 		return 0, fmt.Errorf("commit base definitions: %w", err)
 	}
 	return len(defs), nil
+}
+
+// loadedTypes returns the set of resource types currently in base_definitions.
+func loadedTypes(ctx context.Context, pool *pgxpool.Pool) (map[string]struct{}, error) {
+	rows, err := pool.Query(ctx, `SELECT resource_type FROM base_definitions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	have := make(map[string]struct{})
+	for rows.Next() {
+		var rt string
+		if err := rows.Scan(&rt); err != nil {
+			return nil, err
+		}
+		have[rt] = struct{}{}
+	}
+	return have, rows.Err()
+}
+
+// containsAll reports whether have includes every resource type in defs.
+func containsAll(have map[string]struct{}, defs []def) bool {
+	for _, d := range defs {
+		if _, ok := have[d.resourceType]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type def struct {
