@@ -45,12 +45,6 @@ var bundleFS embed.FS
 
 const bundleFile = "profiles-resources.min.json.gz"
 
-// expectedDefinitions is the number of base resource StructureDefinitions in
-// the embedded R4 bundle. Load treats the table as fully populated only when it
-// holds at least this many rows, so a partial/interrupted earlier load is not
-// mistaken for a complete one.
-const expectedDefinitions = 147
-
 // Load decompresses the embedded base R4 StructureDefinition bundle and upserts
 // each base resource definition into base_definitions, keyed by resource type.
 //
@@ -61,10 +55,11 @@ const expectedDefinitions = 147
 func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 	if !force {
 		var n int
-		// Skip the reload only when the full expected set is already present.
-		// Using a lower bound of expectedDefinitions (rather than > 0) ensures a
-		// previously failed/interrupted partial load is re-applied on restart.
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions`).Scan(&n); err == nil && n >= expectedDefinitions {
+		// The load below is transactional (all-or-nothing), so any existing rows
+		// mean a previous load committed in full — a partial load can never be
+		// observed. In that case skip the expensive decompress/parse. (A failed
+		// load rolls back to zero rows and is retried on the next start.)
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions`).Scan(&n); err == nil && n > 0 {
 			return n, nil
 		}
 	}

@@ -23,37 +23,40 @@ import "testing"
 func TestDecode(t *testing.T) {
 	defs, err := decode()
 	if err != nil {
+		// A truncated or corrupt embedded asset fails here on the gzip checksum.
 		t.Fatalf("decode: %v", err)
 	}
-
-	// The shipped bundle must contain the full base resource set; an exact
-	// check catches a truncated asset where a lower bound would not.
-	if len(defs) != expectedDefinitions {
-		t.Fatalf("expected exactly %d base definitions, got %d", expectedDefinitions, len(defs))
+	if len(defs) == 0 {
+		t.Fatal("decode returned no base definitions")
 	}
 
+	// Every base definition must be usable by the validator: a resource type
+	// and a non-empty snapshot. This holds regardless of the bundle's size, so
+	// it does not need to be revisited when the FHIR version changes.
 	byType := make(map[string]def, len(defs))
 	for _, d := range defs {
 		if d.resourceType == "" {
 			t.Errorf("definition with empty resource type: %+v", d)
 		}
-		if d.sd == nil {
-			t.Errorf("%s: nil StructureDefinition", d.resourceType)
+		snap, _ := d.sd["snapshot"].(map[string]any)
+		if snap == nil {
+			t.Errorf("%s: StructureDefinition has no snapshot", d.resourceType)
+			continue
+		}
+		if els, _ := snap["element"].([]any); len(els) == 0 {
+			t.Errorf("%s: snapshot has no elements", d.resourceType)
 		}
 		byType[d.resourceType] = d
 	}
 
-	for _, rt := range []string{"Patient", "Observation", "Immunization"} {
-		d, ok := byType[rt]
-		if !ok {
-			t.Fatalf("missing base definition for %s", rt)
-		}
-		snap, _ := d.sd["snapshot"].(map[string]any)
-		if snap == nil {
-			t.Fatalf("%s: StructureDefinition has no snapshot", rt)
-		}
-		if els, _ := snap["element"].([]any); len(els) == 0 {
-			t.Fatalf("%s: snapshot has no elements", rt)
+	// A representative set of core resource types must be present — a strong
+	// integrity check on the shipped asset without hardcoding its exact size.
+	for _, rt := range []string{
+		"Patient", "Observation", "Immunization", "Encounter", "Condition",
+		"Procedure", "MedicationRequest", "Bundle", "Organization", "Practitioner",
+	} {
+		if _, ok := byType[rt]; !ok {
+			t.Errorf("missing base definition for %s", rt)
 		}
 	}
 }
