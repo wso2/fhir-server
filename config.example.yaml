@@ -41,9 +41,13 @@ database:
   # createTables: false
 
 ig:
-  # Implementation guides to load at startup.
-  packages:
-    - hl7.fhir.us.core@6.1.0
+  # Implementation guides to load at startup. None are loaded by default —
+  # the server runs as a plain base FHIR R4 store until you opt in here.
+  # Loading an IG fetches its package from registryUrl on first boot and
+  # enables that guide's search parameters and profile validation.
+  # Uncomment to load, e.g. US Core:
+  packages: []
+    # - hl7.fhir.us.core@6.1.0
     # - hl7.fhir.us.carin-bb@2.0.0
   registryUrl: https://packages.fhir.org
   forceReload: false
