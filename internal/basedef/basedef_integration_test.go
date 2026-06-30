@@ -74,3 +74,31 @@ func TestLoad_ReloadsWhenIncomplete(t *testing.T) {
 		t.Fatalf("expected Patient to be reloaded, got count %d", n)
 	}
 }
+
+// A row for a type the bundle does not ship is pruned on the next load, so the
+// table mirrors the embedded set exactly.
+func TestLoad_PrunesStaleDefinitions(t *testing.T) {
+	pool := testutil.MustDB(t)
+	ctx := context.Background()
+
+	if _, err := Load(ctx, pool, false); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO base_definitions (resource_type, sd_url, sd_json) VALUES ('FakeResource', '', '{}'::jsonb)`); err != nil {
+		t.Fatalf("insert stale row: %v", err)
+	}
+
+	if _, err := Load(ctx, pool, false); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM base_definitions WHERE resource_type = 'FakeResource'`).Scan(&n); err != nil {
+		t.Fatalf("count FakeResource: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected stale definition to be pruned, got count %d", n)
+	}
+}

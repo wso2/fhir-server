@@ -61,20 +61,25 @@ func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 
 	if !force {
 		have, err := loadedTypes(ctx, pool)
-		if err == nil && containsAll(have, defs) {
-			return len(have), nil
+		// Skip only when the table matches the bundle exactly. Requiring equal
+		// sizes (not just a superset) means a shrunk bundle — one that dropped a
+		// type — still triggers a reconciling reload that prunes the stale rows.
+		if err == nil && len(have) == len(defs) && containsAll(have, defs) {
+			return len(defs), nil
 		}
 	}
 
-	// Apply the whole set in one transaction so the table is never left in a
-	// partially-loaded state on failure.
+	// Reconcile the table to exactly the embedded set in one transaction, so it
+	// is never left partially loaded and never retains types the bundle dropped.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) // no-op once committed
 
+	shipped := make([]string, 0, len(defs))
 	for _, d := range defs {
+		shipped = append(shipped, d.resourceType)
 		sdJSON, err := json.Marshal(d.sd)
 		if err != nil {
 			return 0, fmt.Errorf("marshal base SD (%s): %w", d.resourceType, err)
@@ -88,6 +93,12 @@ func Load(ctx context.Context, pool *pgxpool.Pool, force bool) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("upsert base_definitions (%s): %w", d.resourceType, err)
 		}
+	}
+	// Drop any rows for types the bundle no longer ships so the table mirrors
+	// the embedded set exactly.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM base_definitions WHERE NOT (resource_type = ANY($1))`, shipped); err != nil {
+		return 0, fmt.Errorf("prune stale base_definitions: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit base definitions: %w", err)
