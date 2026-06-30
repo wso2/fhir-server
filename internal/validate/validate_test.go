@@ -61,6 +61,111 @@ func TestValidate_RequiredMissing(t *testing.T) {
 	}
 }
 
+func TestValidate_RequiredChoicePresent(t *testing.T) {
+	// Immunization.occurrence[x] is required; a concrete variant satisfies it.
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.occurrence[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization", "occurrenceDateTime": "2026-01-01"}
+	if issues := AgainstProfile(resource, sd); hasError(issues, "required") {
+		t.Errorf("choice variant present should satisfy required, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredChoiceMissing(t *testing.T) {
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.occurrence[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization"}
+	if issues := AgainstProfile(resource, sd); !hasError(issues, "required") {
+		t.Errorf("missing required choice should error, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredUnderAbsentParentNotEnforced(t *testing.T) {
+	// doseNumber[x] is required, but only when its optional parent
+	// protocolApplied is present. With protocolApplied absent, no error.
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.protocolApplied", "min": float64(0), "max": "*"},
+		{"path": "Immunization.protocolApplied.doseNumber[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{"resourceType": "Immunization", "occurrenceDateTime": "2026-01-01"}
+	if issues := AgainstProfile(resource, sd); hasError(issues, "required") {
+		t.Errorf("required child under absent optional parent must not fire, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredUnderPresentParentEnforced(t *testing.T) {
+	sd := minSD("Immunization", []map[string]any{
+		{"path": "Immunization.protocolApplied", "min": float64(0), "max": "*"},
+		{"path": "Immunization.protocolApplied.doseNumber[x]", "min": float64(1), "max": "1"},
+	})
+	resource := map[string]any{
+		"resourceType":    "Immunization",
+		"protocolApplied": []any{map[string]any{"series": "A"}},
+	}
+	if issues := AgainstProfile(resource, sd); !hasError(issues, "required") {
+		t.Errorf("required child of a present parent should error, got %v", issues)
+	}
+}
+
+func TestCompile_ReusableAcrossResources(t *testing.T) {
+	// Compile once, validate many: the same *Profile validates multiple
+	// resources without re-parsing the StructureDefinition.
+	sd := minSD("Observation", []map[string]any{
+		{"path": "Observation.status", "min": float64(1), "max": "1"},
+	})
+	p := Compile(sd)
+	if p == nil {
+		t.Fatal("Compile returned nil for a valid SD")
+	}
+	if issues := p.Validate(map[string]any{"resourceType": "Observation"}); !hasError(issues, "required") {
+		t.Errorf("missing status: expected required error, got %v", issues)
+	}
+	if issues := p.Validate(map[string]any{"resourceType": "Observation", "status": "final"}); len(issues) != 0 {
+		t.Errorf("status present: expected no issues, got %v", issues)
+	}
+}
+
+func TestCompile_NoElementsIsNoOp(t *testing.T) {
+	// An SD with no usable elements compiles to nil and validates as a no-op.
+	if p := Compile(map[string]any{"resourceType": "StructureDefinition", "type": "Patient"}); p != nil {
+		t.Errorf("expected nil profile for SD without elements, got %+v", p)
+	}
+	var p *Profile
+	if issues := p.Validate(map[string]any{"resourceType": "Patient"}); issues != nil {
+		t.Errorf("nil profile should validate as no-op, got %v", issues)
+	}
+}
+
+func TestValidate_RequiredChildAcrossRepeatedParents(t *testing.T) {
+	// Observation.component.code is required; every component entry must carry it.
+	sd := minSD("Observation", []map[string]any{
+		{"path": "Observation.component", "min": float64(0), "max": "*"},
+		{"path": "Observation.component.code", "min": float64(1), "max": "1"},
+	})
+	ok := map[string]any{
+		"resourceType": "Observation",
+		"component": []any{
+			map[string]any{"code": map[string]any{"text": "a"}},
+			map[string]any{"code": map[string]any{"text": "b"}},
+		},
+	}
+	if issues := AgainstProfile(ok, sd); hasError(issues, "required") {
+		t.Errorf("all components have code; expected no required error, got %v", issues)
+	}
+	bad := map[string]any{
+		"resourceType": "Observation",
+		"component": []any{
+			map[string]any{"code": map[string]any{"text": "a"}},
+			map[string]any{"note": "missing code"},
+		},
+	}
+	if issues := AgainstProfile(bad, sd); !hasError(issues, "required") {
+		t.Errorf("a later component lacks code; expected required error, got %v", issues)
+	}
+}
+
 func TestValidate_Forbidden(t *testing.T) {
 	sd := minSD("Patient", []map[string]any{
 		{"path": "Patient.multipleBirthBoolean", "min": float64(0), "max": "0"},

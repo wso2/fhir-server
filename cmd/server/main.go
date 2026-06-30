@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/wso2/fhir-server/internal/basedef"
 	"github.com/wso2/fhir-server/internal/config"
 	"github.com/wso2/fhir-server/internal/db"
 	"github.com/wso2/fhir-server/internal/handler"
@@ -96,6 +97,19 @@ func run() error {
 		slog.Warn("search param seed failed (non-fatal)", "err", err)
 	}
 
+	// Load the base FHIR R4 StructureDefinitions used for base validation
+	// (idempotent — skips the decompress/parse when already populated). When
+	// base validation is enabled, a load failure is fatal: continuing would
+	// silently serve writes without the validation the operator asked for.
+	// Disable with FHIR_BASE_VALIDATION=false if base definitions are unwanted.
+	if cfg.BaseValidation {
+		n, err := basedef.Load(ctx, pool, false)
+		if err != nil {
+			return fmt.Errorf("load base FHIR R4 definitions (set FHIR_BASE_VALIDATION=false to disable): %w", err)
+		}
+		slog.Info("base FHIR R4 definitions ready", "resourceTypes", n)
+	}
+
 	// Search param registry — loads base + already-recorded IG params from DB
 	registry := searchparam.NewRegistry()
 	if err := registry.Load(ctx, pool); err != nil {
@@ -116,8 +130,12 @@ func run() error {
 		igReady.Store(1)
 	}
 
-	router := handler.NewRouter(s, pool, registry, cfg.BaseURL, &igReady, cfg.ValidateOnWrite)
-	slog.Info("FHIR router initialized", "baseURL", cfg.BaseURL, "validateOnWrite", cfg.ValidateOnWrite, "igPackages", len(cfg.IGPackages))
+	router := handler.NewRouter(s, pool, registry, cfg.BaseURL, &igReady, handler.Options{
+		ValidateOnWrite:       cfg.ValidateOnWrite,
+		DisableBaseValidation: !cfg.BaseValidation,
+	})
+	slog.Info("FHIR router initialized", "baseURL", cfg.BaseURL,
+		"validateOnWrite", cfg.ValidateOnWrite, "baseValidation", cfg.BaseValidation, "igPackages", len(cfg.IGPackages))
 
 	// Timeouts are configurable (SERVER_READ/WRITE/IDLE_TIMEOUT or server.*Timeout
 	// in the config file): WriteTimeout bounds the whole handler execution, so the

@@ -310,6 +310,20 @@ CREATE TABLE IF NOT EXISTS ig_profiles (
     UNIQUE (profile_url)
 );
 
+-- ─── Base FHIR R4 StructureDefinitions ────────────────────────────────────────
+-- The core FHIR R4 resource StructureDefinitions (kind=resource,
+-- derivation=specialization) shipped with the server and loaded at startup (see
+-- internal/basedef). They let the server validate resources against the base
+-- spec even when no profile is supplied. Like ig_profiles this is reference data,
+-- not PHI, and is identical across tenants — so it carries no tenant_id and is
+-- intentionally excluded from the Row-Level Security policies below.
+CREATE TABLE IF NOT EXISTS base_definitions (
+    resource_type TEXT        NOT NULL PRIMARY KEY,
+    sd_url        TEXT        NOT NULL DEFAULT '',
+    sd_json       JSONB       NOT NULL,
+    loaded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ─── FHIR Terminology: closure tables ─────────────────────────────────────────
 -- Support the $closure operation, which maintains a transitive closure table of
 -- subsumption relationships between coded concepts. A closure context groups
@@ -433,3 +447,5 @@ END
 $rls$;
 
 INSERT INTO schema_version (version) VALUES (6) ON CONFLICT DO NOTHING;
+-- v7: add base_definitions (core FHIR R4 StructureDefinitions for base validation)
+INSERT INTO schema_version (version) VALUES (7) ON CONFLICT DO NOTHING;

@@ -47,6 +47,7 @@ type Config struct {
 	IGForceReload   bool     // re-load IGs even if already recorded in ig_packages
 	IGCacheDir      string   // local .tgz cache dir (default: .fhir-ig-cache)
 	ValidateOnWrite bool     // enforce profile validation on create/update (default off)
+	BaseValidation  bool     // validate writes against base FHIR R4 StructureDefinitions (default on)
 	TerminologyURL  string   // base URL of the FHIR terminology server for :in/:not-in (empty = disabled)
 	CreateTables    bool     // create database tables on startup (requires a DB role with DDL privileges; default off)
 
@@ -153,6 +154,8 @@ func resolve(fc *FileConfig) (*Config, error) {
 	}
 
 	validateOnWrite := strings.EqualFold(os.Getenv("FHIR_VALIDATE_ON_WRITE"), "true")
+	// Base validation is on by default; set FHIR_BASE_VALIDATION=false to disable.
+	baseValidation := !strings.EqualFold(os.Getenv("FHIR_BASE_VALIDATION"), "false")
 	terminologyURL := os.Getenv("FHIR_TERMINOLOGY_URL")
 
 	createTables := false
@@ -186,6 +189,7 @@ func resolve(fc *FileConfig) (*Config, error) {
 		IGForceReload:   igForceReload,
 		IGCacheDir:      igCacheDir,
 		ValidateOnWrite: validateOnWrite,
+		BaseValidation:  baseValidation,
 		TerminologyURL:  terminologyURL,
 		CreateTables:    createTables,
 		ReadTimeout:     readTimeout,

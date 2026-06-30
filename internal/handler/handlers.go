@@ -17,6 +17,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -654,10 +655,8 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 		// count == 0 → fall through to a normal create.
 	}
 
-	if h.validateOnWrite {
-		if stop := h.enforceProfiles(w, r, body); stop {
-			return
-		}
+	if stop := h.enforceWrite(w, r, body); stop {
+		return
 	}
 
 	resource, err := h.store.Create(r.Context(), rt, body)
@@ -724,10 +723,8 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 		ifMatchVersion = v
 	}
 
-	if h.validateOnWrite {
-		if stop := h.enforceProfiles(w, r, body); stop {
-			return
-		}
+	if stop := h.enforceWrite(w, r, body); stop {
+		return
 	}
 
 	resource, err := h.store.Update(r.Context(), rt, id, body, ifMatchVersion)
@@ -1194,6 +1191,13 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 	}
 
 	issues := h.validateAgainstProfiles(r, body, profileURLs)
+	// Include base FHIR R4 validation (when enabled) so $validate reports
+	// structural problems even when the caller names no profile. Guarded by the
+	// same flag as writes so DisableBaseValidation turns the feature off fully.
+	if h.baseValidation {
+		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	}
+
 	if len(issues) == 0 {
 		writeFHIR(w, r, http.StatusOK, map[string]any{
 			"resourceType": "OperationOutcome",
@@ -1206,8 +1210,12 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 		return
 	}
 
+	hasError := false
 	fhirIssues := make([]any, 0, len(issues))
 	for _, iss := range issues {
+		if iss.Severity == "error" {
+			hasError = true
+		}
 		fhirIssues = append(fhirIssues, map[string]any{
 			"severity":    iss.Severity,
 			"code":        iss.Code,
@@ -1215,7 +1223,13 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 			"expression":  []string{iss.Expression},
 		})
 	}
-	writeFHIR(w, r, http.StatusUnprocessableEntity, map[string]any{
+	// Warnings alone (e.g. base FHIRPath invariants the engine can't fully
+	// evaluate) are reported but do not make the resource invalid.
+	status := http.StatusOK
+	if hasError {
+		status = http.StatusUnprocessableEntity
+	}
+	writeFHIR(w, r, status, map[string]any{
 		"resourceType": "OperationOutcome",
 		"issue":        fhirIssues,
 	})
@@ -1428,10 +1442,36 @@ func validateRequiredFields(rt string, body map[string]any) string {
 	return ""
 }
 
-// enforceProfiles runs profile validation on a write (create/update) when
-// validateOnWrite is enabled. Writes the OperationOutcome and returns true
-// when the caller should abort. Profiles are taken from meta.profile.
-func (h *fhirHandler) enforceProfiles(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
+// enforceWrite runs validation on a create/update and, when there is a blocking
+// (error-severity) problem, writes a 422 OperationOutcome and returns true so
+// the caller aborts. Base FHIR R4 validation runs when enabled (the default);
+// profile validation against meta.profile runs when validateOnWrite is enabled.
+// Warning-only findings never block a write.
+func (h *fhirHandler) enforceWrite(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
+	var issues []validate.Issue
+	if h.baseValidation {
+		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	}
+	if h.validateOnWrite {
+		issues = append(issues, h.profileIssues(r, body)...)
+	}
+
+	blocking := false
+	for _, iss := range issues {
+		if iss.Severity == "error" {
+			blocking = true
+			break
+		}
+	}
+	if !blocking {
+		return false
+	}
+	writeIssues(w, r, issues)
+	return true
+}
+
+// profileIssues validates body against the profiles named in meta.profile.
+func (h *fhirHandler) profileIssues(r *http.Request, body map[string]any) []validate.Issue {
 	var profileURLs []string
 	if meta, ok := body["meta"].(map[string]any); ok {
 		if profs, ok := meta["profile"].([]any); ok {
@@ -1443,12 +1483,44 @@ func (h *fhirHandler) enforceProfiles(w http.ResponseWriter, r *http.Request, bo
 		}
 	}
 	if len(profileURLs) == 0 {
-		return false
+		return nil
 	}
-	issues := h.validateAgainstProfiles(r, body, profileURLs)
-	if len(issues) == 0 {
-		return false
+	return h.validateAgainstProfiles(r, body, profileURLs)
+}
+
+// baseValidationIssues validates body against the base FHIR R4 StructureDefinition
+// for its resource type. Structural problems (cardinality, fixed/pattern) are
+// reported as errors; FHIRPath invariant failures are demoted to warnings,
+// because the server's FHIRPath engine implements a subset of the spec and a
+// resource should not be rejected over an invariant it cannot fully evaluate.
+// Returns nil when no base definition is loaded for the type.
+func (h *fhirHandler) baseValidationIssues(ctx context.Context, body map[string]any) []validate.Issue {
+	if h.baseDefs == nil {
+		return nil
 	}
+	rt, _ := body["resourceType"].(string)
+	if rt == "" {
+		return nil
+	}
+	prof, err := h.baseDefs.Lookup(ctx, rt)
+	if err != nil {
+		slog.Warn("base definition lookup failed", "resourceType", rt, "err", err)
+		return nil
+	}
+	if prof == nil {
+		return nil
+	}
+	issues := prof.Validate(body)
+	for i := range issues {
+		if issues[i].Code == "invariant" {
+			issues[i].Severity = "warning"
+		}
+	}
+	return issues
+}
+
+// writeIssues emits a 422 OperationOutcome carrying the given validation issues.
+func writeIssues(w http.ResponseWriter, r *http.Request, issues []validate.Issue) {
 	fhirIssues := make([]any, 0, len(issues))
 	for _, iss := range issues {
 		fhirIssues = append(fhirIssues, map[string]any{
@@ -1462,7 +1534,6 @@ func (h *fhirHandler) enforceProfiles(w http.ResponseWriter, r *http.Request, bo
 		"resourceType": "OperationOutcome",
 		"issue":        fhirIssues,
 	})
-	return true
 }
 
 // ─── Compartment search ───────────────────────────────────────────────────────
