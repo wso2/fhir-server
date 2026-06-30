@@ -38,7 +38,7 @@ var csvFS embed.FS
 // search_param_definitions. Rows that already exist (by resource_type + param_name)
 // are silently skipped so custom parameters are never overwritten.
 func SeedSearchParams(ctx context.Context, pool *pgxpool.Pool) error {
-	slog.Info("starting to seed FHIR R4 search parameters")
+	slog.Debug("seeding base FHIR R4 search parameters from the international (HL7) spec")
 	f, err := csvFS.Open("fhir-r4-search-params.csv")
 	if err != nil {
 		return fmt.Errorf("open embedded csv: %w", err)
@@ -77,6 +77,7 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 	defer tx.Rollback(ctx)
 
 	inserted := 0
+	skipped := 0 // already present (ON CONFLICT DO NOTHING) — e.g. on restart or custom override
 	for {
 		row, err := cr.Read()
 		if err == io.EOF {
@@ -110,7 +111,7 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 			componentsJSON = strings.TrimSpace(row[colIdx.componentsJSON])
 		}
 
-		_, err = tx.Exec(ctx, `
+		ct, err := tx.Exec(ctx, `
 			INSERT INTO search_param_definitions
 				(resource_type, param_name, param_type, fhirpath_expr, is_custom, target_types, components_json)
 			VALUES ($1, $2, $3, $4, FALSE, $5, $6)
@@ -120,14 +121,19 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 		if err != nil {
 			return fmt.Errorf("insert %s.%s: %w", resourceType, paramName, err)
 		}
-		inserted++
+		if ct.RowsAffected() == 1 {
+			inserted++
+		} else {
+			skipped++
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 
-	slog.Info("seeded search param definitions", "rows", inserted)
+	slog.Info("seeded base FHIR R4 search parameters from the international (HL7) spec",
+		"inserted", inserted, "skipped", skipped, "total", inserted+skipped)
 	return nil
 }
 
