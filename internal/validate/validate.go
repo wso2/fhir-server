@@ -42,12 +42,49 @@ type Issue struct {
 	Diagnostics string
 }
 
-// AgainstProfile validates resource against a loaded StructureDefinition sd.
-// Returns a slice of Issues (empty → valid).
-func AgainstProfile(resource, sd map[string]any) []Issue {
+// elemConstraint is the per-element constraint data extracted from a
+// StructureDefinition element: cardinality, forbidden flag, and fixed/pattern.
+type elemConstraint struct {
+	min     int
+	maxZero bool
+	fixed   any // fixed[x] value
+	pattern any // pattern[x] value
+}
+
+// invariant is a FHIRPath constraint declared on an element.
+type invariant struct {
+	path     string
+	key      string
+	severity string
+	human    string
+	expr     string
+}
+
+// sliceEntry describes one named slice of a sliced element.
+type sliceEntry struct {
+	name    string
+	pattern any // patternX value if set
+	min     int
+}
+
+// Profile is a compiled StructureDefinition. Everything derived solely from the
+// SD — the constraint map, invariants and slice groups — is extracted once by
+// Compile, so validating many resources of the same type does not re-parse the
+// (large) snapshot on every call. Only the per-resource checks run in Validate.
+type Profile struct {
+	rootType    string
+	constraints map[string]elemConstraint
+	invariants  []invariant
+	sliceGroups map[string][]sliceEntry
+}
+
+// Compile extracts the SD-derived validation data from a StructureDefinition.
+// It returns nil when the SD carries no usable element list (neither snapshot
+// nor differential); a nil *Profile validates as a no-op.
+func Compile(sd map[string]any) *Profile {
 	snapshot, _ := sd["snapshot"].(map[string]any)
 	if snapshot == nil {
-		// No snapshot — try differential (less complete, but better than nothing)
+		// No snapshot — fall back to differential (less complete, but better than nothing).
 		snapshot, _ = sd["differential"].(map[string]any)
 	}
 	if snapshot == nil {
@@ -58,14 +95,13 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 		return nil
 	}
 
-	// Build a flat constraint map keyed by element path.
-	type elemConstraint struct {
-		min     int
-		maxZero bool
-		fixed   any // fixed[x] value
-		pattern any // pattern[x] value
+	rootType, _ := sd["type"].(string)
+	p := &Profile{
+		rootType:    rootType,
+		constraints: make(map[string]elemConstraint, len(elements)),
+		sliceGroups: map[string][]sliceEntry{},
 	}
-	constraints := make(map[string]elemConstraint, len(elements))
+
 	for _, raw := range elements {
 		el, ok := raw.(map[string]any)
 		if !ok {
@@ -75,8 +111,9 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 		if path == "" {
 			continue
 		}
-		var c elemConstraint
 
+		// Cardinality, forbidden flag, fixed[x], pattern[x].
+		var c elemConstraint
 		if minV, ok := el["min"].(float64); ok {
 			c.min = int(minV)
 		}
@@ -95,69 +132,71 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 				break
 			}
 		}
-		constraints[path] = c
-	}
+		p.constraints[path] = c
 
-	// Check FHIRPath invariants from constraint[].expression on each element.
-	var invariantIssues []Issue
-	for _, raw := range elements {
-		el, _ := raw.(map[string]any)
-		if el == nil {
-			continue
-		}
-		path, _ := el["path"].(string)
+		// FHIRPath invariants declared on this element.
 		constArr, _ := el["constraint"].([]any)
 		for _, cr := range constArr {
-			c, _ := cr.(map[string]any)
-			if c == nil {
+			cm, _ := cr.(map[string]any)
+			if cm == nil {
 				continue
 			}
-			severity, _ := c["severity"].(string)
-			if severity == "" {
-				severity = "error"
-			}
-			expr, _ := c["expression"].(string)
-			key, _ := c["key"].(string)
-			human, _ := c["human"].(string)
+			expr, _ := cm["expression"].(string)
 			if expr == "" {
 				continue
 			}
-			ok, err := fhirpath.EvaluateBool(expr, resource)
-			if err != nil {
-				slog.Debug("invariant eval error", "path", path, "key", key, "err", err)
-				continue
+			severity, _ := cm["severity"].(string)
+			if severity == "" {
+				severity = "error"
 			}
-			if !ok {
-				msg := human
-				if msg == "" {
-					msg = fmt.Sprintf("invariant %s failed: %s", key, expr)
+			key, _ := cm["key"].(string)
+			human, _ := cm["human"].(string)
+			p.invariants = append(p.invariants, invariant{
+				path: path, key: key, severity: severity, human: human, expr: expr,
+			})
+		}
+
+		// Named slices share their parent element's path; group them by it.
+		if sliceName, _ := el["sliceName"].(string); sliceName != "" {
+			se := sliceEntry{name: sliceName}
+			if m, ok := el["min"].(float64); ok {
+				se.min = int(m)
+			}
+			for k, v := range el {
+				if strings.HasPrefix(k, "pattern") {
+					se.pattern = v
+					break
 				}
-				invariantIssues = append(invariantIssues, Issue{
-					Severity:    severity,
-					Code:        "invariant",
-					Expression:  path,
-					Diagnostics: msg,
-				})
 			}
+			p.sliceGroups[path] = append(p.sliceGroups[path], se)
 		}
 	}
+	return p
+}
 
-	// Slicing: for elements with a slicing definition, validate that each slice
-	// entry in the resource matches its discriminator. Currently supports
-	// discriminator.type = "value" and "pattern".
-	slicingIssues := checkSlicing(resource, elements, sd)
+// AgainstProfile validates resource against a StructureDefinition. It compiles
+// the SD on every call; callers that validate many resources against the same
+// SD should Compile once and reuse the returned *Profile.
+func AgainstProfile(resource, sd map[string]any) []Issue {
+	return Compile(sd).Validate(resource)
+}
+
+// Validate checks resource against the compiled profile. A nil profile (an SD
+// with no usable elements) yields no issues.
+func (p *Profile) Validate(resource map[string]any) []Issue {
+	if p == nil {
+		return nil
+	}
 
 	var issues []Issue
-	rootType, _ := sd["type"].(string)
-
-	for path, c := range constraints {
+	for path, c := range p.constraints {
 		// Skip the root element itself (e.g. "Patient" — cardinality is meaningless there).
-		if path == rootType || !strings.Contains(path, ".") {
+		if path == p.rootType || !strings.Contains(path, ".") {
 			continue
 		}
 		// Convert SD path (Patient.name.family) to a relative key path within
 		// the resource (name.family) by stripping the resource type prefix.
-		relPath := strings.TrimPrefix(path, rootType+".")
+		relPath := strings.TrimPrefix(path, p.rootType+".")
 
 		// Collect every value at this path, descending into all repeated
 		// (array) ancestors — not just the first — so constraints are checked
@@ -202,63 +241,41 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 			})
 		}
 	}
-	issues = append(issues, invariantIssues...)
-	issues = append(issues, slicingIssues...)
+
+	// FHIRPath invariants, evaluated against the resource.
+	for _, inv := range p.invariants {
+		ok, err := fhirpath.EvaluateBool(inv.expr, resource)
+		if err != nil {
+			slog.Debug("invariant eval error", "path", inv.path, "key", inv.key, "err", err)
+			continue
+		}
+		if !ok {
+			msg := inv.human
+			if msg == "" {
+				msg = fmt.Sprintf("invariant %s failed: %s", inv.key, inv.expr)
+			}
+			issues = append(issues, Issue{
+				Severity:    inv.severity,
+				Code:        "invariant",
+				Expression:  inv.path,
+				Diagnostics: msg,
+			})
+		}
+	}
+
+	issues = append(issues, p.checkSlicing(resource)...)
 	return issues
 }
 
-// checkSlicing validates sliced elements (elements with a slicing definition).
-// For each slice group, each element in the resource's corresponding array
-// must satisfy the discriminator pattern — if a slice has a patternX, the
-// corresponding resource element must match.
-func checkSlicing(resource map[string]any, elements []any, sd map[string]any) []Issue {
-	rootType, _ := sd["type"].(string)
+// checkSlicing validates the resource's sliced elements against the slice
+// discriminators precomputed in the profile. For each slice group, an element
+// in the resource's corresponding array must satisfy the slice's pattern; a
+// required slice (min>=1) with no matching element is an error.
+func (p *Profile) checkSlicing(resource map[string]any) []Issue {
 	var issues []Issue
 
-	// Collect slice definitions: path → map[sliceName]sliceElement
-	type sliceEntry struct {
-		name    string
-		pattern any // patternX value if set
-		min     int
-	}
-	sliceGroups := map[string][]sliceEntry{}
-
-	for _, raw := range elements {
-		el, _ := raw.(map[string]any)
-		if el == nil {
-			continue
-		}
-		path, _ := el["path"].(string)
-		if path == "" {
-			continue
-		}
-		// Element is a named slice (has sliceName).
-		sliceName, _ := el["sliceName"].(string)
-		if sliceName == "" {
-			continue
-		}
-		// A slice shares the path with its parent element (e.g. a slice of
-		// "Observation.category" also has path "Observation.category"), so we
-		// group slices by that shared path.
-		basePath := path
-		se := sliceEntry{name: sliceName}
-		if m, ok := el["min"].(float64); ok {
-			se.min = int(m)
-		}
-		// Find the pattern value.
-		for k, v := range el {
-			if strings.HasPrefix(k, "pattern") {
-				se.pattern = v
-				break
-			}
-		}
-		sliceGroups[basePath] = append(sliceGroups[basePath], se)
-	}
-
-	// For each sliced path that has required slices with a pattern, check that
-	// at least one element in the resource array matches.
-	for slicedPath, slices := range sliceGroups {
-		relPath := strings.TrimPrefix(slicedPath, rootType+".")
+	for slicedPath, slices := range p.sliceGroups {
+		relPath := strings.TrimPrefix(slicedPath, p.rootType+".")
 		val := getPath(resource, relPath)
 		if val == nil {
 			// Check if any required slice is missing.

@@ -1502,15 +1502,15 @@ func (h *fhirHandler) baseValidationIssues(ctx context.Context, body map[string]
 	if rt == "" {
 		return nil
 	}
-	sd, err := h.baseDefs.Lookup(ctx, rt)
+	prof, err := h.baseDefs.Lookup(ctx, rt)
 	if err != nil {
 		slog.Warn("base definition lookup failed", "resourceType", rt, "err", err)
 		return nil
 	}
-	if sd == nil {
+	if prof == nil {
 		return nil
 	}
-	issues := validate.AgainstProfile(body, sd)
+	issues := prof.Validate(body)
 	for i := range issues {
 		if issues[i].Code == "invariant" {
 			issues[i].Severity = "warning"

@@ -38,6 +38,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/wso2/fhir-server/internal/validate"
 )
 
 //go:embed profiles-resources.min.json.gz
@@ -197,33 +199,36 @@ func decode() ([]def, error) {
 }
 
 // Cache provides concurrency-safe, memoized lookup of base StructureDefinitions
-// by resource type, backed by the base_definitions table. A negative result
-// (no base definition for a type) is cached too, so unknown/custom resource
-// types cost at most one query.
+// by resource type, backed by the base_definitions table. Each definition is
+// compiled (see validate.Compile) once on first use and the compiled *Profile
+// is cached, so repeated validation of the same resource type does not re-parse
+// the snapshot or re-read it from the database. A negative result (no base
+// definition for a type) is cached too, so unknown/custom resource types cost
+// at most one query.
 type Cache struct {
 	pool *pgxpool.Pool
 	mu   sync.RWMutex
-	m    map[string]map[string]any // resourceType -> SD (nil = known-absent)
+	m    map[string]*validate.Profile // resourceType -> compiled profile (nil = known-absent)
 }
 
 // NewCache returns a Cache backed by pool. A nil pool yields a Cache whose
 // Lookup always returns (nil, nil), which disables base validation cleanly.
 func NewCache(pool *pgxpool.Pool) *Cache {
-	return &Cache{pool: pool, m: make(map[string]map[string]any)}
+	return &Cache{pool: pool, m: make(map[string]*validate.Profile)}
 }
 
-// Lookup returns the base StructureDefinition for resourceType, or (nil, nil)
+// Lookup returns the compiled base StructureDefinition for resourceType, or nil
 // when none is loaded.
-func (c *Cache) Lookup(ctx context.Context, resourceType string) (map[string]any, error) {
+func (c *Cache) Lookup(ctx context.Context, resourceType string) (*validate.Profile, error) {
 	if c == nil || c.pool == nil || resourceType == "" {
 		return nil, nil
 	}
 
 	c.mu.RLock()
-	sd, cached := c.m[resourceType]
+	prof, cached := c.m[resourceType]
 	c.mu.RUnlock()
 	if cached {
-		return sd, nil
+		return prof, nil
 	}
 
 	var raw []byte
@@ -241,12 +246,13 @@ func (c *Cache) Lookup(ctx context.Context, resourceType string) (map[string]any
 	if err := json.Unmarshal(raw, &sdMap); err != nil {
 		return nil, fmt.Errorf("unmarshal base SD (%s): %w", resourceType, err)
 	}
-	c.put(resourceType, sdMap)
-	return sdMap, nil
+	prof = validate.Compile(sdMap)
+	c.put(resourceType, prof)
+	return prof, nil
 }
 
-func (c *Cache) put(resourceType string, sd map[string]any) {
+func (c *Cache) put(resourceType string, prof *validate.Profile) {
 	c.mu.Lock()
-	c.m[resourceType] = sd
+	c.m[resourceType] = prof
 	c.mu.Unlock()
 }

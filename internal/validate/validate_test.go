@@ -109,6 +109,35 @@ func TestValidate_RequiredUnderPresentParentEnforced(t *testing.T) {
 	}
 }
 
+func TestCompile_ReusableAcrossResources(t *testing.T) {
+	// Compile once, validate many: the same *Profile validates multiple
+	// resources without re-parsing the StructureDefinition.
+	sd := minSD("Observation", []map[string]any{
+		{"path": "Observation.status", "min": float64(1), "max": "1"},
+	})
+	p := Compile(sd)
+	if p == nil {
+		t.Fatal("Compile returned nil for a valid SD")
+	}
+	if issues := p.Validate(map[string]any{"resourceType": "Observation"}); !hasError(issues, "required") {
+		t.Errorf("missing status: expected required error, got %v", issues)
+	}
+	if issues := p.Validate(map[string]any{"resourceType": "Observation", "status": "final"}); len(issues) != 0 {
+		t.Errorf("status present: expected no issues, got %v", issues)
+	}
+}
+
+func TestCompile_NoElementsIsNoOp(t *testing.T) {
+	// An SD with no usable elements compiles to nil and validates as a no-op.
+	if p := Compile(map[string]any{"resourceType": "StructureDefinition", "type": "Patient"}); p != nil {
+		t.Errorf("expected nil profile for SD without elements, got %+v", p)
+	}
+	var p *Profile
+	if issues := p.Validate(map[string]any{"resourceType": "Patient"}); issues != nil {
+		t.Errorf("nil profile should validate as no-op, got %v", issues)
+	}
+}
+
 func TestValidate_RequiredChildAcrossRepeatedParents(t *testing.T) {
 	// Observation.component.code is required; every component entry must carry it.
 	sd := minSD("Observation", []map[string]any{
