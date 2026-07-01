@@ -1,0 +1,145 @@
+name: Release
+
+# Manually-triggered release pipeline.
+#
+# Given a release version and the next development version, it:
+#   1. Validates the inputs and that the tag does not already exist.
+#   2. Runs unit tests.
+#   3. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
+#      stamping the release version into the binary via -ldflags.
+#   4. Creates and pushes the annotated tag v<release_version>.
+#   5. Publishes a GitHub Release with the .tar.gz archives + SHA256SUMS attached.
+#   6. Opens a PR against main bumping internal/version/VERSION to
+#      <next_version>-dev.
+#
+# Prerequisites (repo/org settings):
+#   - Settings > Actions > General > Workflow permissions:
+#       "Read and write permissions" enabled, and
+#       "Allow GitHub Actions to create and approve pull requests" enabled
+#       (required for step 6; the release itself still succeeds without it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Version to release, no leading v (e.g. 0.5.0)"
+        required: true
+        type: string
+      next_version:
+        description: "Next development version, no leading v (e.g. 0.6.0). '-dev' is appended on main."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate inputs
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+        run: |
+          set -euo pipefail
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if ! echo "$RELEASE_VERSION" | grep -Eq "$semver"; then
+            echo "::error::release_version '$RELEASE_VERSION' is not a plain semver like 0.5.0"; exit 1
+          fi
+          if ! echo "$NEXT_VERSION" | grep -Eq "$semver"; then
+            echo "::error::next_version '$NEXT_VERSION' is not a plain semver like 0.6.0"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$RELEASE_VERSION" >/dev/null; then
+            echo "::error::tag v$RELEASE_VERSION already exists"; exit 1
+          fi
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Cross-compile release binaries
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X github.com/wso2/fhir-server/internal/version.Version=${RELEASE_VERSION}"
+          mkdir -p dist
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS="${platform%/*}"
+            GOARCH="${platform#*/}"
+            name="fhir-server-${RELEASE_VERSION}-${GOOS}-${GOARCH}"
+            echo "Building ${name}"
+            mkdir -p "dist/${name}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/${name}/fhir-server" ./cmd/server
+            cp README.md LICENSE "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            rm -rf "dist/${name}"
+          done
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
+          echo "Artifacts:"; ls -la dist
+
+      - name: Create and push tag
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${RELEASE_VERSION}" -m "Release v${RELEASE_VERSION}"
+          git push origin "v${RELEASE_VERSION}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          gh release create "v${RELEASE_VERSION}" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --title "v${RELEASE_VERSION}" \
+            --generate-notes
+
+      - name: Open version-bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+        run: |
+          set -euo pipefail
+          next_dev="${NEXT_VERSION}-dev"
+          branch="chore/bump-v${NEXT_VERSION}-dev"
+
+          git fetch origin main
+          git checkout -B "$branch" origin/main
+          printf '%s\n' "$next_dev" > internal/version/VERSION
+
+          if git diff --quiet; then
+            echo "VERSION already at ${next_dev}; nothing to bump."
+            exit 0
+          fi
+
+          git add internal/version/VERSION
+          git commit -m "chore: bump version to ${next_dev}"
+          git push --force-with-lease origin "$branch"
+
+          # PR creation needs "Allow GitHub Actions to create and approve pull
+          # requests". If it's disabled the release is already done; surface the
+          # manual step instead of failing the whole run.
+          if ! gh pr create \
+                --base main --head "$branch" \
+                --title "chore: bump version to ${next_dev}" \
+                --body "Automated version bump after releasing v${RELEASE_VERSION}. Sets \`internal/version/VERSION\` to \`${next_dev}\`."; then
+            echo "::warning::Could not open the bump PR automatically. Branch '${branch}' is pushed; open the PR manually or enable Actions PR creation in repo settings."
+          fi
