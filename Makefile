@@ -5,6 +5,12 @@ BINARY      := fhir-server
 PKG         := ./cmd/server
 DOCKER_IMAGE := fhir-server:latest
 
+# Version stamped into the binary. Defaults to the tracked VERSION file; the
+# release pipeline overrides it with the tag being released. Injected via -X.
+VERSION     ?= $(shell tr -d '[:space:]' < internal/version/VERSION 2>/dev/null || echo dev)
+VERSION_PKG := github.com/wso2/fhir-server/internal/version
+LDFLAGS     := -X $(VERSION_PKG).Version=$(VERSION)
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -14,7 +20,7 @@ help: ## Show this help
 
 .PHONY: build
 build: ## Build the server binary
-	go build -o $(BINARY) $(PKG)
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) $(PKG)
 
 .PHONY: run
 run: ## Run the server (uses env vars / --config)

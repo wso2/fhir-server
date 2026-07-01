@@ -39,6 +39,7 @@ import (
 	"github.com/wso2/fhir-server/internal/seed"
 	"github.com/wso2/fhir-server/internal/store"
 	"github.com/wso2/fhir-server/internal/terminology"
+	"github.com/wso2/fhir-server/internal/version"
 )
 
 func main() {
@@ -50,9 +51,18 @@ func main() {
 
 func run() error {
 	var configPath string
+	var showVersion bool
 	flag.StringVar(&configPath, "config", "", "Path to YAML config file (overrides FHIR_SERVER_CONFIG env var)")
 	flag.StringVar(&configPath, "c", "", "Path to YAML config file (shorthand for -config)")
+	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
+	flag.BoolVar(&showVersion, "v", false, "Print version information and exit (shorthand for -version)")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version.String())
+		return nil
+	}
+
 	if configPath == "" {
 		configPath = os.Getenv("FHIR_SERVER_CONFIG")
 	}
@@ -63,6 +73,9 @@ func run() error {
 	}
 
 	setupLogging(cfg.LogLevel)
+
+	ver, commit, buildDate := version.Info()
+	slog.Info("starting WSO2 FHIR Server", "version", ver, "commit", commit, "buildDate", buildDate)
 
 	if configPath != "" {
 		slog.Info("loaded config file", "path", configPath)

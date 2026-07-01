@@ -1,0 +1,184 @@
+name: Release
+
+# Manually-triggered release pipeline.
+#
+# Must be dispatched from main. Given a release version and the next development
+# version, it:
+#   1. Validates the inputs: dispatched from main, both plain semver,
+#      next_version > release_version, and the tag does not already exist.
+#   2. Creates a release commit setting internal/version/VERSION to the release
+#      version, so the tagged tree reads that version (this commit is reachable
+#      only via the tag; main is not touched here).
+#   3. Runs unit tests.
+#   4. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
+#      stamping the release version into the binary via -ldflags.
+#   5. Tags the release commit as v<release_version>, pushes the tag, and
+#      publishes a GitHub Release with the .tar.gz archives + SHA256SUMS. If
+#      publishing fails the tag is deleted so the run can be retried.
+#   6. Opens a PR against main bumping internal/version/VERSION to
+#      <next_version>-dev.
+#
+# Prerequisites (repo/org settings):
+#   - Settings > Actions > General > Workflow permissions:
+#       "Read and write permissions" enabled, and
+#       "Allow GitHub Actions to create and approve pull requests" enabled
+#       (required for step 6; the release itself still succeeds without it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Version to release, no leading v (e.g. 0.5.0)"
+        required: true
+        type: string
+      next_version:
+        description: "Next development version, no leading v (e.g. 0.6.0). '-dev' is appended on main."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Don't leave the push token wired into git for the whole job; the
+          # steps that push (tag, bump branch) opt back in via `gh auth setup-git`.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate inputs
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+        run: |
+          set -euo pipefail
+          # Releases must come from main: the tag is cut from the checked-out
+          # ref while the bump PR is based on origin/main, so a dispatch from
+          # another branch would misalign the two.
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::releases must be dispatched from main (got '$GITHUB_REF')"; exit 1
+          fi
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if ! echo "$RELEASE_VERSION" | grep -Eq "$semver"; then
+            echo "::error::release_version '$RELEASE_VERSION' is not a plain semver like 0.5.0"; exit 1
+          fi
+          if ! echo "$NEXT_VERSION" | grep -Eq "$semver"; then
+            echo "::error::next_version '$NEXT_VERSION' is not a plain semver like 0.6.0"; exit 1
+          fi
+          # next_version must be strictly greater than release_version so the
+          # bump always moves the dev cycle forward.
+          if [[ "$NEXT_VERSION" == "$RELEASE_VERSION" ]] || \
+             [[ "$(printf '%s\n%s\n' "$RELEASE_VERSION" "$NEXT_VERSION" | sort -V | head -n1)" != "$RELEASE_VERSION" ]]; then
+            echo "::error::next_version '$NEXT_VERSION' must be greater than release_version '$RELEASE_VERSION'"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$RELEASE_VERSION" >/dev/null; then
+            echo "::error::tag v$RELEASE_VERSION already exists"; exit 1
+          fi
+
+      - name: Create release commit
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          # Stamp the release version into the tree and commit it, so the tag
+          # points at a source tree whose VERSION file reads the release
+          # version. This commit is referenced only by the tag; it is not
+          # pushed to main (main is advanced separately by the bump PR below).
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s\n' "${RELEASE_VERSION}" > internal/version/VERSION
+          git add internal/version/VERSION
+          git commit -m "release: v${RELEASE_VERSION}"
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Cross-compile release binaries
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X github.com/wso2/fhir-server/internal/version.Version=${RELEASE_VERSION}"
+          mkdir -p dist
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS="${platform%/*}"
+            GOARCH="${platform#*/}"
+            name="fhir-server-${RELEASE_VERSION}-${GOOS}-${GOARCH}"
+            echo "Building ${name}"
+            mkdir -p "dist/${name}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/${name}/fhir-server" ./cmd/server
+            cp README.md LICENSE "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            rm -rf "dist/${name}"
+          done
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
+          echo "Artifacts:"; ls -la dist
+
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git   # persist-credentials is off; wire git auth for the push
+          tag="v${RELEASE_VERSION}"
+          # Tag the release commit built above and push only the tag; main is
+          # untouched here (the bump PR advances it separately).
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          # If publishing fails, drop the tag we just pushed so a rerun isn't
+          # blocked by the "tag already exists" check in validation.
+          if ! gh release create "$tag" \
+                dist/*.tar.gz dist/SHA256SUMS \
+                --title "$tag" \
+                --generate-notes; then
+            echo "::error::release publication failed; deleting tag $tag so the run can be retried"
+            git push origin --delete "$tag" || true
+            exit 1
+          fi
+
+      - name: Open version-bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git   # persist-credentials is off; wire git auth for the push
+          next_dev="${NEXT_VERSION}-dev"
+          branch="chore/bump-v${NEXT_VERSION}-dev"
+
+          git fetch origin main
+          git checkout -B "$branch" origin/main
+          printf '%s\n' "$next_dev" > internal/version/VERSION
+
+          if git diff --quiet; then
+            echo "VERSION already at ${next_dev}; nothing to bump."
+            exit 0
+          fi
+
+          git add internal/version/VERSION
+          git commit -m "chore: bump version to ${next_dev}"
+          git push --force-with-lease origin "$branch"
+
+          # PR creation needs "Allow GitHub Actions to create and approve pull
+          # requests". If it's disabled the release is already done; surface the
+          # manual step instead of failing the whole run.
+          if ! gh pr create \
+                --base main --head "$branch" \
+                --title "chore: bump version to ${next_dev}" \
+                --body "Automated version bump after releasing v${RELEASE_VERSION}. Sets \`internal/version/VERSION\` to \`${next_dev}\`."; then
+            echo "::warning::Could not open the bump PR automatically. Branch '${branch}' is pushed; open the PR manually or enable Actions PR creation in repo settings."
+          fi
