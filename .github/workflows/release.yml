@@ -4,12 +4,15 @@ name: Release
 #
 # Given a release version and the next development version, it:
 #   1. Validates the inputs and that the tag does not already exist.
-#   2. Runs unit tests.
-#   3. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
+#   2. Creates a release commit setting internal/version/VERSION to the release
+#      version, so the tagged tree reads that version (this commit is reachable
+#      only via the tag; main is not touched here).
+#   3. Runs unit tests.
+#   4. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
 #      stamping the release version into the binary via -ldflags.
-#   4. Creates and pushes the annotated tag v<release_version>.
-#   5. Publishes a GitHub Release with the .tar.gz archives + SHA256SUMS attached.
-#   6. Opens a PR against main bumping internal/version/VERSION to
+#   5. Tags the release commit as v<release_version> and pushes the tag.
+#   6. Publishes a GitHub Release with the .tar.gz archives + SHA256SUMS attached.
+#   7. Opens a PR against main bumping internal/version/VERSION to
 #      <next_version>-dev.
 #
 # Prerequisites (repo/org settings):
@@ -65,6 +68,21 @@ jobs:
             echo "::error::tag v$RELEASE_VERSION already exists"; exit 1
           fi
 
+      - name: Create release commit
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          # Stamp the release version into the tree and commit it, so the tag
+          # points at a source tree whose VERSION file reads the release
+          # version. This commit is referenced only by the tag; it is not
+          # pushed to main (main is advanced separately by the bump PR below).
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s\n' "${RELEASE_VERSION}" > internal/version/VERSION
+          git add internal/version/VERSION
+          git commit -m "release: v${RELEASE_VERSION}"
+
       - name: Run unit tests
         run: go test ./...
 
@@ -90,13 +108,13 @@ jobs:
           ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
           echo "Artifacts:"; ls -la dist
 
-      - name: Create and push tag
+      - name: Tag and push the release commit
         env:
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Tag the release commit built above and push only the tag; main is
+          # untouched here (the bump PR advances it separately).
           git tag -a "v${RELEASE_VERSION}" -m "Release v${RELEASE_VERSION}"
           git push origin "v${RELEASE_VERSION}"
 
