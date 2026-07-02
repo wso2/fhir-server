@@ -81,11 +81,14 @@ CREATE TABLE IF NOT EXISTS sp_string (
 -- a sequential scan. The operator class also serves equality lookups.
 CREATE INDEX IF NOT EXISTS idx_sp_str_lower_pattern ON sp_string (tenant_id, resource_type, param_name, value_lower text_pattern_ops);
 CREATE INDEX IF NOT EXISTS idx_sp_str_exact         ON sp_string (tenant_id, resource_type, param_name, value_exact);
--- Narrow re-index/cascade index. Serves per-resource re-index DELETEs
--- (WHERE resource_id, resource_type) and FK ON DELETE CASCADE. Slimmed from the
--- former wide form (…param_name, value_lower) to cut ingest write amplification;
--- the wide form's only extra benefit was index-only multi-param search joins.
-CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (tenant_id, resource_id, resource_type);
+-- Leading on resource_id serves the per-resource EXISTS probe of multi-parameter
+-- searches (correlated on resource_id/resource_type) and per-resource re-index
+-- DELETEs / FK ON DELETE CASCADE. param_name + value_lower let the probe narrow
+-- to the parameter and resolve its value predicate index-only, instead of heap-
+-- fetching every sp_string row of the candidate resource. (The v5 diet slimmed
+-- this to (resource_id, resource_type); that regressed multi-param search — see
+-- the schema_version v8 note below.)
+CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (tenant_id, resource_id, resource_type, param_name, value_lower);
 -- Uncomment for :contains support (requires pg_trgm extension):
 -- CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- CREATE INDEX idx_sp_str_trgm ON sp_string USING GIN (value_lower gin_trgm_ops);
@@ -114,8 +117,13 @@ CREATE INDEX IF NOT EXISTS idx_sp_tok_sys_code ON sp_token (tenant_id, resource_
 --  index only added write cost on the heaviest sp_* table.)
 -- Lookup by code alone when the search omits system.
 CREATE INDEX IF NOT EXISTS idx_sp_tok_code ON sp_token (tenant_id, resource_type, param_name, code) WHERE code IS NOT NULL;
--- Narrow re-index/cascade index (slimmed from …param_name, system, code).
-CREATE INDEX IF NOT EXISTS idx_sp_tok_source ON sp_token (tenant_id, resource_id, resource_type);
+-- Leading on resource_id serves the per-resource EXISTS probe of multi-parameter
+-- searches and re-index deletes; param_name + system + code let the probe filter
+-- the token value index-only rather than heap-fetching every sp_token row of the
+-- candidate resource. (Restored from the v5 diet's (resource_id, resource_type) —
+-- see the schema_version v8 note below. idx_sp_tok_system stays dropped: it is a
+-- strict prefix of idx_sp_tok_sys_code and genuinely redundant for reads.)
+CREATE INDEX IF NOT EXISTS idx_sp_tok_source ON sp_token (tenant_id, resource_id, resource_type, param_name, system, code);
 
 -- ─── Date search index ────────────────────────────────────────────────────────
 -- Stores extracted values for FHIR date / dateTime / Period / instant parameters.
@@ -137,8 +145,10 @@ CREATE TABLE IF NOT EXISTS sp_date (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sp_date_range  ON sp_date (tenant_id, resource_type, param_name, value_low, value_high);
--- Narrow re-index/cascade index (slimmed from …param_name, value_low, value_high).
-CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type);
+-- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
+-- deletes; param_name + range columns keep the probe index-only. (Restored from
+-- the v5 diet's (resource_id, resource_type) — see the schema_version v8 note.)
+CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 
 -- ─── Number search index ──────────────────────────────────────────────────────
 -- Stores extracted values for FHIR number search parameters.
@@ -159,8 +169,10 @@ CREATE TABLE IF NOT EXISTS sp_number (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high);
--- Narrow re-index/cascade index (slimmed from …param_name, value_low, value_high).
-CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (tenant_id, resource_id, resource_type);
+-- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
+-- deletes; param_name + range columns keep the probe index-only. (Restored from
+-- the v5 diet's (resource_id, resource_type) — see the schema_version v8 note.)
+CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 
 -- ─── Quantity search index ────────────────────────────────────────────────────
 -- Stores extracted values for FHIR quantity search parameters.
@@ -186,8 +198,10 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
 
 -- Raw value range search (same system+code, no unit conversion needed).
 CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code);
--- Narrow re-index/cascade index (slimmed from …param_name).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resource_id, resource_type);
+-- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
+-- deletes; param_name narrows the probe to the parameter. (Restored to its pre-v5
+-- form — the diet dropped param_name here too. See the schema_version v8 note.)
+CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resource_id, resource_type, param_name);
 -- Canonical search (cross-unit comparison via UCUM normalisation).
 CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (tenant_id, resource_type, param_name, canonical_value, canonical_units)
     WHERE canonical_value IS NOT NULL;
@@ -209,8 +223,10 @@ CREATE TABLE IF NOT EXISTS sp_uri (
 CREATE INDEX IF NOT EXISTS idx_sp_uri_exact  ON sp_uri (tenant_id, resource_type, param_name, value);
 -- text_pattern_ops enables efficient LIKE 'prefix%' for the :below modifier.
 CREATE INDEX IF NOT EXISTS idx_sp_uri_prefix ON sp_uri (tenant_id, resource_type, param_name, value text_pattern_ops);
--- Narrow re-index/cascade index (slimmed from …param_name, value).
-CREATE INDEX IF NOT EXISTS idx_sp_uri_source ON sp_uri (tenant_id, resource_id, resource_type);
+-- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
+-- deletes; param_name + value keep the probe index-only. (Restored from the v5
+-- diet's (resource_id, resource_type) — see the schema_version v8 note.)
+CREATE INDEX IF NOT EXISTS idx_sp_uri_source ON sp_uri (tenant_id, resource_id, resource_type, param_name, value);
 
 -- ─── Reference search index ───────────────────────────────────────────────────
 -- Stores extracted values for FHIR reference search parameters.
@@ -235,8 +251,11 @@ CREATE TABLE IF NOT EXISTS sp_reference (
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
--- Narrow re-index/cascade index (slimmed from …param_name, target_id).
-CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, resource_id, resource_type);
+-- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
+-- deletes; param_name + target_id let the probe resolve reference-by-source
+-- predicates index-only. (Restored from the v5 diet's (resource_id, resource_type)
+-- — see the schema_version v8 note below.)
+CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, resource_id, resource_type, param_name, target_id);
 -- Used when searching by target (e.g. ?patient=123): leading on target_id
 -- serves bare-id lookups; extra columns allow the predicate to resolve index-only.
 CREATE INDEX IF NOT EXISTS idx_sp_ref_target_full ON sp_reference (tenant_id, target_id, target_type, param_name, resource_type, resource_id);
@@ -449,3 +468,24 @@ $rls$;
 INSERT INTO schema_version (version) VALUES (6) ON CONFLICT DO NOTHING;
 -- v7: add base_definitions (core FHIR R4 StructureDefinitions for base validation)
 INSERT INTO schema_version (version) VALUES (7) ON CONFLICT DO NOTHING;
+
+-- v8: revert the v5 _source-index diet that regressed multi-parameter search.
+-- Multi-param searches are built as correlated `EXISTS (SELECT 1 FROM sp_* s
+-- WHERE s.resource_id = r.fhir_id AND s.resource_type = … AND s.param_name = …
+-- AND <value predicate>)` (see internal/store/search.go). v5 slimmed the 7 sp_*
+-- _source indexes to (tenant_id, resource_id, resource_type), dropping param_name
+-- and the value columns. That forced the per-resource EXISTS probe to scan every
+-- sp_* row of a candidate resource and heap-fetch each to re-check param_name and
+-- value — the drastic search slowdown reported after 2671286. Restored above to
+-- the pre-v5 composite forms (param_name + value columns, tenant_id-led) so the
+-- probe narrows to the parameter and resolves its value predicate index-only.
+-- idx_sp_tok_system stays dropped (a redundant strict prefix of idx_sp_tok_sys_code).
+--
+-- Fresh installs get the restored indexes above. EXISTING databases are NOT
+-- altered by CREATE INDEX IF NOT EXISTS (it won't rebuild an index that already
+-- exists), so each idx_sp_*_source must be dropped and recreated, e.g.:
+--   DROP  INDEX CONCURRENTLY IF EXISTS idx_sp_str_source;
+--   CREATE INDEX CONCURRENTLY idx_sp_str_source
+--       ON sp_string (tenant_id, resource_id, resource_type, param_name, value_lower);
+-- (repeat for tok/date/num/qty/uri/ref with the column lists above).
+INSERT INTO schema_version (version) VALUES (8) ON CONFLICT DO NOTHING;
