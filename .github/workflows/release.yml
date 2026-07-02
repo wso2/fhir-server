@@ -12,17 +12,23 @@ name: Release
 #   3. Runs unit tests.
 #   4. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
 #      stamping the release version into the binary via -ldflags.
-#   5. Tags the release commit as v<release_version>, pushes the tag, and
+#   5. Builds and pushes a multi-arch (linux/amd64,arm64) container image to
+#      GHCR (ghcr.io/<owner>/fhir-server) tagged v<release_version> and latest,
+#      with the release version stamped in via the VERSION build-arg. Done
+#      before tagging so a build failure aborts before anything is published.
+#   6. Tags the release commit as v<release_version>, pushes the tag, and
 #      publishes a GitHub Release with the .tar.gz archives + SHA256SUMS. If
 #      publishing fails the tag is deleted so the run can be retried.
-#   6. Opens a PR against main bumping internal/version/VERSION to
+#   7. Opens a PR against main bumping internal/version/VERSION to
 #      <next_version>-dev.
 #
 # Prerequisites (repo/org settings):
 #   - Settings > Actions > General > Workflow permissions:
 #       "Read and write permissions" enabled, and
 #       "Allow GitHub Actions to create and approve pull requests" enabled
-#       (required for step 6; the release itself still succeeds without it).
+#       (required for step 7; the release itself still succeeds without it).
+#   - GHCR push uses the built-in GITHUB_TOKEN (packages: write below); no extra
+#     secrets are needed for images under the repo owner's namespace.
 
 on:
   workflow_dispatch:
@@ -39,6 +45,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  packages: write
 
 jobs:
   release:
@@ -125,6 +132,42 @@ jobs:
           done
           ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
           echo "Artifacts:"; ls -la dist
+
+      # ── Container image ──────────────────────────────────────────────────
+      # Built and pushed BEFORE the git tag / GitHub Release below, so a build
+      # or push failure aborts the run while it is still cleanly retriable (no
+      # tag has been pushed yet). The image is built from the release commit's
+      # tree, and the release version is stamped in via the VERSION build-arg.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Container image metadata
+        id: image_meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          # Lowercased automatically; works for any owner (wso2, forks, …).
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=v${{ inputs.release_version }}
+            type=raw,value=latest
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ inputs.release_version }}
+          tags: ${{ steps.image_meta.outputs.tags }}
+          labels: ${{ steps.image_meta.outputs.labels }}
+          provenance: false
 
       - name: Tag and publish the release
         env:
