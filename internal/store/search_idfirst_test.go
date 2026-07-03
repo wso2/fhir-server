@@ -62,7 +62,7 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 		wantIdFirst bool
 	}{
 		{"quantity uses id-first", "Observation", "value-quantity", "gt170", true},
-		{"token uses id-first", "Observation", "code", "8302-2", true},
+		{"token keeps ordered scan", "Observation", "code", "8302-2", false},
 		{"reference keeps ordered scan", "Observation", "subject", "Patient/123", false},
 		{"date keeps ordered scan", "Observation", "date", "gt2020", false},
 		{"string keeps ordered scan", "Patient", "name", "Smith", false},

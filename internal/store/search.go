@@ -387,8 +387,10 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 	if expr := b.combinedExists(param, modifier, value); expr != "" {
 		b.and(expr)
 		// Route this search through the id-first fetch strategy only for the
-		// large, selectivity-mis-estimated sp_* tables (see fetchSQL). reference,
-		// date, string and uri params keep the early-terminating ordered scan.
+		// numeric sp_* predicates the planner mis-estimates (quantity/number, and
+		// composite which embeds one — see idFirstType). token, reference, date,
+		// string and uri params keep the early-terminating ordered scan, where the
+		// planner has good enough statistics to pick the right plan itself.
 		if b.paramUsesIdFirst(param) {
 			b.usesSP = true
 		}
@@ -768,7 +770,16 @@ func (b *queryBuilder) paramUsesIdFirst(param string) bool {
 
 func idFirstType(paramType string) bool {
 	switch paramType {
-	case "quantity", "number", "token", "composite":
+	// quantity/number range predicates (and composite, which embeds one) are
+	// mis-estimated by the planner — it cannot judge the selectivity of an
+	// unbounded numeric range, so without the id-first barrier it may choose the
+	// ordered scan and walk the whole table for a sparse match set. token is
+	// deliberately NOT here: token equality has reliable MCV statistics, so the
+	// planner already resolves id-first for selective/empty codes and takes the
+	// ordered early-exit for dense ones. Forcing id-first on tokens instead
+	// pessimises the common dense case (e.g. a category code matching most rows),
+	// which then has to materialize and sort the entire match set.
+	case "quantity", "number", "composite":
 		return true
 	default:
 		return false
