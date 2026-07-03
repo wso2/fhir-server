@@ -150,7 +150,7 @@ func TestConformance_History(t *testing.T) {
 func TestConformance_Search_Basics(t *testing.T) {
 	id, idv := createPatient(t, map[string]any{"gender": "female"})
 
-	resp := hreq(t, http.MethodGet, "/Patient?identifier=urn:conformance%7C"+idv, nil)
+	resp := hreq(t, http.MethodGet, "/Patient?identifier=urn:conformance%7C"+idv+"&_total=accurate", nil)
 	wantStatus(t, resp, http.StatusOK)
 	b := jbody(t, resp)
 	if b["resourceType"] != "Bundle" || b["type"] != "searchset" {
@@ -233,7 +233,7 @@ func TestConformance_Search_Chained(t *testing.T) {
 		"managingOrganization": map[string]any{"reference": "Organization/" + orgID},
 	}).Body.Close()
 
-	b := jbody(t, hreq(t, http.MethodGet, "/Patient?organization.name="+orgName, nil))
+	b := jbody(t, hreq(t, http.MethodGet, "/Patient?organization.name="+orgName+"&_total=accurate", nil))
 	if total, _ := b["total"].(float64); total != 1 {
 		t.Errorf("Patient?organization.name=%s: got total %v, want 1", orgName, b["total"])
 	}

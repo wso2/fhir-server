@@ -184,7 +184,7 @@ func TestIntegration_Batch_IndependentEntries(t *testing.T) {
 	}
 
 	// The good Patient persisted despite the sibling failure.
-	search := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=BatchGood", nil)
+	search := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=BatchGood&_total=accurate", nil)
 	sbody := iJSON(t, search)
 	if total, _ := sbody["total"].(float64); total != 1 {
 		t.Errorf("want 1 BatchGood Patient, got %v", total)

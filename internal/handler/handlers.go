@@ -206,6 +206,19 @@ func firstVal(params map[string][]string, key string) string {
 	return ""
 }
 
+// totalMode resolves the search _total mode. When the client does not specify
+// _total, the server defaults to "none": it does NOT compute Bundle.total. An
+// accurate total is a COUNT(*) over the full match set, which is O(matches) and
+// impractical for broad searches, so like most production FHIR servers we make
+// it opt-in. Clients that need the count request _total=accurate (or estimate),
+// which routes to the counted path in the store.
+func totalMode(params map[string][]string) string {
+	if v := firstVal(params, "_total"); v != "" {
+		return v
+	}
+	return "none"
+}
+
 // parseIfMatchVersion extracts the integer version from an ETag like W/"3".
 // Returns (version, true) on success, (0, false) if the header is malformed.
 func parseIfMatchVersion(header string) (int, bool) {
@@ -269,7 +282,7 @@ func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
 		Params:       params,
 		Page:         page,
 		PageSize:     pageSize,
-		Total:        firstVal(params, "_total"),
+		Total:        totalMode(params),
 		CountOnly:    summary == "count",
 	})
 	if err != nil {
@@ -313,7 +326,7 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 		Params:       params,
 		Page:         page,
 		PageSize:     pageSize,
-		Total:        firstVal(params, "_total"),
+		Total:        totalMode(params),
 		CountOnly:    summary == "count",
 	})
 	if err != nil {
@@ -362,8 +375,9 @@ func (h *fhirHandler) buildBundle(baseURL, rt string, result store.SearchResult,
 		map[string]any{"relation": "self", "url": base + "?" + pageQuery(params, page, pageSize)},
 		map[string]any{"relation": "first", "url": base + "?" + pageQuery(params, 1, pageSize)},
 	}
-	// result.Total < 0 means the count was skipped (_total=none): we can't
-	// compute the last page or a count-based next link.
+	// result.Total < 0 means the count was skipped (the default _total=none):
+	// without a count we can't compute the last page or a count-based next link,
+	// so we fall back to a full-page heuristic for "next" and omit "last".
 	if result.Total >= 0 {
 		lastPage := result.Total / pageSize
 		if result.Total%pageSize != 0 {
@@ -379,6 +393,13 @@ func (h *fhirHandler) buildBundle(baseURL, rt string, result store.SearchResult,
 				"url":      base + "?" + pageQuery(params, page+1, pageSize),
 			})
 		}
+	} else if len(result.Entries) == pageSize {
+		// A full page of matches without a total: there may be more results, so
+		// offer "next". A subsequent short/empty page ends the chain (no "next").
+		links = append(links, map[string]any{
+			"relation": "next",
+			"url":      base + "?" + pageQuery(params, page+1, pageSize),
+		})
 	}
 	if page > 1 {
 		links = append(links, map[string]any{
