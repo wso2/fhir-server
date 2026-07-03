@@ -12,14 +12,18 @@ name: Release
 #   3. Runs unit tests.
 #   4. Cross-compiles the server for linux/{amd64,arm64} and darwin/{amd64,arm64},
 #      stamping the release version into the binary via -ldflags.
-#   5. Builds and pushes a multi-arch (linux/amd64,arm64) container image to
-#      GHCR (ghcr.io/<owner>/fhir-server) tagged v<release_version> and latest,
-#      with the release version stamped in via the VERSION build-arg. Done
-#      before tagging so a build failure aborts before anything is published.
+#   5. Builds a multi-arch (linux/amd64,arm64) container image from the release
+#      tree, with the release version stamped in via the VERSION build-arg, and
+#      pushes it to GHCR (ghcr.io/<owner>/fhir-server) under an immutable
+#      per-commit staging tag only. A build/push failure here aborts before any
+#      git tag exists, keeping the run cleanly retriable.
 #   6. Tags the release commit as v<release_version>, pushes the tag, and
 #      publishes a GitHub Release with the .tar.gz archives + SHA256SUMS. If
 #      publishing fails the tag is deleted so the run can be retried.
-#   7. Opens a PR against main bumping internal/version/VERSION to
+#   7. Promotes the staged image: retags that same digest as v<release_version>
+#      and latest, so the user-facing tags appear only after the release is
+#      published (never dangling if an earlier step failed).
+#   8. Opens a PR against main bumping internal/version/VERSION to
 #      <next_version>-dev.
 #
 # Prerequisites (repo/org settings):
@@ -133,11 +137,14 @@ jobs:
           ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
           echo "Artifacts:"; ls -la dist
 
-      # ── Container image ──────────────────────────────────────────────────
-      # Built and pushed BEFORE the git tag / GitHub Release below, so a build
-      # or push failure aborts the run while it is still cleanly retriable (no
-      # tag has been pushed yet). The image is built from the release commit's
-      # tree, and the release version is stamped in via the VERSION build-arg.
+      # ── Container image: build + push a staging tag ──────────────────────
+      # Built from the release commit's tree (version stamped via the VERSION
+      # build-arg) and pushed under an immutable per-commit tag ONLY. The
+      # user-facing v<version> and latest tags are promoted onto this same
+      # digest after the GitHub Release is published (see "Promote ..." below),
+      # so an earlier failure never leaves final tags on an unreleased image.
+      # Doing the build here also aborts the run before any git tag is pushed if
+      # the image can't be built, keeping the run cleanly retriable.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - name: Set up Docker Buildx
@@ -154,10 +161,9 @@ jobs:
         with:
           # Lowercased automatically; works for any owner (wso2, forks, …).
           images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=v${{ inputs.release_version }}
-            type=raw,value=latest
-      - name: Build and push image
+          # Staging tag only; v<version> + latest are added by the promote step.
+          tags: type=raw,value=sha-${{ github.sha }}
+      - name: Build and push image (staging tag)
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -191,6 +197,22 @@ jobs:
             git push origin --delete "$tag" || true
             exit 1
           fi
+
+      - name: Promote image to release tags
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          # The GitHub Release is now published, so point the user-facing tags at
+          # the multi-arch image already built and pushed under the staging tag.
+          # imagetools only rewrites manifest-list tags (no rebuild, same digest),
+          # so it is cheap and cannot diverge from the image tested/pushed above.
+          # Lowercase the repo: GHCR requires it and owner names may hold capitals.
+          repo="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          docker buildx imagetools create \
+            --tag "${repo}:v${RELEASE_VERSION}" \
+            --tag "${repo}:latest" \
+            "${repo}:sha-${GITHUB_SHA}"
 
       - name: Open version-bump PR
         env:
