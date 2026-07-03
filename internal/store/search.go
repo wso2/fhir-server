@@ -413,8 +413,9 @@ func (b *queryBuilder) applyHas(modifier, value string) {
 	))
 }
 
-// buildCompositeExists builds an AND of two component EXISTS subqueries for a
-// composite search param (e.g. code-value-quantity=8480-6$gt110).
+// buildCompositeExists builds a nested-EXISTS predicate for a composite search
+// param (e.g. code-value-quantity=8480-6$gt110): the resource must have both
+// component values (matched independently, correlated on resource_id).
 // The value is split on "$" to get the two component values. Each component's
 // expression maps to a sub-param name in the registry.
 func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, value string) (string, bool) {
@@ -439,21 +440,23 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 		return "", false
 	}
 
-	// Build the component EXISTS subqueries directly (not via combinedExists which
-	// wraps them in EXISTS again) so the composite becomes AND(cond1, cond2)
-	// at the same level as other predicates rather than EXISTS(EXISTS AND EXISTS).
+	// Build the two component SELECT bodies. Each is a fully-formed
+	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
+	// correlated to the outer resource row.
 	cond1, ok1 := b.buildExistsForValue(comp1Name, "", val1)
 	cond2, ok2 := b.buildExistsForValue(comp2Name, "", val2)
 	if !ok1 || !ok2 || cond1 == "" || cond2 == "" {
 		return "", false
 	}
-	// Return a raw AND of the two EXISTS subqueries. The caller in
-	// buildTypedExists → combinedExists will wrap it in EXISTS(...) again,
-	// so we must NOT add EXISTS here — we return the inner content for the
-	// EXISTS wrapper to wrap.
-	// Actually: the caller adds EXISTS around our return value. So we should
-	// return a SELECT that yields 1 when both match. Use INTERSECT:
-	return cond1 + " INTERSECT " + cond2, true
+	// Nest cond2 as a correlated EXISTS inside cond1's WHERE. The caller
+	// (combinedExists) wraps our return value in a single EXISTS(...), producing
+	//   EXISTS (cond1 … AND EXISTS (cond2 …))
+	// Both components are matched independently and correlated only on
+	// resource_id, so the resource matches when it has both component values.
+	// This nested-EXISTS shape is flattenable: Postgres turns it into two
+	// semi-joins driven by the more selective component's sp_* index, rather
+	// than a correlated subplan run once per candidate resource row.
+	return cond1 + " AND EXISTS (" + cond2 + ")", true
 }
 
 // resolveComponentName converts a component expression like "code",
