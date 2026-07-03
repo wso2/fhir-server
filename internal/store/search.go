@@ -248,6 +248,12 @@ type queryBuilder struct {
 	args        []any
 	argN        int
 	sort        []sortKey
+	// usesSP is set when a positive value predicate against a large,
+	// selectivity-mis-estimated sp_* table (quantity/number/token/composite; see
+	// paramUsesIdFirst) is added. It selects the id-first fetch strategy in
+	// fetchSQL, which avoids the full-table scan the ordered-scan plan degrades to
+	// for sparse result sets on those tables.
+	usesSP bool
 	// err is set when the request can't be satisfied (e.g. a registry-known
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
@@ -380,6 +386,12 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 
 	if expr := b.combinedExists(param, modifier, value); expr != "" {
 		b.and(expr)
+		// Route this search through the id-first fetch strategy only for the
+		// large, selectivity-mis-estimated sp_* tables (see fetchSQL). reference,
+		// date, string and uri params keep the early-terminating ordered scan.
+		if b.paramUsesIdFirst(param) {
+			b.usesSP = true
+		}
 	}
 }
 
@@ -728,6 +740,38 @@ func (b *queryBuilder) buildTypedExists(def searchparam.Definition, param, modif
 		slog.Warn("unsupported search param type; failing request",
 			"resourceType", b.rt, "param", param, "paramType", paramType)
 		return "", false
+	}
+}
+
+// paramUsesIdFirst reports whether a positive value predicate on this search
+// param should select the id-first fetch strategy (see fetchSQL). It is enabled
+// only for the large, selectivity-mis-estimated sp_* tables — quantity, number,
+// token, and composites built from them — where the ordered-scan plan collapses
+// to a full-table scan-with-probe when the result set is sparse or empty (the
+// source of the multi-second query tail on the perf dataset).
+//
+// reference is deliberately excluded: Postgres already plans it id-first from the
+// sp_reference target index, so wrapping it would only add the CTE's fixed cost.
+// date, string and uri live in small tables where even a full scan is cheap, so
+// they keep the early-terminating ordered scan.
+func (b *queryBuilder) paramUsesIdFirst(param string) bool {
+	if pt, ok := universalParamType[param]; ok {
+		return idFirstType(pt)
+	}
+	if b.reg != nil {
+		if def, ok := b.reg.Lookup(b.rt, param); ok {
+			return idFirstType(def.ParamType)
+		}
+	}
+	return false
+}
+
+func idFirstType(paramType string) bool {
+	switch paramType {
+	case "quantity", "number", "token", "composite":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1173,15 +1217,26 @@ func (b *queryBuilder) addSort(value string) {
 	}
 }
 
-// orderByClause builds the SQL ORDER BY body (without the "ORDER BY" keyword)
-// from b.sort. Each search-param key becomes a correlated subquery into its
-// sp_* table — MIN(value) for ascending, MAX(value) for descending — so a
-// resource with multiple values sorts by its lowest/highest, with NULLS LAST
-// so unindexed resources sort to the end. _id and _lastUpdated sort directly
-// off the resources table. Falls back to last_updated DESC when no usable key
-// is supplied.
-func (b *queryBuilder) orderByClause() string {
-	var clauses []string
+// orderTerm is one resolved ORDER BY component: a SQL expression (referencing
+// the resources alias r) and its direction suffix (e.g. "DESC" or
+// "ASC NULLS LAST").
+type orderTerm struct {
+	expr string
+	dir  string
+}
+
+// orderTerms resolves b.sort into structured ORDER BY components. Each
+// search-param key becomes a correlated subquery into its sp_* table — MIN(value)
+// for ascending, MAX(value) for descending — so a resource with multiple values
+// sorts by its lowest/highest, with NULLS LAST so unindexed resources sort to the
+// end. _id and _lastUpdated sort directly off the resources table. Falls back to
+// last_updated DESC when no usable key is supplied.
+//
+// Returning structured terms (rather than a pre-joined string) lets fetch build
+// the id-first query, where the sort keys are computed once in the candidate CTE,
+// carried through the LIMIT, and re-applied after the resource_json join.
+func (b *queryBuilder) orderTerms() []orderTerm {
+	var terms []orderTerm
 	for _, k := range b.sort {
 		dir := "ASC"
 		if k.desc {
@@ -1189,10 +1244,10 @@ func (b *queryBuilder) orderByClause() string {
 		}
 		switch k.param {
 		case "_id":
-			clauses = append(clauses, "r.fhir_id "+dir)
+			terms = append(terms, orderTerm{"r.fhir_id", dir})
 			continue
 		case "_lastUpdated":
-			clauses = append(clauses, "r.last_updated "+dir)
+			terms = append(terms, orderTerm{"r.last_updated", dir})
 			continue
 		case "_score":
 			// relevance scoring is not implemented; skip rather than error.
@@ -1220,12 +1275,12 @@ func (b *queryBuilder) orderByClause() string {
 			"(SELECT %s(s.%s) FROM %s s WHERE s.resource_id = r.fhir_id AND s.resource_type = r.resource_type AND s.param_name = %s)",
 			agg, col, table, pP,
 		)
-		clauses = append(clauses, expr+" "+dir+" NULLS LAST")
+		terms = append(terms, orderTerm{expr, dir + " NULLS LAST"})
 	}
-	if len(clauses) == 0 {
-		return "r.last_updated DESC"
+	if len(terms) == 0 {
+		return []orderTerm{{"r.last_updated", "DESC"}}
 	}
-	return strings.Join(clauses, ", ")
+	return terms
 }
 
 // sortColumnForTable returns the value column to sort on for a given sp_* table.
@@ -1350,19 +1405,7 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 }
 
 func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset int) ([]map[string]any, error) {
-	// Build the ORDER BY before binding LIMIT/OFFSET so the positional args line
-	// up: [where args…, order-by param args…, limit, offset].
-	orderBy := b.orderByClause()
-	limitP := b.next(limit)
-	offsetP := b.next(offset)
-	q := fmt.Sprintf(`
-		SELECT r.resource_json, r.version_id, r.last_updated
-		FROM resources r
-		WHERE %s
-		ORDER BY %s
-		LIMIT %s OFFSET %s`,
-		b.where.String(), orderBy, limitP, offsetP,
-	)
+	q := b.fetchSQL(limit, offset)
 
 	rows, err := pool.Query(ctx, q, b.args...)
 	if err != nil {
@@ -1385,6 +1428,87 @@ func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset in
 		entries = append(entries, m)
 	}
 	return entries, rows.Err()
+}
+
+// fetchSQL builds the paginated result query. It binds the ORDER BY parameters
+// (for _sort on search params) before LIMIT/OFFSET, keeping b.args ordered as
+// [where args…, order-by args…, limit, offset, …].
+//
+// Two query shapes are produced:
+//
+//   - No sp_* predicate (plain browse, or filters only on resources columns such
+//     as _id / _lastUpdated / _text): the classic single-scan form. With
+//     ORDER BY r.last_updated served directly by idx_res_active, the LIMIT
+//     terminates early after `limit` rows without visiting the whole match set.
+//
+//   - With an sp_* predicate: an id-first form. A MATERIALIZED CTE resolves the
+//     matching (fhir_id, sort keys) first, so the planner can drive the match off
+//     the selective sp_* index instead of scanning resources in last_updated
+//     order and probing sp_* once per candidate row. The sort + LIMIT then run
+//     over the light candidate rows, and only the surviving page joins back to
+//     resources for resource_json.
+//
+// The MATERIALIZED barrier is load-bearing: without it the planner collapses the
+// id-first form back into the single-scan shape, whose cost explodes for
+// selective search predicates — a full resources scan with a per-row sp_* probe
+// that never reaches the LIMIT (observed at multiple seconds per query, versus
+// sub-second id-first, on the perf dataset). The barrier gives up the single-scan
+// early-termination for broad (non-selective) sp_* predicates, so it is applied
+// only when the WHERE actually filters on an sp_* table.
+func (b *queryBuilder) fetchSQL(limit, offset int) string {
+	terms := b.orderTerms()
+
+	if !b.usesSP {
+		var clauses []string
+		for _, t := range terms {
+			clauses = append(clauses, t.expr+" "+t.dir)
+		}
+		limitP := b.next(limit)
+		offsetP := b.next(offset)
+		return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM resources r
+		WHERE %s
+		ORDER BY %s
+		LIMIT %s OFFSET %s`,
+			b.where.String(), strings.Join(clauses, ", "), limitP, offsetP,
+		)
+	}
+
+	// id-first: compute fhir_id plus each sort key once in the candidate CTE,
+	// carry them through the LIMIT, then re-apply the sort after the json join.
+	selectList := []string{"r.fhir_id"}
+	innerCols := []string{"fhir_id"}
+	var innerOrder, outerOrder []string
+	for i, t := range terms {
+		alias := fmt.Sprintf("sort%d", i)
+		selectList = append(selectList, t.expr+" AS "+alias)
+		innerCols = append(innerCols, alias)
+		innerOrder = append(innerOrder, alias+" "+t.dir)
+		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+	rtP := b.next(b.rt)
+
+	return fmt.Sprintf(`
+		WITH candidates AS MATERIALIZED (
+			SELECT %s
+			FROM resources r
+			WHERE %s
+		)
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (SELECT %s FROM candidates ORDER BY %s LIMIT %s OFFSET %s) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+		ORDER BY %s`,
+		strings.Join(selectList, ", "),
+		b.where.String(),
+		strings.Join(innerCols, ", "), strings.Join(innerOrder, ", "), limitP, offsetP,
+		rtP,
+		strings.Join(outerOrder, ", "),
+	)
 }
 
 // fetchWithCount returns the page of matching rows plus the exact total match
