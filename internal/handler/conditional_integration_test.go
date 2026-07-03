@@ -56,7 +56,7 @@ func TestIntegration_ConditionalCreate_IfNoneExist(t *testing.T) {
 	}
 
 	// Exactly one Patient with that identifier should exist.
-	resp = iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?identifier="+sys+"%7Cmrn-1", nil)
+	resp = iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?identifier="+sys+"%7Cmrn-1&_total=accurate", nil)
 	bundle := iJSON(t, resp)
 	if total, _ := bundle["total"].(float64); total != 1 {
 		t.Errorf("expected exactly 1 Patient, got %v", bundle["total"])

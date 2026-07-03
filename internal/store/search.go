@@ -129,7 +129,9 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 	total := -1
 	var entries []map[string]any
 	if sp.Total == "none" {
-		// _total=none: skip the count entirely, just fetch rows.
+		// _total=none: skip the count entirely, just fetch rows. This is the
+		// default for API search requests (see handler.totalMode); an accurate
+		// count is opt-in because it scans the whole match set.
 		var err error
 		entries, err = b.fetch(ctx, c, sp.PageSize, offset)
 		if err != nil {
@@ -138,7 +140,9 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		}
 		slog.Debug("search completed", "resourceType", sp.ResourceType, "returned", len(entries))
 	} else {
-		// Default: fetch rows and total in a single query via COUNT(*) OVER().
+		// _total=accurate|estimate (and internal callers that leave Total unset):
+		// compute the exact count. fetchWithCount runs a dedicated COUNT(*) plus
+		// an early-terminating page fetch.
 		var err error
 		total, entries, err = b.fetchWithCount(ctx, c, sp.PageSize, offset)
 		if err != nil {

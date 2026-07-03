@@ -347,7 +347,7 @@ func TestIntegration_Search_String(t *testing.T) {
 		"name":         []any{map[string]any{"family": "Dragonborn", "use": "official"}},
 	})
 
-	resp := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=dragon", nil)
+	resp := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=dragon&_total=accurate", nil)
 	bundle := iJSON(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("search: want 200, got %d", resp.StatusCode)
@@ -364,7 +364,7 @@ func TestIntegration_Search_Token(t *testing.T) {
 	iCreate(t, srv, "Patient", map[string]any{"resourceType": "Patient", "gender": "female"})
 	iCreate(t, srv, "Patient", map[string]any{"resourceType": "Patient", "gender": "male"})
 
-	resp := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?gender=female", nil)
+	resp := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?gender=female&_total=accurate", nil)
 	bundle := iJSON(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("search: want 200, got %d", resp.StatusCode)
@@ -390,7 +390,7 @@ func TestIntegration_SearchPost(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost,
 		srv.URL+"/fhir/r4/Patient/_search",
-		strings.NewReader("gender=male"),
+		strings.NewReader("gender=male&_total=accurate"),
 	)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := srv.Client().Do(req)
@@ -416,23 +416,40 @@ func TestIntegration_Search_Pagination_Links(t *testing.T) {
 		iCreate(t, srv, "Patient", map[string]any{"resourceType": "Patient"})
 	}
 
-	// Page 1 with _count=2 — expect self/first/last/next but no previous
+	// Default (no _total): the count is skipped, so there is no "last" link and
+	// no bundle total, but a full page still yields a "next" link.
 	resp := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?_page=1&_count=2", nil)
 	bundle := iJSON(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
 	rels := linkRels(bundle)
-	for _, rel := range []string{"self", "first", "last", "next"} {
+	for _, rel := range []string{"self", "first", "next"} {
 		if rels[rel] == "" {
-			t.Errorf("page 1: expected link %q to be present; links=%v", rel, rels)
+			t.Errorf("page 1 (default): expected link %q to be present; links=%v", rel, rels)
 		}
+	}
+	if rels["last"] != "" {
+		t.Errorf("page 1 (default, no _total): should have no last link, got %q", rels["last"])
+	}
+	if _, ok := bundle["total"]; ok {
+		t.Errorf("page 1 (default, no _total): should omit bundle total, got %v", bundle["total"])
 	}
 	if rels["previous"] != "" {
 		t.Errorf("page 1 should have no previous link, got %q", rels["previous"])
 	}
 
-	// Page 2 — expect both next and previous
+	// With _total=accurate: the count is computed, so a "last" link appears.
+	resp = iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?_page=1&_count=2&_total=accurate", nil)
+	bundle = iJSON(t, resp)
+	rels = linkRels(bundle)
+	for _, rel := range []string{"self", "first", "next", "last"} {
+		if rels[rel] == "" {
+			t.Errorf("page 1 (_total=accurate): expected link %q to be present; links=%v", rel, rels)
+		}
+	}
+
+	// Page 2 (default) — expect both next (full page) and previous
 	resp = iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?_page=2&_count=2", nil)
 	bundle = iJSON(t, resp)
 	rels = linkRels(bundle)
