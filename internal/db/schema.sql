@@ -492,3 +492,37 @@ INSERT INTO schema_version (version) VALUES (7) ON CONFLICT DO NOTHING;
 --       ON sp_string (tenant_id, resource_id, resource_type, param_name, value_lower);
 -- (repeat for tok/date/num/qty/uri/ref with the column lists above).
 INSERT INTO schema_version (version) VALUES (8) ON CONFLICT DO NOTHING;
+
+-- v9: mark numeric comparison operators LEAKPROOF so quantity/number range and
+-- equality predicates push into the sp_quantity/sp_number indexes under RLS.
+--
+-- With Row-Level Security the sp_* tables are security barriers: a user WHERE
+-- qual is evaluated *inside* the index scan (as an index cond) only if its
+-- operator is LEAKPROOF; otherwise it is held back and applied as a post-filter
+-- above the barrier. PostgreSQL ships text and date/timestamptz comparisons
+-- LEAKPROOF, but NOT the numeric ones. So `value_low > $1` on sp_quantity
+-- (numeric(20,6)) could not use the (tenant_id, resource_type, param_name,
+-- value_low, …) index bound — every quantity/number search scanned the entire
+-- (tenant, type, param) partition and filtered value_low in memory (~50ms/query
+-- on the perf dataset, and far worse under concurrency where it spawned parallel
+-- seq scans). numeric comparison operators are pure arithmetic and do not leak
+-- argument values via errors or side channels, so marking them LEAKPROOF is safe.
+--
+-- Requires superuser: only a superuser may set LEAKPROOF. Wrapped so a non-super
+-- DDL role (or managed Postgres with no superuser, e.g. Azure Flexible Server)
+-- still applies the rest of the schema — the optimization is skipped with a
+-- notice and those searches fall back to the correct, slower post-filter path.
+DO $leakproof$
+BEGIN
+    ALTER FUNCTION numeric_eq(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_gt(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_ge(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_lt(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_le(numeric, numeric) LEAKPROOF;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE NOTICE 'skipping LEAKPROOF on numeric comparison operators (requires superuser); quantity/number range searches under RLS will use a slower post-filter';
+END
+$leakproof$;
+
+INSERT INTO schema_version (version) VALUES (9) ON CONFLICT DO NOTHING;
