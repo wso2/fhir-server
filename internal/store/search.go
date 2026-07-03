@@ -248,12 +248,20 @@ type queryBuilder struct {
 	args        []any
 	argN        int
 	sort        []sortKey
-	// usesSP is set when a positive value predicate against a large,
-	// selectivity-mis-estimated sp_* table (quantity/number/token/composite; see
-	// paramUsesIdFirst) is added. It selects the id-first fetch strategy in
-	// fetchSQL, which avoids the full-table scan the ordered-scan plan degrades to
-	// for sparse result sets on those tables.
+	// usesSP is set when a positive value predicate against a numeric,
+	// selectivity-mis-estimated sp_* table (quantity/number, or composite which
+	// embeds one; see paramUsesIdFirst) is added. It selects the id-first fetch
+	// strategy in fetchSQL, which avoids the full-table scan the ordered-scan plan
+	// degrades to for sparse result sets on those tables.
 	usesSP bool
+	// predicateCount counts the top-level value predicates added (one per and()).
+	// numericSP is set when a quantity/number param is added. Together they gate
+	// the dense probe (see probeDense): it runs only for a search whose sole
+	// predicate is numeric, where the LIMIT-bounded probe is cheap. A token or
+	// composite predicate would make the probe scan a large match set, so those
+	// (and any multi-predicate search) keep the id-first shape unconditionally.
+	predicateCount int
+	numericSP      bool
 	// err is set when the request can't be satisfied (e.g. a registry-known
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
@@ -286,6 +294,7 @@ func (b *queryBuilder) writeBase() {
 func (b *queryBuilder) and(cond string) {
 	b.where.WriteString(" AND ")
 	b.where.WriteString(cond)
+	b.predicateCount++
 }
 
 func (b *queryBuilder) applyParam(rawKey, value string) {
@@ -393,6 +402,9 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 		// planner has good enough statistics to pick the right plan itself.
 		if b.paramUsesIdFirst(param) {
 			b.usesSP = true
+		}
+		if b.paramIsNumeric(param) {
+			b.numericSP = true
 		}
 	}
 }
@@ -766,6 +778,23 @@ func (b *queryBuilder) paramUsesIdFirst(param string) bool {
 		}
 	}
 	return false
+}
+
+// paramIsNumeric reports whether param maps to a bare numeric sp_* table
+// (quantity/number). These are exactly the predicates whose selectivity the
+// dense probe can measure cheaply via a LIMIT-bounded index scan, so probeDense
+// only engages for a search whose sole predicate is one of them. composite is
+// excluded: it embeds a token whose match set the probe would have to scan.
+func (b *queryBuilder) paramIsNumeric(param string) bool {
+	pt := ""
+	if t, ok := universalParamType[param]; ok {
+		pt = t
+	} else if b.reg != nil {
+		if def, ok := b.reg.Lookup(b.rt, param); ok {
+			pt = def.ParamType
+		}
+	}
+	return pt == "quantity" || pt == "number"
 }
 
 func idFirstType(paramType string) bool {
@@ -1416,7 +1445,11 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 }
 
 func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset int) ([]map[string]any, error) {
-	q := b.fetchSQL(limit, offset)
+	dense, err := b.probeDense(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	q := b.fetchSQL(limit, offset, dense)
 
 	rows, err := pool.Query(ctx, q, b.args...)
 	if err != nil {
@@ -1447,29 +1480,32 @@ func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset in
 //
 // Two query shapes are produced:
 //
-//   - No sp_* predicate (plain browse, or filters only on resources columns such
-//     as _id / _lastUpdated / _text): the classic single-scan form. With
-//     ORDER BY r.last_updated served directly by idx_res_active, the LIMIT
-//     terminates early after `limit` rows without visiting the whole match set.
+//   - Single-scan form (no numeric sp_* predicate, or dense == true): ORDER BY
+//     r.last_updated served directly by idx_res_active, so the LIMIT terminates
+//     early after `limit` rows without visiting the whole match set. Used for
+//     plain browse, resources-column filters, token/reference/etc. predicates
+//     (the planner picks the right plan from their statistics), and numeric
+//     predicates the probe has confirmed are dense.
 //
-//   - With an sp_* predicate: an id-first form. A MATERIALIZED CTE resolves the
-//     matching (fhir_id, sort keys) first, so the planner can drive the match off
-//     the selective sp_* index instead of scanning resources in last_updated
-//     order and probing sp_* once per candidate row. The sort + LIMIT then run
-//     over the light candidate rows, and only the surviving page joins back to
-//     resources for resource_json.
+//   - id-first form (numeric sp_* predicate, dense == false): a MATERIALIZED CTE
+//     resolves the matching (fhir_id, sort keys) first, so the planner drives the
+//     match off the selective sp_* index instead of scanning resources in
+//     last_updated order and probing sp_* per candidate row. The sort + LIMIT run
+//     over the light candidate rows, then the surviving page joins back for
+//     resource_json.
 //
-// The MATERIALIZED barrier is load-bearing: without it the planner collapses the
-// id-first form back into the single-scan shape, whose cost explodes for
-// selective search predicates — a full resources scan with a per-row sp_* probe
-// that never reaches the LIMIT (observed at multiple seconds per query, versus
-// sub-second id-first, on the perf dataset). The barrier gives up the single-scan
-// early-termination for broad (non-selective) sp_* predicates, so it is applied
-// only when the WHERE actually filters on an sp_* table.
-func (b *queryBuilder) fetchSQL(limit, offset int) string {
+// The MATERIALIZED barrier is load-bearing for a sparse numeric predicate:
+// without it the planner (which cannot estimate an unbounded numeric range)
+// collapses into the single-scan shape and does a full resources scan with a
+// per-row sp_* probe that never reaches the LIMIT — multiple seconds per query on
+// the perf dataset. For a dense numeric predicate that same single-scan shape is
+// instead the fast plan (a page's worth of matches sits in the first handful of
+// rows), so probeDense measures the density up front and passes dense=true to
+// switch back to it.
+func (b *queryBuilder) fetchSQL(limit, offset int, dense bool) string {
 	terms := b.orderTerms()
 
-	if !b.usesSP {
+	if !b.usesSP || dense {
 		var clauses []string
 		for _, t := range terms {
 			clauses = append(clauses, t.expr+" "+t.dir)
@@ -1520,6 +1556,57 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 		rtP,
 		strings.Join(outerOrder, ", "),
 	)
+}
+
+// denseCandidateThreshold is the match-set size at which the single-scan fetch
+// overtakes the id-first MATERIALIZED fetch for a numeric predicate. Below it the
+// id-first form resolves and sorts a small candidate set cheaply; above it that
+// set is large, and materializing+sorting all of it costs more than letting the
+// ordered scan walk idx_res_active and stop at the page. Measured crossover was
+// ~1.5k rows on the perf dataset; 1000 is a slightly conservative round value.
+const denseCandidateThreshold = 1000
+
+// probeDense reports whether a numeric search's match set is large enough that
+// fetchSQL should use the ordered single-scan shape instead of the id-first
+// MATERIALIZED one.
+//
+// It runs only for a search whose sole predicate is numeric (quantity/number)
+// and whose sort is served by the resources index (see orderByResourceIndex).
+// That restriction keeps the check cheap: the LIMIT-bounded probe resolves off
+// the numeric sp_* index — a sparse predicate returns in well under a
+// millisecond, a dense one hits the LIMIT after scanning few rows. token and
+// composite predicates are excluded because their probe would scan a large token
+// match set (and composites are almost always sparse anyway); multi-predicate
+// searches are excluded because the extra predicates make the probe expensive.
+// It reuses b.args as-is (the LIMIT is a constant), so it must run before
+// fetchSQL appends the ORDER BY / LIMIT / OFFSET parameters.
+func (b *queryBuilder) probeDense(ctx context.Context, pool querier) (bool, error) {
+	if !b.numericSP || b.predicateCount != 1 || !b.orderByResourceIndex() {
+		return false, nil
+	}
+	q := fmt.Sprintf(
+		`SELECT count(*) FROM (SELECT 1 FROM resources r WHERE %s LIMIT %d) probe`,
+		b.where.String(), denseCandidateThreshold,
+	)
+	var n int
+	if err := pool.QueryRow(ctx, q, b.args...).Scan(&n); err != nil {
+		return false, err
+	}
+	return n >= denseCandidateThreshold, nil
+}
+
+// orderByResourceIndex reports whether every ORDER BY term is a plain resources
+// column (last_updated / fhir_id), so the ordered single-scan fetch can serve the
+// sort straight from idx_res_active and stop at the page. A _sort on an sp_* param
+// orders by a correlated subquery that no index provides, so the ordered scan
+// could not early-terminate and the id-first form must be kept.
+func (b *queryBuilder) orderByResourceIndex() bool {
+	for _, t := range b.orderTerms() {
+		if t.expr != "r.last_updated" && t.expr != "r.fhir_id" {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchWithCount returns the page of matching rows plus the exact total match
