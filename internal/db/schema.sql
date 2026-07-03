@@ -199,9 +199,12 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
 -- Raw value range search (same system+code, no unit conversion needed).
 CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code);
 -- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
--- deletes; param_name narrows the probe to the parameter. (Restored to its pre-v5
--- form — the diet dropped param_name here too. See the schema_version v8 note.)
-CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resource_id, resource_type, param_name);
+-- deletes. buildQuantityExists filters on value_low/value_high plus optional
+-- system/code, so those trail param_name to keep the probe index-only — matching
+-- the date/number _source indexes. (The pre-v5 form was (resource_id,
+-- resource_type, param_name) with no value columns; widened here for index-only
+-- parity. See the schema_version v8 note.)
+CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resource_id, resource_type, param_name, value_low, value_high, system, code);
 -- Canonical search (cross-unit comparison via UCUM normalisation).
 CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (tenant_id, resource_type, param_name, canonical_value, canonical_units)
     WHERE canonical_value IS NOT NULL;
