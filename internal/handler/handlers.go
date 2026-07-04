@@ -1444,12 +1444,17 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateRequiredFields returns a non-empty error message if key required
-// FHIR R4 fields are missing from the resource body. Covers only the resource
-// types exercised by the integration test suite; returns "" for unknown types.
+// FHIR R4 fields are missing from the resource body. Coverage is intentionally
+// limited to a small set of commonly-created resources whose required fields
+// are simple 1..1 top-level elements; unknown types and more complex
+// cardinality rules are left to the base StructureDefinition validator.
 func validateRequiredFields(rt string, body map[string]any) string {
 	required := map[string][]string{
-		"Observation": {"code"},
-		"Encounter":   {"status", "class"},
+		"Observation":        {"code"},
+		"Encounter":          {"status", "class"},
+		"Condition":          {"subject"},
+		"DiagnosticReport":   {"status", "code"},
+		"AllergyIntolerance": {"patient"},
 	}
 	fields, ok := required[rt]
 	if !ok {
