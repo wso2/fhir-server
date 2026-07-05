@@ -1461,11 +1461,30 @@ func validateRequiredFields(rt string, body map[string]any) string {
 		return ""
 	}
 	for _, f := range fields {
-		if _, exists := body[f]; !exists {
+		if v, exists := body[f]; !exists || !isPresent(v) {
 			return fmt.Sprintf("missing required field %q for %s", f, rt)
 		}
 	}
 	return ""
+}
+
+// isPresent reports whether a decoded JSON value carries actual content.
+// A required field whose key is present but whose value is null, an empty
+// string, or an empty object/array is treated as absent, matching FHIR
+// cardinality semantics for 1..1 elements.
+func isPresent(v any) bool {
+	if v == nil {
+		return false
+	}
+	switch t := v.(type) {
+	case string:
+		return t != ""
+	case map[string]any:
+		return len(t) > 0
+	case []any:
+		return len(t) > 0
+	}
+	return true
 }
 
 // enforceWrite runs validation on a create/update and, when there is a blocking

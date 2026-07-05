@@ -289,11 +289,36 @@ func TestCreate_RequiredFields_Condition_MissingSubject(t *testing.T) {
 	}
 }
 
+func TestCreate_RequiredFields_Condition_NullSubject(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      nil,
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
 func TestCreate_RequiredFields_DiagnosticReport_MissingStatus(t *testing.T) {
 	h := newRouter(&mockStore{})
 	payload := map[string]any{
 		"resourceType": "DiagnosticReport",
 		"code":         map[string]any{"text": "blood panel"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_MissingCode(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"status":       "final",
 	}
 	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
 	if w.Code != http.StatusUnprocessableEntity {
@@ -328,6 +353,46 @@ func TestCreate_RequiredFields_DiagnosticReport_Valid(t *testing.T) {
 		"code":         map[string]any{"text": "blood panel"},
 	}
 	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_Condition_Valid(t *testing.T) {
+	ms := &mockStore{}
+	ms.createFn = func(_ context.Context, rt string, body map[string]any) (map[string]any, error) {
+		body["id"] = "generated-id"
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      map[string]any{"reference": "Patient/p1"},
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_AllergyIntolerance_Valid(t *testing.T) {
+	ms := &mockStore{}
+	ms.createFn = func(_ context.Context, rt string, body map[string]any) (map[string]any, error) {
+		body["id"] = "generated-id"
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{
+		"resourceType": "AllergyIntolerance",
+		"patient":      map[string]any{"reference": "Patient/p1"},
+		"code":         map[string]any{"text": "peanuts"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/AllergyIntolerance", payload)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("want 201, got %d", w.Code)
 	}
