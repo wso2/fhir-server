@@ -165,10 +165,18 @@ CREATE TABLE IF NOT EXISTS sp_number (
     value         DECIMAL(20,6) NOT NULL,
     value_low     DECIMAL(20,6) NOT NULL,
     value_high    DECIMAL(20,6) NOT NULL,
+    -- Denormalised copy of resources.last_updated, set at index time to the exact
+    -- value written to resources. Lets the id-first fetch sort candidates straight
+    -- from idx_sp_num_range without a per-match resources lookup — see fetchSQL's
+    -- direct-drive shape.
+    last_updated  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high);
+-- INCLUDE (resource_id, last_updated) makes the range scan covering: the id-first
+-- candidate resolve is index-only, yielding the fhir_id to join and the sort key
+-- to order by without touching the heap.
+CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
 -- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
 -- deletes; param_name + range columns keep the probe index-only. (Restored from
 -- the v5 diet's (resource_id, resource_type) — see the schema_version v8 note.)
@@ -193,11 +201,18 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
     code             VARCHAR(64),
     canonical_value  DECIMAL(20,6),
     canonical_units  VARCHAR(64),
+    -- Denormalised copy of resources.last_updated, set at index time to the exact
+    -- value written to resources. Lets the id-first fetch sort candidates straight
+    -- from idx_sp_qty_raw without a per-match resources lookup — see fetchSQL's
+    -- direct-drive shape.
+    last_updated     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
 -- Raw value range search (same system+code, no unit conversion needed).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code);
+-- INCLUDE (resource_id, last_updated) makes the range scan covering so the
+-- id-first candidate resolve is index-only (fhir_id to join + sort key to order).
+CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code) INCLUDE (resource_id, last_updated);
 -- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
 -- deletes. buildQuantityExists filters on value_low/value_high plus optional
 -- system/code, so those trail param_name to keep the probe index-only — matching

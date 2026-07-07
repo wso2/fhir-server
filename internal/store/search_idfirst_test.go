@@ -51,7 +51,7 @@ func buildSQL(t *testing.T, rt, rawKey, value string) string {
 	if b.err != nil {
 		t.Fatalf("applyParam(%q=%q): %v", rawKey, value, b.err)
 	}
-	return b.fetchSQL(20, 0, false)
+	return b.fetchSQL(20, 0)
 }
 
 func TestFetchSQL_IdFirstGating(t *testing.T) {
@@ -91,7 +91,7 @@ func TestFetchSQL_MixedParamsUseIdFirst(t *testing.T) {
 	if b.err != nil {
 		t.Fatal(b.err)
 	}
-	if sql := b.fetchSQL(20, 0, false); !strings.Contains(sql, idFirstMarker) {
+	if sql := b.fetchSQL(20, 0); !strings.Contains(sql, idFirstMarker) {
 		t.Fatalf("expected id-first for mixed reference+quantity search\nSQL:\n%s", sql)
 	}
 }
@@ -106,7 +106,7 @@ func TestFetchSQL_IdFirstCarriesSortKey(t *testing.T) {
 	if b.err != nil {
 		t.Fatal(b.err)
 	}
-	sql := b.fetchSQL(20, 0, false)
+	sql := b.fetchSQL(20, 0)
 	for _, want := range []string{idFirstMarker, "AS sort0", "ORDER BY sort0", "ORDER BY c.sort0"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("id-first sort SQL missing %q\nSQL:\n%s", want, sql)
@@ -114,33 +114,42 @@ func TestFetchSQL_IdFirstCarriesSortKey(t *testing.T) {
 	}
 }
 
-// A numeric search the probe has confirmed dense (dense=true) must switch to the
-// ordered single-scan shape rather than materialize the whole candidate set.
-func TestFetchSQL_DenseNumericUsesOrderedScan(t *testing.T) {
+// A sole numeric predicate sorted by a resources column uses the direct-drive
+// id-first shape: the candidate CTE resolves straight off the sp_* value index
+// (FROM sp_quantity s) using the denormalised last_updated, rather than scanning
+// resources with a correlated EXISTS.
+func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
 	b.writeBase()
 	b.applyParam("value-quantity", "gt170")
 	if b.err != nil {
 		t.Fatal(b.err)
 	}
-	if sql := b.fetchSQL(20, 0, true); strings.Contains(sql, idFirstMarker) {
-		t.Fatalf("dense numeric search should use ordered single-scan, got id-first\nSQL:\n%s", sql)
+	sql := b.fetchSQL(20, 0)
+	for _, want := range []string{idFirstMarker, "FROM sp_quantity s", "s.resource_id AS fhir_id", "s.last_updated"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("direct-drive SQL missing %q\nSQL:\n%s", want, sql)
+		}
+	}
+	// The candidate CTE resolves off sp_quantity, not a correlated EXISTS over resources.
+	if strings.Contains(sql, "EXISTS (SELECT 1 FROM sp_quantity") {
+		t.Fatalf("direct-drive should not use a correlated EXISTS\nSQL:\n%s", sql)
 	}
 }
 
-// probeDense only engages for a sole numeric predicate; the builder tracks
-// numericSP and predicateCount to gate it. Token predicates and multi-predicate
-// searches must not qualify (their probe would be expensive).
-func TestProbeGating(t *testing.T) {
+// directDrive engages only for a lone numeric predicate sorted by a resources
+// column. A token predicate (no id-first) and any multi-predicate search must not
+// qualify — they fall back to the ordered scan or the correlated id-first shape.
+func TestDirectDriveGating(t *testing.T) {
 	cases := []struct {
-		name        string
-		params      [][2]string
-		wantNumeric bool
-		wantCount   int
+		name       string
+		params     [][2]string
+		wantDirect bool
+		wantCount  int
 	}{
 		{"sole quantity", [][2]string{{"value-quantity", "gt170"}}, true, 1},
 		{"sole token", [][2]string{{"code", "8302-2"}}, false, 1},
-		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, true, 2},
+		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, false, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,17 +161,11 @@ func TestProbeGating(t *testing.T) {
 			if b.err != nil {
 				t.Fatal(b.err)
 			}
-			if b.numericSP != tc.wantNumeric {
-				t.Errorf("numericSP=%v, want %v", b.numericSP, tc.wantNumeric)
-			}
 			if b.predicateCount != tc.wantCount {
 				t.Errorf("predicateCount=%d, want %d", b.predicateCount, tc.wantCount)
 			}
-			// The gate: probe runs only for a sole numeric predicate.
-			eligible := b.numericSP && b.predicateCount == 1 && b.orderByResourceIndex()
-			wantEligible := tc.wantNumeric && tc.wantCount == 1
-			if eligible != wantEligible {
-				t.Errorf("probe-eligible=%v, want %v", eligible, wantEligible)
+			if got := b.directDrive(); got != tc.wantDirect {
+				t.Errorf("directDrive()=%v, want %v", got, tc.wantDirect)
 			}
 		})
 	}

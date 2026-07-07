@@ -44,13 +44,13 @@ func New(registry *searchparam.Registry) *Extractor {
 
 // Index extracts all search parameter values from resource and inserts them
 // into the sp_* tables within tx using a single batched round-trip.
-func (e *Extractor) Index(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, resource map[string]any) error {
+func (e *Extractor) Index(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) error {
 	slog.Debug("Starting index extraction", "resourceType", resourceType, "resourceID", resourceID)
 	batch := &pgx.Batch{}
 
 	defs := e.registry.ForResource(resourceType)
 	for _, d := range defs {
-		e.queueParam(batch, resourceType, resourceID, resource, d)
+		e.queueParam(batch, resourceType, resourceID, resource, d, lastUpdated)
 	}
 	// Universal meta.* params (_tag/_security/_profile/_source) and the
 	// resource-level language. These live on Resource/DomainResource and so
@@ -139,10 +139,10 @@ func Delete(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) err
 // an external batch without sending it. The caller is responsible for sending
 // and draining the batch. This allows callers to merge index inserts with other
 // write operations into a single round-trip.
-func (e *Extractor) Queue(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any) {
+func (e *Extractor) Queue(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) {
 	defs := e.registry.ForResource(resourceType)
 	for _, d := range defs {
-		e.queueParam(batch, resourceType, resourceID, resource, d)
+		e.queueParam(batch, resourceType, resourceID, resource, d, lastUpdated)
 	}
 	queueMeta(batch, resourceType, resourceID, resource)
 }
@@ -171,7 +171,7 @@ func DeleteWithPool(ctx context.Context, pool *pgxpool.Pool, resourceType, resou
 	return tx.Commit(ctx)
 }
 
-func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any, d searchparam.Definition) {
+func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any, d searchparam.Definition, lastUpdated time.Time) {
 	vals, err := fhirpath.EvaluatePolymorphic(d.FHIRPath, resource)
 	if err != nil || len(vals) == 0 {
 		return
@@ -185,9 +185,9 @@ func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string
 	case "date", "dateTime", "instant", "Period":
 		queueDate(batch, resourceType, resourceID, d.ParamName, vals)
 	case "number":
-		queueNumber(batch, resourceType, resourceID, d.ParamName, vals)
+		queueNumber(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "quantity":
-		queueQuantity(batch, resourceType, resourceID, d.ParamName, vals)
+		queueQuantity(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "uri":
 		queueURI(batch, resourceType, resourceID, d.ParamName, vals)
 	case "reference":
@@ -400,7 +400,7 @@ func expandDateString(s string) (low, high time.Time, err error) {
 
 // ─── sp_number ────────────────────────────────────────────────────────────────
 
-func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		f, ok := toFloat(v)
 		if !ok {
@@ -408,17 +408,19 @@ func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any) {
 		}
 		// ±5 ULP as implicit precision range
 		eps := math.Abs(f) * 1e-7
+		// last_updated mirrors resources.last_updated so the id-first fetch can
+		// sort candidates from idx_sp_num_range without a resources lookup.
 		batch.Queue(
-			`INSERT INTO sp_number (resource_id, resource_type, param_name, value_low, value_high)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			rid, rt, param, f-eps, f+eps,
+			`INSERT INTO sp_number (resource_id, resource_type, param_name, value_low, value_high, last_updated)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			rid, rt, param, f-eps, f+eps, lastUpdated,
 		)
 	}
 }
 
 // ─── sp_quantity ──────────────────────────────────────────────────────────────
 
-func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		m, ok := v.(map[string]any)
 		if !ok {
@@ -431,10 +433,12 @@ func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any) {
 		sys := asString(m["system"])
 		code := asString(m["code"])
 		eps := math.Abs(f) * 1e-7
+		// last_updated mirrors resources.last_updated so the id-first fetch can
+		// sort candidates from idx_sp_qty_raw without a resources lookup.
 		batch.Queue(
-			`INSERT INTO sp_quantity (resource_id, resource_type, param_name, value, value_low, value_high, system, code)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			rid, rt, param, f, f-eps, f+eps, sys, code,
+			`INSERT INTO sp_quantity (resource_id, resource_type, param_name, value, value_low, value_high, system, code, last_updated)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			rid, rt, param, f, f-eps, f+eps, sys, code, lastUpdated,
 		)
 	}
 }
