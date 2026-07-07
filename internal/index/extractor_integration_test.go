@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2/fhir-server/internal/index"
@@ -88,7 +89,7 @@ func TestExtractor_IndexStringParam(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 
-	if err := ext2.Index(ctx, tx, "Patient", "test-str-1", resource); err != nil {
+	if err := ext2.Index(ctx, tx, "Patient", "test-str-1", resource, time.Now()); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 	tx.Commit(ctx)
@@ -115,7 +116,7 @@ func TestExtractor_IndexTokenParam_FromGender(t *testing.T) {
 	tx, _ := pool.Begin(ctx)
 	defer tx.Rollback(ctx)
 
-	if err := ext.Index(ctx, tx, "Patient", "test-gender-1", resource); err != nil {
+	if err := ext.Index(ctx, tx, "Patient", "test-gender-1", resource, time.Now()); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 	tx.Commit(ctx)
@@ -142,7 +143,7 @@ func TestExtractor_IndexDateParam(t *testing.T) {
 	tx, _ := pool.Begin(ctx)
 	defer tx.Rollback(ctx)
 
-	if err := ext.Index(ctx, tx, "Patient", "test-bd-1", resource); err != nil {
+	if err := ext.Index(ctx, tx, "Patient", "test-bd-1", resource, time.Now()); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 	tx.Commit(ctx)
@@ -173,7 +174,7 @@ func TestExtractor_IndexReferenceParam(t *testing.T) {
 	tx, _ := pool.Begin(ctx)
 	defer tx.Rollback(ctx)
 
-	if err := ext.Index(ctx, tx, "Observation", "test-ref-obs-1", resource); err != nil {
+	if err := ext.Index(ctx, tx, "Observation", "test-ref-obs-1", resource, time.Now()); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 	tx.Commit(ctx)
@@ -210,7 +211,7 @@ func TestExtractor_IndexTokenParam_CodeableConcept(t *testing.T) {
 	tx, _ := pool.Begin(ctx)
 	defer tx.Rollback(ctx)
 
-	if err := ext.Index(ctx, tx, "Observation", "test-obs-code-1", resource); err != nil {
+	if err := ext.Index(ctx, tx, "Observation", "test-obs-code-1", resource, time.Now()); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 	tx.Commit(ctx)
@@ -240,7 +241,7 @@ func TestExtractor_Delete_ClearsAllSpTables(t *testing.T) {
 	insertResource(t, pool, "Patient", rid, resource)
 
 	tx, _ := pool.Begin(ctx)
-	ext.Index(ctx, tx, "Patient", rid, resource)
+	ext.Index(ctx, tx, "Patient", rid, resource, time.Now())
 	tx.Commit(ctx)
 
 	tx2, _ := pool.Begin(ctx)
