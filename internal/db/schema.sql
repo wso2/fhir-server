@@ -430,6 +430,19 @@ ALTER TABLE sp_reference ALTER COLUMN param_name    SET STATISTICS 1000;
 CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_code (dependencies, ndistinct, mcv)
     ON resource_type, param_name, code FROM sp_token;
 
+-- system|code searches (the common token form, e.g.
+-- class=http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB) filter on system
+-- AND code, which are strongly correlated — a code like AMB only ever appears
+-- under its own system. Without system in the stats the planner treats them as
+-- independent and badly UNDER-estimates a dense combination: Encounter class=AMB
+-- (62k rows) was estimated at 593, so it materialised + sorted every match and
+-- joined resources per row (~2.7s) instead of the abort-early ordered scan
+-- (~0.7ms). Adding system to the multivariate stat corrects the estimate so the
+-- planner takes the ordered early-exit for dense system|code tokens and keeps
+-- the id-first materialize for sparse ones. Populated by ANALYZE.
+CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_sys_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, system, code FROM sp_token;
+
 -- ─── Autovacuum tuning for high-churn tables ─────────────────────────────────
 -- Default autovacuum_vacuum_scale_factor=0.20 means PostgreSQL waits until 20%
 -- of a table is dead before cleaning up. On tables with millions of rows that
