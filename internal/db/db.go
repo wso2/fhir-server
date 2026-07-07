@@ -34,6 +34,21 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
 
+	// Force per-value (custom) plans instead of cached generic plans. Search
+	// plan quality depends heavily on the specific bound value's selectivity:
+	// the planner must see the literal to choose between an ordered early-exit
+	// scan (dense predicate) and driving from the sp_* value index (sparse or
+	// empty predicate). Under a generic plan it cannot tell them apart — e.g. a
+	// dense token like category=laboratory (~70% of rows) degrades to a
+	// HashAggregate over the whole match set (~2.9s), where a custom plan sees
+	// the value's MCV stats and takes the ordered scan (~6ms). Planning cost per
+	// query is negligible next to search execution. Set as a startup RuntimeParam
+	// so every pooled connection uses it.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_custom_plan"
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pool: %w", err)
