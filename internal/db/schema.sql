@@ -406,6 +406,19 @@ ALTER TABLE sp_token     ALTER COLUMN param_name    SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN target_id     SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN param_name    SET STATISTICS 1000;
 
+-- Multivariate statistics: the per-column targets above still let the planner
+-- assume resource_type / param_name / code are independent, so it badly
+-- under-estimates a common (resource_type, param_name, code) combination — e.g.
+-- Observation category=vital-signs (~20% of Observations) was estimated at <2%.
+-- That misestimate made it materialize + sort the entire match set (135k rows,
+-- one resources lookup each) instead of the abort-early ordered scan that stops
+-- at the first page: ~966ms vs ~15ms on the perf dataset. MCV/dependencies over
+-- the correlated columns correct the estimate so the planner picks the ordered
+-- scan for dense codes and the id-first-style materialize for sparse ones.
+-- Populated by ANALYZE (autoanalyze covers this after the bulk import).
+CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, code FROM sp_token;
+
 -- ─── Autovacuum tuning for high-churn tables ─────────────────────────────────
 -- Default autovacuum_vacuum_scale_factor=0.20 means PostgreSQL waits until 20%
 -- of a table is dead before cleaning up. On tables with millions of rows that
