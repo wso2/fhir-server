@@ -32,11 +32,18 @@ const idFirstMarker = "WITH candidates AS MATERIALIZED"
 func idFirstTestRegistry() *searchparam.Registry {
 	reg := searchparam.NewRegistry()
 	for _, d := range []searchparam.Definition{
-		{ResourceType: "Observation", ParamName: "value-quantity", ParamType: "quantity"},
-		{ResourceType: "Observation", ParamName: "code", ParamType: "token"},
+		{ResourceType: "Observation", ParamName: "value-quantity", ParamType: "quantity", FHIRPath: "Observation.value.ofType(Quantity)"},
+		{ResourceType: "Observation", ParamName: "code", ParamType: "token", FHIRPath: "Observation.code"},
 		{ResourceType: "Observation", ParamName: "subject", ParamType: "reference", Targets: []string{"Patient"}},
 		{ResourceType: "Observation", ParamName: "date", ParamType: "date"},
 		{ResourceType: "Patient", ParamName: "name", ParamType: "string"},
+		// A composite embedding a token + quantity component — exercises the
+		// direct-drive suppression inside buildCompositeExists.
+		{ResourceType: "Observation", ParamName: "code-value-quantity", ParamType: "composite",
+			Components: []searchparam.ComponentDef{
+				{Expression: "Observation.code"},
+				{Expression: "Observation.value.ofType(Quantity)"},
+			}},
 	} {
 		reg.Upsert(d)
 	}
@@ -179,6 +186,7 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 		{"quantity OR list (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt10,lt5"}}, ""},
 		{"quantity system|code (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt5|http://unitsofmeasure.org|mg"}}, ""},
 		{"mixed ref+quantity (correlated id-first)", "Observation", [][2]string{{"subject", "Patient/123"}, {"value-quantity", "gt170"}}, ""},
+		{"composite token+quantity (correlated id-first)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
 		{"quantity sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"value-quantity", "gt170"}}, "-date"},
 		{"token (single-scan)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
 		{"plain browse (single-scan)", "Observation", nil, ""},
@@ -215,6 +223,7 @@ func TestDirectDriveGating(t *testing.T) {
 		{"sole quantity", [][2]string{{"value-quantity", "gt170"}}, true, 1},
 		{"sole token", [][2]string{{"code", "8302-2"}}, false, 1},
 		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, false, 2},
+		{"composite embedding quantity", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, false, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

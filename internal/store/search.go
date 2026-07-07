@@ -276,6 +276,14 @@ type queryBuilder struct {
 	// density probe.
 	numericTable  string
 	numericBodies []string
+	// inComposite is set while buildCompositeExists resolves its component
+	// sub-predicates. A composite embedding a quantity/number component would
+	// otherwise have buildQuantityExists/buildNumberExists capture numericTable/
+	// numericBodies, wrongly triggering the direct-drive fetch — which emits only
+	// that one component's body and drops the rest of the composite (both wrong
+	// results and an orphaned parameter → SQLSTATE 42P18). The capture is skipped
+	// while this is set, so a composite keeps the correlated id-first shape.
+	inComposite bool
 	// err is set when the request can't be satisfied (e.g. a registry-known
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
@@ -484,9 +492,14 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 
 	// Build the two component SELECT bodies. Each is a fully-formed
 	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
-	// correlated to the outer resource row.
+	// correlated to the outer resource row. inComposite suppresses the
+	// direct-drive capture for a numeric component: the composite's full
+	// predicate is both components, so it must keep the correlated id-first shape.
+	prevInComposite := b.inComposite
+	b.inComposite = true
 	cond1, ok1 := b.buildExistsForValue(comp1Name, "", val1)
 	cond2, ok2 := b.buildExistsForValue(comp2Name, "", val2)
+	b.inComposite = prevInComposite
 	if !ok1 || !ok2 || cond1 == "" || cond2 == "" {
 		return "", false
 	}
@@ -1064,9 +1077,12 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	}
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
 	// Capture the correlation-free body so a lone number predicate can drive the
-	// id-first CTE straight off sp_number (see fetchSQL).
-	b.numericTable = "sp_number"
-	b.numericBodies = append(b.numericBodies, body)
+	// id-first CTE straight off sp_number (see fetchSQL). Skipped inside a
+	// composite, whose full predicate is more than this one component.
+	if !b.inComposite {
+		b.numericTable = "sp_number"
+		b.numericBodies = append(b.numericBodies, body)
+	}
 	return "SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND " + body
 }
 
@@ -1161,9 +1177,12 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	}
 	// Capture the correlation-free body so a lone quantity predicate can drive the
 	// id-first CTE straight off sp_quantity (see fetchSQL). The same $N args are
-	// shared with the EXISTS form below.
-	b.numericTable = "sp_quantity"
-	b.numericBodies = append(b.numericBodies, body)
+	// shared with the EXISTS form below. Skipped inside a composite, whose full
+	// predicate is more than this one component.
+	if !b.inComposite {
+		b.numericTable = "sp_quantity"
+		b.numericBodies = append(b.numericBodies, body)
+	}
 	return "SELECT 1 FROM sp_quantity s WHERE s.resource_id = r.fhir_id AND " + body
 }
 
