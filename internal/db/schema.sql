@@ -554,3 +554,21 @@ END
 $leakproof$;
 
 INSERT INTO schema_version (version) VALUES (9) ON CONFLICT DO NOTHING;
+
+-- v10: recency covering indexes on the numeric sp_* tables, ordered by
+-- last_updated DESC, for the early-exit id-first fetch (directDriveSQL).
+--
+-- The value indexes above (idx_sp_qty_raw / idx_sp_num_range) are ordered by
+-- value, so a search sorted by recency had to read the entire match set and
+-- top-N sort it — fine for a sparse predicate, but for a DENSE one (e.g.
+-- value-quantity=le140 matching ~500k rows) that was a multi-hundred-ms
+-- materialise-and-sort. Ordering the index by last_updated DESC lets the
+-- planner walk it newest-first, apply the value predicate from the INCLUDE'd
+-- columns, and stop after one page (~1ms), while a sparse/empty predicate still
+-- uses the value index. The planner chooses between the two per bound value
+-- (force_custom_plan) from the single sp_* table's own statistics — no
+-- application-level plan forcing.
+CREATE INDEX IF NOT EXISTS idx_sp_qty_recent ON sp_quantity (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id, system, code);
+CREATE INDEX IF NOT EXISTS idx_sp_num_recent ON sp_number   (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
+
+INSERT INTO schema_version (version) VALUES (10) ON CONFLICT DO NOTHING;

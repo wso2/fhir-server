@@ -1616,12 +1616,10 @@ func (b *queryBuilder) directDrive(terms []orderTerm) bool {
 // building; only limit/offset/rt are appended here.
 func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) string {
 	selectList := []string{"s.resource_id AS fhir_id"}
-	innerCols := []string{"fhir_id"}
 	var innerOrder, outerOrder []string
 	for i, t := range terms {
 		alias := fmt.Sprintf("sort%d", i)
 		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
-		innerCols = append(innerCols, alias)
 		innerOrder = append(innerOrder, alias+" "+t.dir)
 		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
 	}
@@ -1631,18 +1629,32 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 	}
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
-	// Reuse writeBase's resource_type placeholder ($1) rather than binding a fresh
-	// one: b.where is not emitted by this shape, so $1 would otherwise be an unused
-	// parameter and Postgres could not infer its type (SQLSTATE 42P18).
 
+	// Early-exit id-first fetch. DISTINCT + ORDER BY + LIMIT are pushed into the
+	// candidate subquery (no MATERIALIZED barrier) so the planner drives it
+	// straight off an sp_* index and stops as soon as `limit` distinct resources
+	// are found:
+	//
+	//   - dense predicate sorted by last_updated → recency covering index
+	//     (…, last_updated DESC) INCLUDE (value_low, …): the page resolves after
+	//     scanning a few dozen index rows, instead of the older MATERIALIZED CTE's
+	//     full materialise-and-sort of the whole match set (e.g. value-quantity=le140
+	//     matched ~500k rows → multi-hundred-ms sort; now ~1ms early-exit).
+	//   - sparse/empty predicate → value index: returns few/zero rows directly,
+	//     never a resources full-scan.
+	//
+	// DISTINCT dedupes resources that have several matching sp_* rows so a page is
+	// always `limit` distinct resources (the old shape could emit duplicates).
+	// Reuse writeBase's resource_type placeholder (b.rtParam): b.where is not
+	// emitted by this shape, so binding a fresh one would orphan $1 (SQLSTATE 42P18).
 	return fmt.Sprintf(`
-		WITH candidates AS MATERIALIZED (
-			SELECT %s
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT DISTINCT %s
 			FROM %s s
 			WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
-		)
-		SELECT r.resource_json, r.version_id, r.last_updated
-		FROM (SELECT %s FROM candidates ORDER BY %s LIMIT %s OFFSET %s) c
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
 		JOIN resources r ON r.fhir_id = c.fhir_id
 			AND r.resource_type = %s
 			AND r.tenant_id = current_setting('app.current_tenant', true)
@@ -1650,7 +1662,7 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 		ORDER BY %s`,
 		strings.Join(selectList, ", "),
 		b.numericTable, match,
-		strings.Join(innerCols, ", "), strings.Join(innerOrder, ", "), limitP, offsetP,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
 		b.rtParam,
 		strings.Join(outerOrder, ", "),
 	)

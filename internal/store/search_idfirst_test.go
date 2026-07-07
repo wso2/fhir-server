@@ -25,9 +25,20 @@ import (
 	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
-// idFirstMarker uniquely identifies the id-first fetch shape produced by
-// fetchSQL. The ordered-scan shape never contains a CTE.
+// fetchSQL produces two id-first shapes, both distinct from the plain
+// ordered-scan (which is a bare "FROM resources r WHERE …"):
+//   - correlated id-first (composite / multi-predicate): a MATERIALIZED CTE.
+//   - direct-drive (a lone numeric predicate sorted by a resources column): a
+//     DISTINCT candidate subquery driven straight off the sp_* index, with the
+//     ORDER BY + LIMIT pushed in so a dense predicate early-exits.
 const idFirstMarker = "WITH candidates AS MATERIALIZED"
+const directDriveMarker = "SELECT DISTINCT"
+
+// usesIdFirst reports whether the fetch SQL is one of the id-first shapes
+// (rather than the plain ordered scan over resources).
+func usesIdFirst(sql string) bool {
+	return strings.Contains(sql, idFirstMarker) || strings.Contains(sql, directDriveMarker)
+}
 
 func idFirstTestRegistry() *searchparam.Registry {
 	reg := searchparam.NewRegistry()
@@ -83,7 +94,7 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sql := buildSQL(t, tc.rt, tc.key, tc.value)
-			got := strings.Contains(sql, idFirstMarker)
+			got := usesIdFirst(sql)
 			if got != tc.wantIdFirst {
 				t.Fatalf("id-first=%v, want %v\nSQL:\n%s", got, tc.wantIdFirst, sql)
 			}
@@ -126,9 +137,10 @@ func TestFetchSQL_IdFirstCarriesSortKey(t *testing.T) {
 }
 
 // A sole numeric predicate sorted by a resources column uses the direct-drive
-// id-first shape: the candidate CTE resolves straight off the sp_* value index
-// (FROM sp_quantity s) using the denormalised last_updated, rather than scanning
-// resources with a correlated EXISTS.
+// id-first shape: a DISTINCT candidate subquery resolves straight off the sp_*
+// index (FROM sp_quantity s) with the ORDER BY + LIMIT pushed in so a dense
+// predicate early-exits, rather than scanning resources with a correlated
+// EXISTS or materialising the whole match set in a CTE.
 func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
 	b.writeBase()
@@ -137,12 +149,16 @@ func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 		t.Fatal(b.err)
 	}
 	sql := b.fetchSQL(20, 0)
-	for _, want := range []string{idFirstMarker, "FROM sp_quantity s", "s.resource_id AS fhir_id", "s.last_updated"} {
+	for _, want := range []string{directDriveMarker, "FROM sp_quantity s", "s.resource_id AS fhir_id", "s.last_updated", "LIMIT"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("direct-drive SQL missing %q\nSQL:\n%s", want, sql)
 		}
 	}
-	// The candidate CTE resolves off sp_quantity, not a correlated EXISTS over resources.
+	// Early-exit shape: no MATERIALIZED barrier (which would force resolving the
+	// whole match set before the LIMIT) and no correlated EXISTS over resources.
+	if strings.Contains(sql, idFirstMarker) {
+		t.Fatalf("direct-drive must not use a MATERIALIZED CTE (defeats early-exit)\nSQL:\n%s", sql)
+	}
 	if strings.Contains(sql, "EXISTS (SELECT 1 FROM sp_quantity") {
 		t.Fatalf("direct-drive should not use a correlated EXISTS\nSQL:\n%s", sql)
 	}
