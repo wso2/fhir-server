@@ -17,6 +17,8 @@
 package store
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -137,6 +139,69 @@ func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 	}
 }
 
+var paramRefRE = regexp.MustCompile(`\$(\d+)`)
+
+// assertParamsContiguous fails if the SQL does not reference exactly $1..$nargs.
+// A bound-but-unreferenced placeholder (a gap) makes Postgres unable to infer the
+// parameter's type at execute time — "could not determine data type of parameter
+// $N" (SQLSTATE 42P18) — which substring assertions alone would miss.
+func assertParamsContiguous(t *testing.T, sql string, nargs int) {
+	t.Helper()
+	seen := map[int]bool{}
+	for _, m := range paramRefRE.FindAllStringSubmatch(sql, -1) {
+		n, _ := strconv.Atoi(m[1])
+		seen[n] = true
+	}
+	for i := 1; i <= nargs; i++ {
+		if !seen[i] {
+			t.Errorf("parameter $%d is bound but never referenced (orphan → SQLSTATE 42P18)\nSQL:\n%s", i, sql)
+		}
+	}
+	for n := range seen {
+		if n < 1 || n > nargs {
+			t.Errorf("SQL references $%d but only %d args are bound\nSQL:\n%s", n, nargs, sql)
+		}
+	}
+}
+
+// Every fetch shape must reference exactly the parameters it binds. A gap orphans
+// a placeholder and fails at execute time with SQLSTATE 42P18 — the direct-drive
+// shape hit this by binding writeBase's $1 without referencing it.
+func TestFetchSQL_NoOrphanParams(t *testing.T) {
+	cases := []struct {
+		name   string
+		rt     string
+		params [][2]string
+		sort   string
+	}{
+		{"sole quantity (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt170"}}, ""},
+		{"quantity eq two-bound (direct-drive)", "Observation", [][2]string{{"value-quantity", "5"}}, ""},
+		{"quantity OR list (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt10,lt5"}}, ""},
+		{"quantity system|code (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt5|http://unitsofmeasure.org|mg"}}, ""},
+		{"mixed ref+quantity (correlated id-first)", "Observation", [][2]string{{"subject", "Patient/123"}, {"value-quantity", "gt170"}}, ""},
+		{"quantity sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"value-quantity", "gt170"}}, "-date"},
+		{"token (single-scan)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
+		{"plain browse (single-scan)", "Observation", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &queryBuilder{rt: tc.rt, reg: idFirstTestRegistry()}
+			b.writeBase()
+			for _, p := range tc.params {
+				b.applyParam(p[0], p[1])
+			}
+			if tc.sort != "" {
+				b.addSort(tc.sort)
+			}
+			if b.err != nil {
+				t.Fatal(b.err)
+			}
+			sql := b.fetchSQL(20, 0)
+			assertParamsContiguous(t, sql, len(b.args))
+		})
+	}
+}
+
 // directDrive engages only for a lone numeric predicate sorted by a resources
 // column. A token predicate (no id-first) and any multi-predicate search must not
 // qualify — they fall back to the ordered scan or the correlated id-first shape.
@@ -164,7 +229,7 @@ func TestDirectDriveGating(t *testing.T) {
 			if b.predicateCount != tc.wantCount {
 				t.Errorf("predicateCount=%d, want %d", b.predicateCount, tc.wantCount)
 			}
-			if got := b.directDrive(); got != tc.wantDirect {
+			if got := b.directDrive(b.orderTerms()); got != tc.wantDirect {
 				t.Errorf("directDrive()=%v, want %v", got, tc.wantDirect)
 			}
 		})

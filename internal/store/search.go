@@ -247,7 +247,13 @@ type queryBuilder struct {
 	where       strings.Builder
 	args        []any
 	argN        int
-	sort        []sortKey
+	// rtParam is the placeholder writeBase bound for the resource_type ($1). The
+	// direct-drive fetch reuses it in its resources JOIN so that placeholder stays
+	// referenced — a parameter bound but never used trips Postgres' type inference
+	// (SQLSTATE 42P18), which the direct-drive shape would otherwise hit because it
+	// builds its WHERE from numericBodies rather than b.where.
+	rtParam string
+	sort    []sortKey
 	// usesSP is set when a positive value predicate against a numeric,
 	// selectivity-mis-estimated sp_* table (quantity/number, or composite which
 	// embeds one; see paramUsesIdFirst) is added. It selects the id-first fetch
@@ -291,6 +297,7 @@ func (b *queryBuilder) next(v any) string {
 
 func (b *queryBuilder) writeBase() {
 	rtP := b.next(b.rt)
+	b.rtParam = rtP
 	// Tenant scope (defence in depth alongside Row-Level Security): restrict to
 	// the request's tenant via the app.current_tenant setting the store applies
 	// to the connection/transaction. Holds even if the DB role bypasses RLS.
@@ -1518,7 +1525,7 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 		)
 	}
 
-	if b.directDrive() {
+	if b.directDrive(terms) {
 		return b.directDriveSQL(terms, limit, offset)
 	}
 
@@ -1565,9 +1572,9 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 // scan; predicateCount == 1 guarantees the bodies fully express the match (no
 // other WHERE predicate); orderByResourceIndex keeps the sort mappable to the
 // sp_* columns (last_updated / resource_id).
-func (b *queryBuilder) directDrive() bool {
+func (b *queryBuilder) directDrive(terms []orderTerm) bool {
 	return b.numericTable != "" && len(b.numericBodies) > 0 &&
-		b.predicateCount == 1 && b.orderByResourceIndex()
+		b.predicateCount == 1 && orderByResourceIndex(terms)
 }
 
 // directDriveSQL builds the id-first fetch that resolves candidates directly from
@@ -1593,7 +1600,9 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 	}
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
-	rtP := b.next(b.rt)
+	// Reuse writeBase's resource_type placeholder ($1) rather than binding a fresh
+	// one: b.where is not emitted by this shape, so $1 would otherwise be an unused
+	// parameter and Postgres could not infer its type (SQLSTATE 42P18).
 
 	return fmt.Sprintf(`
 		WITH candidates AS MATERIALIZED (
@@ -1611,7 +1620,7 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 		strings.Join(selectList, ", "),
 		b.numericTable, match,
 		strings.Join(innerCols, ", "), strings.Join(innerOrder, ", "), limitP, offsetP,
-		rtP,
+		b.rtParam,
 		strings.Join(outerOrder, ", "),
 	)
 }
@@ -1631,12 +1640,14 @@ func directDriveSortExpr(resExpr string) string {
 }
 
 // orderByResourceIndex reports whether every ORDER BY term is a plain resources
-// column (last_updated / fhir_id), so the ordered single-scan fetch can serve the
-// sort straight from idx_res_active and stop at the page. A _sort on an sp_* param
-// orders by a correlated subquery that no index provides, so the ordered scan
-// could not early-terminate and the id-first form must be kept.
-func (b *queryBuilder) orderByResourceIndex() bool {
-	for _, t := range b.orderTerms() {
+// column (last_updated / fhir_id), so the sort maps onto the sp_* value index's
+// denormalised columns (direct-drive). A _sort on an sp_* param orders by a
+// correlated subquery that no such index provides, so it keeps the correlated
+// id-first shape. It takes the already-resolved terms rather than calling
+// orderTerms() itself: orderTerms binds a $N arg per _sort param, so calling it
+// twice would orphan a placeholder (SQLSTATE 42P18).
+func orderByResourceIndex(terms []orderTerm) bool {
+	for _, t := range terms {
 		if t.expr != "r.last_updated" && t.expr != "r.fhir_id" {
 			return false
 		}
