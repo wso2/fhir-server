@@ -276,14 +276,16 @@ type queryBuilder struct {
 	// density probe.
 	numericTable  string
 	numericBodies []string
-	// inComposite is set while buildCompositeExists resolves its component
-	// sub-predicates. A composite embedding a quantity/number component would
-	// otherwise have buildQuantityExists/buildNumberExists capture numericTable/
-	// numericBodies, wrongly triggering the direct-drive fetch — which emits only
-	// that one component's body and drops the rest of the composite (both wrong
-	// results and an orphaned parameter → SQLSTATE 42P18). The capture is skipped
-	// while this is set, so a composite keeps the correlated id-first shape.
-	inComposite bool
+	// suppressDirectDrive is set while a nested value predicate is being built —
+	// a composite component (buildCompositeExists), a chained target
+	// (buildChainedCondition), or a _has value (applyHas). In those contexts the
+	// numeric builders would otherwise capture numericTable/numericBodies, and a
+	// lone such predicate would then wrongly satisfy directDrive() — emitting only
+	// that embedded numeric body and dropping the surrounding structure (wrong
+	// results, plus orphaned params → SQLSTATE 42P18). Capture is skipped while
+	// this is set, so those searches keep the correlated id-first / single-scan
+	// shape built from b.where.
+	suppressDirectDrive bool
 	// err is set when the request can't be satisfied (e.g. a registry-known
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
@@ -443,10 +445,15 @@ func (b *queryBuilder) applyHas(modifier, value string) {
 	sourceType, refParam, valueParam := parts[0], parts[1], parts[2]
 
 	// Build the inner predicate for valueParam=value on sourceType, shadowing
-	// the outer 'r' alias with the source resource row.
+	// the outer 'r' alias with the source resource row. suppressDirectDrive so a
+	// numeric valueParam is not mistaken for a direct-drive candidate (this is a
+	// reverse-chained predicate on the source type, not a bare value match).
 	saved := b.rt
 	b.rt = sourceType
+	prevSuppress := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	inner := b.combinedExists(valueParam, "", value)
+	b.suppressDirectDrive = prevSuppress
 	b.rt = saved
 	if inner == "" {
 		return
@@ -492,14 +499,14 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 
 	// Build the two component SELECT bodies. Each is a fully-formed
 	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
-	// correlated to the outer resource row. inComposite suppresses the
-	// direct-drive capture for a numeric component: the composite's full
-	// predicate is both components, so it must keep the correlated id-first shape.
-	prevInComposite := b.inComposite
-	b.inComposite = true
+	// correlated to the outer resource row. suppressDirectDrive stops a numeric
+	// component from being captured as a direct-drive candidate: the composite's
+	// full predicate is both components, so it must keep the correlated id-first shape.
+	prev := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	cond1, ok1 := b.buildExistsForValue(comp1Name, "", val1)
 	cond2, ok2 := b.buildExistsForValue(comp2Name, "", val2)
-	b.inComposite = prevInComposite
+	b.suppressDirectDrive = prev
 	if !ok1 || !ok2 || cond1 == "" || cond2 == "" {
 		return "", false
 	}
@@ -675,9 +682,14 @@ func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, target
 	}
 
 	// Leaf hop: build the value predicate on the final target type.
+	// suppressDirectDrive so a numeric targetParam is not captured as a direct-drive
+	// candidate — it is a chained predicate on the target type, not a bare match.
 	saved := b.rt
 	b.rt = targetType
+	prevSuppress := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	inner := b.combinedExists(targetParam, targetModifier, value)
+	b.suppressDirectDrive = prevSuppress
 	b.rt = saved
 	if inner == "" {
 		return ""
@@ -1077,9 +1089,9 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	}
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
 	// Capture the correlation-free body so a lone number predicate can drive the
-	// id-first CTE straight off sp_number (see fetchSQL). Skipped inside a
-	// composite, whose full predicate is more than this one component.
-	if !b.inComposite {
+	// id-first CTE straight off sp_number (see fetchSQL). Skipped inside a nested
+	// context (composite / chained / _has), whose full predicate is more than this.
+	if !b.suppressDirectDrive {
 		b.numericTable = "sp_number"
 		b.numericBodies = append(b.numericBodies, body)
 	}
@@ -1177,9 +1189,9 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	}
 	// Capture the correlation-free body so a lone quantity predicate can drive the
 	// id-first CTE straight off sp_quantity (see fetchSQL). The same $N args are
-	// shared with the EXISTS form below. Skipped inside a composite, whose full
-	// predicate is more than this one component.
-	if !b.inComposite {
+	// shared with the EXISTS form below. Skipped inside a nested context (composite
+	// / chained / _has), whose full predicate is more than this one body.
+	if !b.suppressDirectDrive {
 		b.numericTable = "sp_quantity"
 		b.numericBodies = append(b.numericBodies, body)
 	}

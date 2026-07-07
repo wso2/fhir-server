@@ -37,6 +37,8 @@ func idFirstTestRegistry() *searchparam.Registry {
 		{ResourceType: "Observation", ParamName: "subject", ParamType: "reference", Targets: []string{"Patient"}},
 		{ResourceType: "Observation", ParamName: "date", ParamType: "date"},
 		{ResourceType: "Patient", ParamName: "name", ParamType: "string"},
+		// A numeric Patient param, reached only via a chained search (subject.pat-qty).
+		{ResourceType: "Patient", ParamName: "pat-qty", ParamType: "quantity", FHIRPath: "Patient.patQty"},
 		// A composite embedding a token + quantity component — exercises the
 		// direct-drive suppression inside buildCompositeExists.
 		{ResourceType: "Observation", ParamName: "code-value-quantity", ParamType: "composite",
@@ -143,6 +145,36 @@ func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 	// The candidate CTE resolves off sp_quantity, not a correlated EXISTS over resources.
 	if strings.Contains(sql, "EXISTS (SELECT 1 FROM sp_quantity") {
 		t.Fatalf("direct-drive should not use a correlated EXISTS\nSQL:\n%s", sql)
+	}
+}
+
+// A numeric value embedded in a nested context (composite component, chained
+// target, or _has value) must never be captured as a direct-drive candidate —
+// only a bare top-level numeric predicate qualifies. Capturing it would drive the
+// fetch off just that embedded body, dropping the surrounding structure (wrong
+// results, orphaned params → SQLSTATE 42P18).
+func TestNestedNumericNotDirectDrive(t *testing.T) {
+	cases := []struct{ name, rt, key, val string }{
+		{"composite component", "Observation", "code-value-quantity", "8480-6$gt110"},
+		{"chained target", "Observation", "subject:Patient.pat-qty", "gt5"},
+		{"_has value", "Patient", "_has:Observation:subject:value-quantity", "gt5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &queryBuilder{rt: tc.rt, reg: idFirstTestRegistry()}
+			b.writeBase()
+			b.applyParam(tc.key, tc.val)
+			if b.err != nil {
+				t.Fatal(b.err)
+			}
+			if b.numericTable != "" {
+				t.Errorf("numericTable=%q; a nested numeric must not be captured for direct-drive", b.numericTable)
+			}
+			if b.directDrive(b.orderTerms()) {
+				t.Error("directDrive()=true; a nested numeric must not direct-drive")
+			}
+			assertParamsContiguous(t, b.fetchSQL(20, 0), len(b.args))
+		})
 	}
 }
 
