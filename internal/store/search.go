@@ -405,14 +405,27 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 
 	// :not negates the match. :not-in is also negated (handled in buildTypedExists
 	// but needs to be NOT EXISTS at the applyParam level).
+	// suppressDirectDrive around the negated branches: a :not / :not-in predicate
+	// is a NOT EXISTS over the positive body, not a bare value match, so the inner
+	// numeric builder must not register it as a direct-drive candidate (which would
+	// let a lone negated numeric search drive the id-first fetch off the *positive*
+	// predicate). Mirrors applyHas / buildCompositeExists / buildChainedCondition.
 	if modifier == "not" {
-		if expr := b.combinedExists(param, "", value); expr != "" {
+		prev := b.suppressDirectDrive
+		b.suppressDirectDrive = true
+		expr := b.combinedExists(param, "", value)
+		b.suppressDirectDrive = prev
+		if expr != "" {
 			b.and("NOT " + expr)
 		}
 		return
 	}
 	if modifier == "not-in" {
-		if expr := b.combinedExists(param, "not-in", value); expr != "" {
+		prev := b.suppressDirectDrive
+		b.suppressDirectDrive = true
+		expr := b.combinedExists(param, "not-in", value)
+		b.suppressDirectDrive = prev
+		if expr != "" {
 			b.and("NOT " + expr)
 		}
 		return
@@ -796,15 +809,16 @@ func (b *queryBuilder) buildTypedExists(def searchparam.Definition, param, modif
 
 // paramUsesIdFirst reports whether a positive value predicate on this search
 // param should select the id-first fetch strategy (see fetchSQL). It is enabled
-// only for the large, selectivity-mis-estimated sp_* tables — quantity, number,
-// token, and composites built from them — where the ordered-scan plan collapses
-// to a full-table scan-with-probe when the result set is sparse or empty (the
-// source of the multi-second query tail on the perf dataset).
+// only for the numeric, selectivity-mis-estimated params — quantity, number, and
+// composites built from them (see idFirstType) — where the ordered-scan plan
+// collapses to a full-table scan-with-probe when the result set is sparse or
+// empty (the source of the multi-second query tail on the perf dataset).
 //
-// reference is deliberately excluded: Postgres already plans it id-first from the
-// sp_reference target index, so wrapping it would only add the CTE's fixed cost.
-// date, string and uri live in small tables where even a full scan is cheap, so
-// they keep the early-terminating ordered scan.
+// token is deliberately excluded (idFirstType): its equality has reliable MCV
+// stats, so the planner already resolves id-first for selective/empty codes and
+// takes the ordered early-exit for dense ones. reference is excluded too —
+// Postgres already plans it id-first from the sp_reference target index — as are
+// date, string and uri, which live in small tables where a full scan is cheap.
 func (b *queryBuilder) paramUsesIdFirst(param string) bool {
 	if pt, ok := universalParamType[param]; ok {
 		return idFirstType(pt)

@@ -173,6 +173,13 @@ CREATE TABLE IF NOT EXISTS sp_number (
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
+-- Migration for pre-existing deployments: CREATE TABLE IF NOT EXISTS above does
+-- NOT add last_updated to an already-created sp_number, and the covering /
+-- recency indexes below reference it (idx_sp_num_recent keys on it). ADD COLUMN
+-- IF NOT EXISTS is a no-op on fresh installs and backfills existing rows with the
+-- DEFAULT, so both paths end up with the column before the indexes are built.
+ALTER TABLE sp_number ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 -- INCLUDE (resource_id, last_updated) makes the range scan covering: the id-first
 -- candidate resolve is index-only, yielding the fhir_id to join and the sort key
 -- to order by without touching the heap.
@@ -208,6 +215,10 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
     last_updated     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
+
+-- Migration for pre-existing deployments (see the sp_number note above): backfill
+-- last_updated before the covering / recency indexes that reference it are built.
+ALTER TABLE sp_quantity ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- Raw value range search (same system+code, no unit conversion needed).
 -- INCLUDE (resource_id, last_updated) makes the range scan covering so the

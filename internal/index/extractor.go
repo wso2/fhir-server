@@ -411,9 +411,9 @@ func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdate
 		// last_updated mirrors resources.last_updated so the id-first fetch can
 		// sort candidates from idx_sp_num_range without a resources lookup.
 		batch.Queue(
-			`INSERT INTO sp_number (resource_id, resource_type, param_name, value_low, value_high, last_updated)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			rid, rt, param, f-eps, f+eps, lastUpdated,
+			`INSERT INTO sp_number (resource_id, resource_type, param_name, value, value_low, value_high, last_updated)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			rid, rt, param, f, f-eps, f+eps, lastUpdated,
 		)
 	}
 }
