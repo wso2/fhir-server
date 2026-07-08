@@ -102,6 +102,114 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 	}
 }
 
+// A multi-value reference search (comma = OR) must coalesce into a single EXISTS
+// with target_id = ANY(...), not OR-ed separate EXISTS subqueries. The lone
+// EXISTS lets Postgres drive from the sp_reference target index; OR-of-EXISTS
+// defeats that inversion and forces a full recency-walk over resources.
+func TestMultiValueReferenceUsesAnyArray(t *testing.T) {
+	cases := []struct {
+		name       string
+		key, value string
+		wantTypes  []string // target_type literals expected in the SQL
+	}{
+		{"same type", "subject", "Patient/1,Patient/2", []string{"Patient"}},
+		{"typed via modifier", "subject:Patient", "1,2,3", []string{"Patient"}},
+		{"mixed types grouped", "subject", "Patient/1,Group/2,Patient/3", []string{"Patient", "Group"}},
+		{"bare ids", "subject", "1,2", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
+			b.writeBase()
+			b.applyParam(tc.key, tc.value)
+			if b.err != nil {
+				t.Fatal(b.err)
+			}
+			sql := b.fetchSQL(20, 0)
+			if !strings.Contains(sql, "= ANY(") {
+				t.Fatalf("multi-value reference should use = ANY(...)\nSQL:\n%s", sql)
+			}
+			if strings.Contains(sql, "OR EXISTS") {
+				t.Fatalf("multi-value reference must not OR separate EXISTS subqueries\nSQL:\n%s", sql)
+			}
+			if n := strings.Count(sql, "FROM sp_reference s"); n != 1 {
+				t.Fatalf("want exactly one sp_reference scan, got %d\nSQL:\n%s", n, sql)
+			}
+			for _, ty := range tc.wantTypes {
+				if !strings.Contains(sql, "s.target_type = ") {
+					t.Fatalf("expected a target_type predicate for %q\nSQL:\n%s", ty, sql)
+				}
+			}
+			// Bare ids carry no target_type filter.
+			if tc.wantTypes == nil && strings.Contains(sql, "s.target_type") {
+				t.Fatalf("bare-id reference should not filter target_type\nSQL:\n%s", sql)
+			}
+			assertParamsContiguous(t, sql, len(b.args))
+		})
+	}
+}
+
+// A lone composite (token + quantity) must resolve candidates by driving from
+// the selective token component's table, filtering by the quantity component as
+// a nested EXISTS, rather than the correlated CTE that scans resources first.
+func TestCompositeUsesTwoTableDrive(t *testing.T) {
+	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
+	b.writeBase()
+	b.applyParam("code-value-quantity", "8480-6$gt110")
+	if b.err != nil {
+		t.Fatal(b.err)
+	}
+	if b.comp == nil {
+		t.Fatal("composite drive was not captured")
+	}
+	sql := b.fetchSQL(20, 0)
+	t.Logf("COMPOSITE_DRIVE_SQL_BEGIN\n%s\nCOMPOSITE_DRIVE_SQL_END", sql)
+	for _, want := range []string{
+		idFirstMarker,
+		"FROM sp_token s",
+		"EXISTS (SELECT 1 FROM sp_quantity s2 WHERE s2.resource_id = s.resource_id",
+		"SELECT DISTINCT fhir_id FROM candidates",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("composite drive SQL missing %q\nSQL:\n%s", want, sql)
+		}
+	}
+	// The candidate CTE must not scan resources (that is the correlated shape).
+	if strings.Contains(sql, "FROM resources r\n\t\t\tWHERE") {
+		t.Fatalf("composite drive should not resolve candidates from resources\nSQL:\n%s", sql)
+	}
+	assertParamsContiguous(t, sql, len(b.args))
+}
+
+// A composite embedded in a chained search must NOT be captured as a two-table
+// drive (it is not the sole top-level predicate); it keeps the correlated shape.
+func TestNestedCompositeNotDriven(t *testing.T) {
+	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
+	b.writeBase()
+	// A composite plus another predicate: predicateCount > 1, drive must not engage.
+	b.applyParam("code-value-quantity", "8480-6$gt110")
+	b.applyParam("date", "gt2020")
+	if b.err != nil {
+		t.Fatal(b.err)
+	}
+	if b.compositeDriveOK(b.orderTerms()) {
+		t.Fatal("composite drive must not engage when other predicates are present")
+	}
+	assertParamsContiguous(t, b.fetchSQL(20, 0), len(b.args))
+}
+
+// A single-value reference keeps the plain equality form (no ANY), so we do not
+// regress the common case into an array bind.
+func TestSingleValueReferenceKeepsEquality(t *testing.T) {
+	sql := buildSQL(t, "Observation", "subject", "Patient/123")
+	if strings.Contains(sql, "= ANY(") {
+		t.Fatalf("single-value reference should use plain equality, not ANY(...)\nSQL:\n%s", sql)
+	}
+	if !strings.Contains(sql, "s.target_id = $") {
+		t.Fatalf("single-value reference should match target_id by equality\nSQL:\n%s", sql)
+	}
+}
+
 // A search that mixes a reference filter (ordered-scan-friendly) with a quantity
 // filter must still use id-first: the quantity predicate is the one that can
 // degrade into a full scan.
@@ -234,7 +342,7 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 		{"quantity OR list (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt10,lt5"}}, ""},
 		{"quantity system|code (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt5|http://unitsofmeasure.org|mg"}}, ""},
 		{"mixed ref+quantity (correlated id-first)", "Observation", [][2]string{{"subject", "Patient/123"}, {"value-quantity", "gt170"}}, ""},
-		{"composite token+quantity (correlated id-first)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
+		{"composite token+quantity (two-table drive)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
 		{"quantity sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"value-quantity", "gt170"}}, "-date"},
 		{"token (single-scan)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
 		{"plain browse (single-scan)", "Observation", nil, ""},

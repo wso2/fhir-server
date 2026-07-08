@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -276,6 +277,15 @@ type queryBuilder struct {
 	// density probe.
 	numericTable  string
 	numericBodies []string
+	// comp captures a composite search (e.g. code-value-quantity) as a two-table
+	// drive: resolve candidate resource_ids from the selective token component's
+	// sp_* table, filtered by the other component as a nested EXISTS, before
+	// touching resources. Set only when the composite is the sole predicate, one
+	// component is a token (a selective equality driver), and the sort maps to a
+	// resources column. compositeDriveSQL uses it instead of the correlated
+	// id-first CTE, which otherwise joins resources for every single-component
+	// match before intersecting (measured 255ms → 88ms on the perf dataset).
+	comp *compositeDrive
 	// suppressDirectDrive is set while a nested value predicate is being built —
 	// a composite component (buildCompositeExists), a chained target
 	// (buildChainedCondition), or a _has value (applyHas). In those contexts the
@@ -523,6 +533,13 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 	if !ok1 || !ok2 || cond1 == "" || cond2 == "" {
 		return "", false
 	}
+	// At the top level (not nested inside a chained/_has/composite context),
+	// capture a two-table drive so fetchSQL can resolve candidates from the
+	// selective token component instead of the resources recency-walk / correlated
+	// CTE. Nested composites keep the correlated shape (prev == true).
+	if !prev {
+		b.captureCompositeDrive(comp1Name, cond1, comp2Name, cond2)
+	}
 	// Nest cond2 as a correlated EXISTS inside cond1's WHERE. The caller
 	// (combinedExists) wraps our return value in a single EXISTS(...), producing
 	//   EXISTS (cond1 … AND EXISTS (cond2 …))
@@ -532,6 +549,77 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 	// semi-joins driven by the more selective component's sp_* index, rather
 	// than a correlated subplan run once per candidate resource row.
 	return cond1 + " AND EXISTS (" + cond2 + ")", true
+}
+
+// compositeDrive holds a composite search decomposed into a candidate driver
+// (the selective token component's sp_* table) and a filter (the other
+// component, applied as a nested EXISTS correlated to the driver row). Both
+// bodies are correlation-free WHERE fragments; driverBody references alias s and
+// filterBody references alias s2. The $N placeholders they contain were bound
+// while the components were built, so compositeDriveSQL reuses them verbatim.
+type compositeDrive struct {
+	driverTable string
+	driverBody  string
+	filterTable string
+	filterBody  string
+}
+
+// captureCompositeDrive records a two-table drive for the composite when one
+// component is a token (a selective equality driver). cond1/cond2 are the
+// fully-formed correlated component subqueries. If neither component is a token,
+// or either body is too complex to safely re-alias, capture is skipped and the
+// search keeps the correlated id-first CTE.
+func (b *queryBuilder) captureCompositeDrive(name1, cond1, name2, cond2 string) {
+	t1, body1, ok1 := splitSimpleExists(cond1)
+	t2, body2, ok2 := splitSimpleExists(cond2)
+	if !ok1 || !ok2 {
+		return
+	}
+	tok1 := b.resolvedParamType(name1) == "token"
+	tok2 := b.resolvedParamType(name2) == "token"
+	var drvTable, drvBody, fltTable, fltBody string
+	switch {
+	case tok1:
+		drvTable, drvBody, fltTable, fltBody = t1, body1, t2, body2
+	case tok2:
+		drvTable, drvBody, fltTable, fltBody = t2, body2, t1, body1
+	default:
+		return // no selective equality driver — keep the correlated id-first CTE
+	}
+	b.comp = &compositeDrive{
+		driverTable: drvTable,
+		driverBody:  drvBody,
+		filterTable: fltTable,
+		// The filter runs as a nested EXISTS under alias s2 correlated to the
+		// driver's resource_id; re-alias its column references from s to s2. The
+		// body only ever references s.<column> (never a literal "s." — values are
+		// $N placeholders), so a plain replace is safe.
+		filterBody: strings.ReplaceAll(fltBody, "s.", "s2."),
+	}
+}
+
+// splitSimpleExists decomposes a component subquery of the exact shape
+// "SELECT 1 FROM <table> s WHERE s.resource_id = r.fhir_id AND <body>" into its
+// table and correlation-free body. Returns ok=false for any other shape (token
+// :in / heuristic UNION, terminology hierarchy, etc.) that embeds a further
+// SELECT and cannot be safely re-aliased into a driver row.
+func splitSimpleExists(cond string) (table, body string, ok bool) {
+	const pfx = "SELECT 1 FROM "
+	const mid = " s WHERE s.resource_id = r.fhir_id AND "
+	if !strings.HasPrefix(cond, pfx) {
+		return "", "", false
+	}
+	rest := cond[len(pfx):]
+	i := strings.Index(rest, mid)
+	if i < 0 {
+		return "", "", false
+	}
+	table = rest[:i]
+	body = rest[i+len(mid):]
+	if strings.Contains(body, "SELECT") || strings.Contains(body, "UNION") {
+		return "", "", false
+	}
+	return table, body, true
 }
 
 // resolveComponentName converts a component expression like "code",
@@ -717,6 +805,20 @@ func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, target
 // combinedExists builds the EXISTS predicate for a (possibly comma-separated)
 // value, OR-joining the parts. Returns "" when no part produced a condition.
 func (b *queryBuilder) combinedExists(param, modifier, value string) string {
+	// Multi-value reference searches (comma = logical OR): coalesce the targets
+	// into a single EXISTS with target_id = ANY(...) rather than OR-ing separate
+	// EXISTS subqueries. A lone EXISTS lets Postgres invert the plan and drive
+	// from the selective sp_reference target index; OR-of-EXISTS defeats that
+	// inversion and collapses to a full recency-walk over resources — measured on
+	// the perf dataset at 360ms / 672k buffers for an empty match set, vs
+	// 0.1ms / 19 buffers for the ANY form. :identifier is excluded (it matches on
+	// identifier_system/value, not target_id).
+	if modifier != "identifier" && strings.IndexByte(value, ',') >= 0 && b.resolvedParamType(param) == "reference" {
+		if expr, ok := b.buildReferenceAnyExists(param, modifier, value); ok {
+			return expr
+		}
+		// Fall through to the generic OR form if the values could not be coalesced.
+	}
 	var ors []string
 	for _, p := range strings.Split(value, ",") {
 		cond, ok := b.buildExistsForValue(param, modifier, strings.TrimSpace(p))
@@ -732,6 +834,79 @@ func (b *queryBuilder) combinedExists(param, modifier, value string) string {
 	default:
 		return "(" + strings.Join(ors, " OR ") + ")"
 	}
+}
+
+// resolvedParamType returns the FHIR search param type for param on the current
+// resource type, resolving universal meta params first, then the registry.
+// Returns "" when the type is unknown (heuristic path).
+func (b *queryBuilder) resolvedParamType(param string) string {
+	if pt, ok := universalParamType[param]; ok {
+		return pt
+	}
+	if b.reg != nil {
+		if def, ok := b.reg.Lookup(b.rt, param); ok {
+			return def.ParamType
+		}
+	}
+	return ""
+}
+
+// buildReferenceAnyExists builds a single EXISTS predicate for a multi-value
+// reference search, matching any of the comma-separated targets via
+// target_id = ANY(...). Values are grouped by target_type so a mixed-type list
+// (e.g. subject=Patient/1,Group/2) stays correct; each group contributes one
+// ANY clause OR-ed inside the single EXISTS. Bare ids (no Type/ prefix and no
+// type modifier) form an untyped group. Returns ok=false if any value has no
+// id, so the caller falls back to the generic OR-of-EXISTS form.
+func (b *queryBuilder) buildReferenceAnyExists(param, modifier, value string) (string, bool) {
+	rtP := b.next(b.rt)
+	pP := b.next(param)
+
+	typed := map[string][]string{} // target_type -> ids
+	var bare []string              // ids with no explicit type
+	for _, part := range strings.Split(value, ",") {
+		typ, id := parseSearchReference(strings.TrimSpace(part))
+		if typ == "" && modifier != "" {
+			// e.g. subject:Patient=1,2 — the modifier names the target type.
+			typ = modifier
+		}
+		if id == "" {
+			return "", false
+		}
+		if typ != "" {
+			typed[typ] = append(typed[typ], id)
+		} else {
+			bare = append(bare, id)
+		}
+	}
+
+	var clauses []string
+	types := make([]string, 0, len(typed))
+	for t := range typed {
+		types = append(types, t)
+	}
+	sort.Strings(types) // deterministic SQL for stable plans and tests
+	for _, typ := range types {
+		tP := b.next(typ)
+		idsP := b.next(typed[typ])
+		clauses = append(clauses, fmt.Sprintf("(s.target_type = %s AND s.target_id = ANY(%s))", tP, idsP))
+	}
+	if len(bare) > 0 {
+		idsP := b.next(bare)
+		clauses = append(clauses, fmt.Sprintf("s.target_id = ANY(%s)", idsP))
+	}
+	if len(clauses) == 0 {
+		return "", false
+	}
+	targetClause := clauses[0]
+	if len(clauses) > 1 {
+		targetClause = "(" + strings.Join(clauses, " OR ") + ")"
+	}
+	body := fmt.Sprintf(
+		"SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND %s",
+		rtP, pP, targetClause,
+	)
+	return "EXISTS (" + body + ")", true
 }
 
 // buildExistsForValue builds an EXISTS subquery for a single value, routing to
@@ -1574,6 +1749,10 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 		return b.directDriveSQL(terms, limit, offset)
 	}
 
+	if b.compositeDriveOK(terms) {
+		return b.compositeDriveSQL(terms, limit, offset)
+	}
+
 	// Correlated id-first: compute fhir_id plus each sort key once in the candidate
 	// CTE, carry them through the LIMIT, then re-apply the sort after the json join.
 	selectList := []string{"r.fhir_id"}
@@ -1620,6 +1799,54 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 func (b *queryBuilder) directDrive(terms []orderTerm) bool {
 	return b.numericTable != "" && len(b.numericBodies) > 0 &&
 		b.predicateCount == 1 && orderByResourceIndex(terms)
+}
+
+// compositeDriveOK reports whether a captured composite drive can be used: the
+// composite must be the sole predicate (predicateCount == 1, so its two
+// components fully express the match) and the sort must map to a resources
+// column (applied after the resources join, since the token driver table has no
+// denormalised sort column). Otherwise the search keeps the correlated id-first
+// CTE built from b.where.
+func (b *queryBuilder) compositeDriveOK(terms []orderTerm) bool {
+	return b.comp != nil && b.predicateCount == 1 && orderByResourceIndex(terms)
+}
+
+// compositeDriveSQL resolves candidate resource_ids from the composite's
+// selective token component (the driver), filtered by the other component as a
+// nested EXISTS, then joins resources once for the small candidate set and
+// sorts/limits there. This avoids both the resources recency-walk and the
+// correlated CTE's habit of joining resources for every single-component match
+// before intersecting. The driver/filter bodies reuse the $N args already bound
+// while the components were built; only limit/offset are appended here, and the
+// resources_type placeholder reuses writeBase's $1 (b.rtParam) so no bound
+// parameter is left unreferenced (SQLSTATE 42P18).
+func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) string {
+	var order []string
+	for _, t := range terms {
+		order = append(order, t.expr+" "+t.dir)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+	return fmt.Sprintf(`
+		WITH candidates AS MATERIALIZED (
+			SELECT s.resource_id AS fhir_id
+			FROM %s s
+			WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
+				AND EXISTS (SELECT 1 FROM %s s2 WHERE s2.resource_id = s.resource_id AND %s)
+		)
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (SELECT DISTINCT fhir_id FROM candidates) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+			AND r.is_deleted = FALSE
+		ORDER BY %s
+		LIMIT %s OFFSET %s`,
+		b.comp.driverTable, b.comp.driverBody,
+		b.comp.filterTable, b.comp.filterBody,
+		b.rtParam,
+		strings.Join(order, ", "), limitP, offsetP,
+	)
 }
 
 // directDriveSQL builds the id-first fetch that resolves candidates directly from
