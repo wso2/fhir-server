@@ -165,18 +165,20 @@ func TestCompositeUsesTwoTableDrive(t *testing.T) {
 	sql := b.fetchSQL(20, 0)
 	t.Logf("COMPOSITE_DRIVE_SQL_BEGIN\n%s\nCOMPOSITE_DRIVE_SQL_END", sql)
 	for _, want := range []string{
-		idFirstMarker,
+		directDriveMarker, // early-exit DISTINCT subquery, not a MATERIALIZED CTE
 		"FROM sp_token s",
-		"EXISTS (SELECT 1 FROM sp_quantity s2 WHERE s2.resource_id = s.resource_id",
-		"SELECT DISTINCT fhir_id FROM candidates",
+		"s.last_updated AS sort0", // recency sort key from the driver, mapped
+		"EXISTS (SELECT 1 FROM sp_quantity s2 WHERE s2.resource_id = s.resource_id", // filter component
+		"ORDER BY sort0 DESC LIMIT", // ORDER BY + LIMIT pushed in for early-exit
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("composite drive SQL missing %q\nSQL:\n%s", want, sql)
 		}
 	}
-	// The candidate CTE must not scan resources (that is the correlated shape).
-	if strings.Contains(sql, "FROM resources r\n\t\t\tWHERE") {
-		t.Fatalf("composite drive should not resolve candidates from resources\nSQL:\n%s", sql)
+	// Early-exit means no MATERIALIZED barrier and no resources scan to resolve
+	// candidates (that was the correlated / full-intersection shape).
+	if strings.Contains(sql, idFirstMarker) {
+		t.Fatalf("composite drive should be early-exit, not a MATERIALIZED CTE\nSQL:\n%s", sql)
 	}
 	assertParamsContiguous(t, sql, len(b.args))
 }

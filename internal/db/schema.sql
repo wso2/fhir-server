@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS sp_token (
     system        VARCHAR(512),
     code          VARCHAR(191),
     display       VARCHAR(512),
+    -- Denormalised copy of resources.last_updated, set at index time. Lets the
+    -- composite early-exit drive (fetchSQL's composite shape) walk sp_token
+    -- newest-first for a code and stop after one page, without a resources lookup.
+    last_updated  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
@@ -596,3 +600,26 @@ CREATE INDEX IF NOT EXISTS idx_sp_qty_recent ON sp_quantity (tenant_id, resource
 CREATE INDEX IF NOT EXISTS idx_sp_num_recent ON sp_number   (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
 
 INSERT INTO schema_version (version) VALUES (10) ON CONFLICT DO NOTHING;
+
+-- v11: recency covering index on sp_token, ordered by last_updated DESC, for the
+-- composite early-exit drive (fetchSQL's composite shape, see search.go).
+--
+-- A composite token+quantity search (e.g. code-value-quantity) drives candidate
+-- resolution from the selective token component, then filters by the quantity
+-- component. Without a recency-ordered token index the drive had to resolve the
+-- whole intersection and top-N sort it — cheap for a selective code, but for a
+-- common code with a loose value bound (e.g. body-weight code + value>80, an
+-- 8k-row intersection) that was a multi-second materialise-and-sort that also
+-- tripped a parallel hash join. Ordering the index by last_updated DESC lets the
+-- drive walk sp_token newest-first for the code, probe the quantity component
+-- per row, and stop after one page. INCLUDE (resource_id, system) keeps the walk
+-- (and an optional system filter) index-only.
+--
+-- Migration for pre-existing deployments (mirrors the sp_number / sp_quantity
+-- v10 note): ADD COLUMN before the recency index that references it. Existing
+-- rows take the migration-time default; the exact resources.last_updated is
+-- written on the next re-index, matching how the numeric tables were populated.
+ALTER TABLE sp_token ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_sp_tok_recent ON sp_token (tenant_id, resource_type, param_name, code, last_updated DESC) INCLUDE (resource_id, system) WHERE code IS NOT NULL;
+
+INSERT INTO schema_version (version) VALUES (11) ON CONFLICT DO NOTHING;

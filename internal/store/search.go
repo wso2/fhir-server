@@ -1821,31 +1821,50 @@ func (b *queryBuilder) compositeDriveOK(terms []orderTerm) bool {
 // resources_type placeholder reuses writeBase's $1 (b.rtParam) so no bound
 // parameter is left unreferenced (SQLSTATE 42P18).
 func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) string {
-	var order []string
-	for _, t := range terms {
-		order = append(order, t.expr+" "+t.dir)
+	selectList := []string{"s.resource_id AS fhir_id"}
+	var innerOrder, outerOrder []string
+	for i, t := range terms {
+		alias := fmt.Sprintf("sort%d", i)
+		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
+		innerOrder = append(innerOrder, alias+" "+t.dir)
+		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
 	}
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
+
+	// Early-exit composite drive. DISTINCT + ORDER BY + LIMIT are pushed into the
+	// candidate subquery (no MATERIALIZED barrier) so the planner walks the
+	// driver's recency index (idx_sp_tok_recent: …, code, last_updated DESC)
+	// newest-first for the token component, probes the other component via EXISTS
+	// per row, and stops as soon as `limit` distinct resources are found — instead
+	// of resolving the whole intersection and top-N sorting it (which, for a common
+	// code with a loose value bound, was a multi-second materialise-and-sort plus a
+	// parallel hash join). The sort keys map from their resources columns to the
+	// denormalised sp_token columns (r.last_updated → s.last_updated, r.fhir_id →
+	// s.resource_id). DISTINCT dedupes a resource that carries the code more than
+	// once. Driver/filter bodies reuse the $N args bound while the components were
+	// built; the resource_type placeholder reuses writeBase's $1 (b.rtParam) so no
+	// bound parameter is left unreferenced (SQLSTATE 42P18).
 	return fmt.Sprintf(`
-		WITH candidates AS MATERIALIZED (
-			SELECT s.resource_id AS fhir_id
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT DISTINCT %s
 			FROM %s s
 			WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
 				AND EXISTS (SELECT 1 FROM %s s2 WHERE s2.resource_id = s.resource_id AND %s)
-		)
-		SELECT r.resource_json, r.version_id, r.last_updated
-		FROM (SELECT DISTINCT fhir_id FROM candidates) c
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
 		JOIN resources r ON r.fhir_id = c.fhir_id
 			AND r.resource_type = %s
 			AND r.tenant_id = current_setting('app.current_tenant', true)
 			AND r.is_deleted = FALSE
-		ORDER BY %s
-		LIMIT %s OFFSET %s`,
+		ORDER BY %s`,
+		strings.Join(selectList, ", "),
 		b.comp.driverTable, b.comp.driverBody,
 		b.comp.filterTable, b.comp.filterBody,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
 		b.rtParam,
-		strings.Join(order, ", "), limitP, offsetP,
+		strings.Join(outerOrder, ", "),
 	)
 }
 
