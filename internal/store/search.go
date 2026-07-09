@@ -252,7 +252,7 @@ type queryBuilder struct {
 	// direct-drive fetch reuses it in its resources JOIN so that placeholder stays
 	// referenced — a parameter bound but never used trips Postgres' type inference
 	// (SQLSTATE 42P18), which the direct-drive shape would otherwise hit because it
-	// builds its WHERE from driveBodies rather than b.where.
+	// builds its WHERE from numericBodies rather than b.where.
 	rtParam string
 	sort    []sortKey
 	// usesSP is set when a positive value predicate against a numeric,
@@ -262,22 +262,21 @@ type queryBuilder struct {
 	// degrades to for sparse result sets on those tables.
 	usesSP bool
 	// predicateCount counts the top-level value predicates added (one per and()).
-	// With driveTable/driveBodies it gates the direct-drive id-first fetch (see
+	// With numericTable/numericBodies it gates the direct-drive id-first fetch (see
 	// fetchSQL): a search whose sole predicate (predicateCount == 1) is a numeric
 	// value match can drive the candidate CTE straight off the sp_* value index.
 	predicateCount int
-	// driveTable / driveBodies capture the non-correlated candidate source for a
-	// drivable predicate — a numeric (quantity/number) value match or a code-token
-	// match — as the sp_* table plus the predicate on alias s with the
-	// s.resource_id = r.fhir_id correlation stripped (comma-OR values append one
-	// body each). When the search is a lone such predicate sorted by a resources
-	// column, fetchSQL drives the candidate resolve straight off that table's
-	// recency index (idx_sp_qty_recent / idx_sp_num_recent / idx_sp_tok_recent),
-	// newest-first with the sort key from the denormalised last_updated, instead of
-	// walking resources with a correlated EXISTS. Both the sparse and dense case
-	// early-exit index-only — no per-match resources lookup.
-	driveTable  string
-	driveBodies []string
+	// numericTable / numericBodies capture the non-correlated candidate source for
+	// a numeric (quantity/number) predicate — the sp_* table and the predicate on
+	// alias s with the s.resource_id = r.fhir_id correlation stripped (comma-OR
+	// values append one body each). When the search turns out to be a lone numeric
+	// predicate sorted by a resources column, fetchSQL drives the id-first CTE off
+	// these instead of scanning resources with a correlated EXISTS. Since sp_* rows
+	// carry a denormalised last_updated in the covering index, both the sparse and
+	// the dense case resolve index-only — no per-match resources lookup, and no
+	// density probe.
+	numericTable  string
+	numericBodies []string
 	// comp captures a composite search (e.g. code-value-quantity) as a two-table
 	// drive: resolve candidate resource_ids from the selective token component's
 	// sp_* table, filtered by the other component as a nested EXISTS, before
@@ -290,7 +289,7 @@ type queryBuilder struct {
 	// suppressDirectDrive is set while a nested value predicate is being built —
 	// a composite component (buildCompositeExists), a chained target
 	// (buildChainedCondition), or a _has value (applyHas). In those contexts the
-	// numeric builders would otherwise capture driveTable/driveBodies, and a
+	// numeric builders would otherwise capture numericTable/numericBodies, and a
 	// lone such predicate would then wrongly satisfy directDrive() — emitting only
 	// that embedded numeric body and dropping the surrounding structure (wrong
 	// results, plus orphaned params → SQLSTATE 42P18). Capture is skipped while
@@ -444,17 +443,12 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 
 	if expr := b.combinedExists(param, modifier, value); expr != "" {
 		b.and(expr)
-		// Route this search through the id-first fetch strategy when it can be
-		// resolved off an sp_* recency index instead of the resources
-		// recency-walk. Two triggers:
-		//   - paramUsesIdFirst: quantity/number/composite, which the planner
-		//     mis-estimates for an unbounded numeric range (see idFirstType).
-		//   - a captured drive candidate (b.driveTable): a lone code-token search,
-		//     which the planner otherwise resolves by walking resources and probing
-		//     sp_token per row rather than driving from idx_sp_tok_recent.
-		// reference, date, string, uri and system-only / :text tokens capture no
-		// drive candidate and keep the early-terminating ordered scan.
-		if b.paramUsesIdFirst(param) || b.driveTable != "" {
+		// Route this search through the id-first fetch strategy only for the
+		// numeric sp_* predicates the planner mis-estimates (quantity/number, and
+		// composite which embeds one — see idFirstType). token, reference, date,
+		// string and uri params keep the early-terminating ordered scan, where the
+		// planner has good enough statistics to pick the right plan itself.
+		if b.paramUsesIdFirst(param) {
 			b.usesSP = true
 		}
 	}
@@ -1017,17 +1011,12 @@ func idFirstType(paramType string) bool {
 	// quantity/number range predicates (and composite, which embeds one) are
 	// mis-estimated by the planner — it cannot judge the selectivity of an
 	// unbounded numeric range, so without the id-first barrier it may choose the
-	// ordered scan and walk the whole table for a sparse match set.
-	//
-	// token is NOT here: it is routed to id-first differently — buildTokenExists
-	// captures a drive candidate (b.driveTable) for a code-equality match, and
-	// applySearchParam flips usesSP on that. This matters because the planner does
-	// NOT reliably drive selective code searches off sp_token — for a sort by
-	// recency + LIMIT it prefers to walk resources by last_updated and probe
-	// sp_token per row, scanning thousands of rows for a code that matches ~0.3%
-	// of resources (measured 77k buffers vs 134 for the id-first shape). Driving
-	// off idx_sp_tok_recent early-exits for both sparse and dense codes, so it is
-	// safe to force; system-only / :text tokens capture nothing and keep the scan.
+	// ordered scan and walk the whole table for a sparse match set. token is
+	// deliberately NOT here: token equality has reliable MCV statistics, so the
+	// planner already resolves id-first for selective/empty codes and takes the
+	// ordered early-exit for dense ones. Forcing id-first on tokens instead
+	// pessimises the common dense case (e.g. a category code matching most rows),
+	// which then has to materialize and sort the entire match set.
 	case "quantity", "number", "composite":
 		return true
 	default:
@@ -1098,49 +1087,28 @@ func (b *queryBuilder) buildTokenExists(param, modifier, value string) string {
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 	// :text matches the human-readable display/text of the token (case-insensitive
-	// substring), not its code — it can't drive off the code recency index, so no
-	// drive candidate is captured and it keeps the ordered scan.
+	// substring), not its code.
 	if modifier == "text" {
 		vP := b.next("%" + strings.ToLower(value) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND LOWER(s.display) LIKE %s", rtP, pP, vP)
 	}
-	// cond is the correlation-free predicate on alias s. hasCode marks a
-	// code-equality predicate — only those can drive off idx_sp_tok_recent, whose
-	// key is (…, code, last_updated DESC) and which is partial on code IS NOT NULL.
-	var cond string
-	hasCode := false
 	parts := strings.SplitN(value, "|", 2)
 	if len(parts) == 2 {
 		sys, code := parts[0], parts[1]
-		switch {
-		case sys == "": // |code
-			cond = fmt.Sprintf("s.code = %s", b.next(code))
-			hasCode = true
-		case code == "": // system|
-			cond = fmt.Sprintf("s.system = %s", b.next(sys))
-		default: // system|code
-			sP := b.next(sys)
+		if sys == "" {
 			cP := b.next(code)
-			cond = fmt.Sprintf("s.system = %s AND s.code = %s", sP, cP)
-			hasCode = true
+			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, cP)
 		}
-	} else {
-		cond = fmt.Sprintf("s.code = %s", b.next(value))
-		hasCode = true
+		if code == "" {
+			sP := b.next(sys)
+			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s", rtP, pP, sP)
+		}
+		sP := b.next(sys)
+		cP := b.next(code)
+		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s AND s.code = %s", rtP, pP, sP, cP)
 	}
-	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
-	// Capture a drive candidate so a lone token search resolves id-first off
-	// idx_sp_tok_recent — walking sp_token newest-first for the code and
-	// early-exiting at the page — instead of the resources recency-walk, which
-	// scans thousands of resource rows probing sp_token per row (measured 77k
-	// buffers vs 134 for the id-first shape). Only a code-equality body qualifies;
-	// a system-only or :text predicate keeps the ordered scan. Skipped in a nested
-	// context (composite / chained / _has), like the numeric builders.
-	if hasCode && !b.suppressDirectDrive {
-		b.driveTable = "sp_token"
-		b.driveBodies = append(b.driveBodies, body)
-	}
-	return "SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND " + body
+	vP := b.next(value)
+	return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, vP)
 }
 
 // buildTokenInExists expands a ValueSet URL and builds an IN/NOT IN subquery
@@ -1313,8 +1281,8 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	// id-first CTE straight off sp_number (see fetchSQL). Skipped inside a nested
 	// context (composite / chained / _has), whose full predicate is more than this.
 	if !b.suppressDirectDrive {
-		b.driveTable = "sp_number"
-		b.driveBodies = append(b.driveBodies, body)
+		b.numericTable = "sp_number"
+		b.numericBodies = append(b.numericBodies, body)
 	}
 	return "SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND " + body
 }
@@ -1413,8 +1381,8 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	// shared with the EXISTS form below. Skipped inside a nested context (composite
 	// / chained / _has), whose full predicate is more than this one body.
 	if !b.suppressDirectDrive {
-		b.driveTable = "sp_quantity"
-		b.driveBodies = append(b.driveBodies, body)
+		b.numericTable = "sp_quantity"
+		b.numericBodies = append(b.numericBodies, body)
 	}
 	return "SELECT 1 FROM sp_quantity s WHERE s.resource_id = r.fhir_id AND " + body
 }
@@ -1824,12 +1792,12 @@ func (b *queryBuilder) fetchSQL(limit, offset int) string {
 // directDrive reports whether the search is a lone numeric (quantity/number)
 // value predicate sorted by a resources column, so the id-first candidate CTE can
 // be driven straight off the sp_* value index (see directDriveSQL) instead of a
-// correlated EXISTS over resources. driveTable/driveBodies hold the captured
+// correlated EXISTS over resources. numericTable/numericBodies hold the captured
 // scan; predicateCount == 1 guarantees the bodies fully express the match (no
 // other WHERE predicate); orderByResourceIndex keeps the sort mappable to the
 // sp_* columns (last_updated / resource_id).
 func (b *queryBuilder) directDrive(terms []orderTerm) bool {
-	return b.driveTable != "" && len(b.driveBodies) > 0 &&
+	return b.numericTable != "" && len(b.numericBodies) > 0 &&
 		b.predicateCount == 1 && orderByResourceIndex(terms)
 }
 
@@ -1904,7 +1872,7 @@ func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) s
 // the numeric sp_* value index. The sort keys map from their resources columns to
 // the denormalised sp_* columns (r.last_updated → s.last_updated, r.fhir_id →
 // s.resource_id), both covered by the value index, so the candidate resolve is
-// index-only. The driveBodies reuse the $N args already bound during predicate
+// index-only. The numericBodies reuse the $N args already bound during predicate
 // building; only limit/offset/rt are appended here.
 func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) string {
 	selectList := []string{"s.resource_id AS fhir_id"}
@@ -1915,9 +1883,9 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 		innerOrder = append(innerOrder, alias+" "+t.dir)
 		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
 	}
-	match := b.driveBodies[0]
-	if len(b.driveBodies) > 1 {
-		match = "(" + strings.Join(b.driveBodies, " OR ") + ")"
+	match := b.numericBodies[0]
+	if len(b.numericBodies) > 1 {
+		match = "(" + strings.Join(b.numericBodies, " OR ") + ")"
 	}
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
@@ -1953,7 +1921,7 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 			AND r.is_deleted = FALSE
 		ORDER BY %s`,
 		strings.Join(selectList, ", "),
-		b.driveTable, match,
+		b.numericTable, match,
 		strings.Join(innerOrder, ", "), limitP, offsetP,
 		b.rtParam,
 		strings.Join(outerOrder, ", "),

@@ -84,11 +84,7 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 		wantIdFirst bool
 	}{
 		{"quantity uses id-first", "Observation", "value-quantity", "gt170", true},
-		{"code token uses id-first", "Observation", "code", "8302-2", true},
-		{"system|code token uses id-first", "Observation", "code", "http://loinc.org|8302-2", true},
-		{"system-only token keeps ordered scan", "Observation", "code", "http://loinc.org|", false},
-		{"token :text keeps ordered scan", "Observation", "code:text", "gluc", false},
-		{"negated code token keeps ordered scan", "Observation", "code:not", "8302-2", false},
+		{"token keeps ordered scan", "Observation", "code", "8302-2", false},
 		{"reference keeps ordered scan", "Observation", "subject", "Patient/123", false},
 		{"date keeps ordered scan", "Observation", "date", "gt2020", false},
 		{"string keeps ordered scan", "Patient", "name", "Smith", false},
@@ -185,31 +181,6 @@ func TestCompositeUsesTwoTableDrive(t *testing.T) {
 		t.Fatalf("composite drive should be early-exit, not a MATERIALIZED CTE\nSQL:\n%s", sql)
 	}
 	assertParamsContiguous(t, sql, len(b.args))
-}
-
-// A lone code-token search must resolve id-first by driving from sp_token
-// (idx_sp_tok_recent) with the ORDER BY + LIMIT pushed into the candidate
-// subquery to early-exit, rather than the resources recency-walk.
-func TestTokenUsesIdFirstDrive(t *testing.T) {
-	sql := buildSQL(t, "Observation", "code", "8302-2")
-	for _, want := range []string{
-		directDriveMarker, // DISTINCT candidate subquery
-		"FROM sp_token s",
-		"s.last_updated AS sort0",   // recency sort key from the driver
-		"ORDER BY sort0 DESC LIMIT", // pushed in for early-exit
-	} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("token id-first SQL missing %q\nSQL:\n%s", want, sql)
-		}
-	}
-	// It must NOT drive by walking resources (the old ordered-scan shape).
-	if strings.Contains(sql, "FROM resources r\n\t\tWHERE") {
-		t.Fatalf("token search should not recency-walk resources\nSQL:\n%s", sql)
-	}
-	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
-	b.writeBase()
-	b.applyParam("code", "8302-2")
-	assertParamsContiguous(t, b.fetchSQL(20, 0), len(b.args))
 }
 
 // A composite embedded in a chained search must NOT be captured as a two-table
@@ -322,8 +293,8 @@ func TestNestedNumericNotDirectDrive(t *testing.T) {
 			if b.err != nil {
 				t.Fatal(b.err)
 			}
-			if b.driveTable != "" {
-				t.Errorf("driveTable=%q; a nested numeric must not be captured for direct-drive", b.driveTable)
+			if b.numericTable != "" {
+				t.Errorf("numericTable=%q; a nested numeric must not be captured for direct-drive", b.numericTable)
 			}
 			if b.directDrive(b.orderTerms()) {
 				t.Error("directDrive()=true; a nested numeric must not direct-drive")
@@ -375,10 +346,7 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 		{"mixed ref+quantity (correlated id-first)", "Observation", [][2]string{{"subject", "Patient/123"}, {"value-quantity", "gt170"}}, ""},
 		{"composite token+quantity (two-table drive)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
 		{"quantity sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"value-quantity", "gt170"}}, "-date"},
-		{"code token (direct-drive)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
-		{"code token OR list (direct-drive)", "Observation", [][2]string{{"code", "a,b,c"}}, ""},
-		{"system|code token (direct-drive)", "Observation", [][2]string{{"code", "http://loinc.org|8302-2"}}, ""},
-		{"code token sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"code", "8302-2"}}, "-date"},
+		{"token (single-scan)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
 		{"plain browse (single-scan)", "Observation", nil, ""},
 	}
 	for _, tc := range cases {
@@ -400,9 +368,9 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 	}
 }
 
-// directDrive engages for a lone drivable predicate (numeric value match or a
-// code-token match) sorted by a resources column. Any multi-predicate search
-// must not qualify — it falls back to the correlated id-first CTE.
+// directDrive engages only for a lone numeric predicate sorted by a resources
+// column. A token predicate (no id-first) and any multi-predicate search must not
+// qualify — they fall back to the ordered scan or the correlated id-first shape.
 func TestDirectDriveGating(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -411,7 +379,7 @@ func TestDirectDriveGating(t *testing.T) {
 		wantCount  int
 	}{
 		{"sole quantity", [][2]string{{"value-quantity", "gt170"}}, true, 1},
-		{"sole code token", [][2]string{{"code", "8302-2"}}, true, 1},
+		{"sole token", [][2]string{{"code", "8302-2"}}, false, 1},
 		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, false, 2},
 		{"composite embedding quantity", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, false, 1},
 	}
