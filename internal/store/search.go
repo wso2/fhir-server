@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -247,7 +248,54 @@ type queryBuilder struct {
 	where       strings.Builder
 	args        []any
 	argN        int
-	sort        []sortKey
+	// rtParam is the placeholder writeBase bound for the resource_type ($1). The
+	// direct-drive fetch reuses it in its resources JOIN so that placeholder stays
+	// referenced — a parameter bound but never used trips Postgres' type inference
+	// (SQLSTATE 42P18), which the direct-drive shape would otherwise hit because it
+	// builds its WHERE from numericBodies rather than b.where.
+	rtParam string
+	sort    []sortKey
+	// usesSP is set when a positive value predicate against a numeric,
+	// selectivity-mis-estimated sp_* table (quantity/number, or composite which
+	// embeds one; see paramUsesIdFirst) is added. It selects the id-first fetch
+	// strategy in fetchSQL, which avoids the full-table scan the ordered-scan plan
+	// degrades to for sparse result sets on those tables.
+	usesSP bool
+	// predicateCount counts the top-level value predicates added (one per and()).
+	// With numericTable/numericBodies it gates the direct-drive id-first fetch (see
+	// fetchSQL): a search whose sole predicate (predicateCount == 1) is a numeric
+	// value match can drive the candidate CTE straight off the sp_* value index.
+	predicateCount int
+	// numericTable / numericBodies capture the non-correlated candidate source for
+	// a numeric (quantity/number) predicate — the sp_* table and the predicate on
+	// alias s with the s.resource_id = r.fhir_id correlation stripped (comma-OR
+	// values append one body each). When the search turns out to be a lone numeric
+	// predicate sorted by a resources column, fetchSQL drives the id-first CTE off
+	// these instead of scanning resources with a correlated EXISTS. Since sp_* rows
+	// carry a denormalised last_updated in the covering index, both the sparse and
+	// the dense case resolve index-only — no per-match resources lookup, and no
+	// density probe.
+	numericTable  string
+	numericBodies []string
+	// comp captures a composite search (e.g. code-value-quantity) as a two-table
+	// drive: resolve candidate resource_ids from the selective token component's
+	// sp_* table, filtered by the other component as a nested EXISTS, before
+	// touching resources. Set only when the composite is the sole predicate, one
+	// component is a token (a selective equality driver), and the sort maps to a
+	// resources column. compositeDriveSQL uses it instead of the correlated
+	// id-first CTE, which otherwise joins resources for every single-component
+	// match before intersecting (measured 255ms → 88ms on the perf dataset).
+	comp *compositeDrive
+	// suppressDirectDrive is set while a nested value predicate is being built —
+	// a composite component (buildCompositeExists), a chained target
+	// (buildChainedCondition), or a _has value (applyHas). In those contexts the
+	// numeric builders would otherwise capture numericTable/numericBodies, and a
+	// lone such predicate would then wrongly satisfy directDrive() — emitting only
+	// that embedded numeric body and dropping the surrounding structure (wrong
+	// results, plus orphaned params → SQLSTATE 42P18). Capture is skipped while
+	// this is set, so those searches keep the correlated id-first / single-scan
+	// shape built from b.where.
+	suppressDirectDrive bool
 	// err is set when the request can't be satisfied (e.g. a registry-known
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
@@ -269,6 +317,7 @@ func (b *queryBuilder) next(v any) string {
 
 func (b *queryBuilder) writeBase() {
 	rtP := b.next(b.rt)
+	b.rtParam = rtP
 	// Tenant scope (defence in depth alongside Row-Level Security): restrict to
 	// the request's tenant via the app.current_tenant setting the store applies
 	// to the connection/transaction. Holds even if the DB role bypasses RLS.
@@ -280,6 +329,7 @@ func (b *queryBuilder) writeBase() {
 func (b *queryBuilder) and(cond string) {
 	b.where.WriteString(" AND ")
 	b.where.WriteString(cond)
+	b.predicateCount++
 }
 
 func (b *queryBuilder) applyParam(rawKey, value string) {
@@ -365,14 +415,27 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 
 	// :not negates the match. :not-in is also negated (handled in buildTypedExists
 	// but needs to be NOT EXISTS at the applyParam level).
+	// suppressDirectDrive around the negated branches: a :not / :not-in predicate
+	// is a NOT EXISTS over the positive body, not a bare value match, so the inner
+	// numeric builder must not register it as a direct-drive candidate (which would
+	// let a lone negated numeric search drive the id-first fetch off the *positive*
+	// predicate). Mirrors applyHas / buildCompositeExists / buildChainedCondition.
 	if modifier == "not" {
-		if expr := b.combinedExists(param, "", value); expr != "" {
+		prev := b.suppressDirectDrive
+		b.suppressDirectDrive = true
+		expr := b.combinedExists(param, "", value)
+		b.suppressDirectDrive = prev
+		if expr != "" {
 			b.and("NOT " + expr)
 		}
 		return
 	}
 	if modifier == "not-in" {
-		if expr := b.combinedExists(param, "not-in", value); expr != "" {
+		prev := b.suppressDirectDrive
+		b.suppressDirectDrive = true
+		expr := b.combinedExists(param, "not-in", value)
+		b.suppressDirectDrive = prev
+		if expr != "" {
 			b.and("NOT " + expr)
 		}
 		return
@@ -380,6 +443,14 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 
 	if expr := b.combinedExists(param, modifier, value); expr != "" {
 		b.and(expr)
+		// Route this search through the id-first fetch strategy only for the
+		// numeric sp_* predicates the planner mis-estimates (quantity/number, and
+		// composite which embeds one — see idFirstType). token, reference, date,
+		// string and uri params keep the early-terminating ordered scan, where the
+		// planner has good enough statistics to pick the right plan itself.
+		if b.paramUsesIdFirst(param) {
+			b.usesSP = true
+		}
 	}
 }
 
@@ -397,10 +468,15 @@ func (b *queryBuilder) applyHas(modifier, value string) {
 	sourceType, refParam, valueParam := parts[0], parts[1], parts[2]
 
 	// Build the inner predicate for valueParam=value on sourceType, shadowing
-	// the outer 'r' alias with the source resource row.
+	// the outer 'r' alias with the source resource row. suppressDirectDrive so a
+	// numeric valueParam is not mistaken for a direct-drive candidate (this is a
+	// reverse-chained predicate on the source type, not a bare value match).
 	saved := b.rt
 	b.rt = sourceType
+	prevSuppress := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	inner := b.combinedExists(valueParam, "", value)
+	b.suppressDirectDrive = prevSuppress
 	b.rt = saved
 	if inner == "" {
 		return
@@ -446,11 +522,23 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 
 	// Build the two component SELECT bodies. Each is a fully-formed
 	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
-	// correlated to the outer resource row.
+	// correlated to the outer resource row. suppressDirectDrive stops a numeric
+	// component from being captured as a direct-drive candidate: the composite's
+	// full predicate is both components, so it must keep the correlated id-first shape.
+	prev := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	cond1, ok1 := b.buildExistsForValue(comp1Name, "", val1)
 	cond2, ok2 := b.buildExistsForValue(comp2Name, "", val2)
+	b.suppressDirectDrive = prev
 	if !ok1 || !ok2 || cond1 == "" || cond2 == "" {
 		return "", false
+	}
+	// At the top level (not nested inside a chained/_has/composite context),
+	// capture a two-table drive so fetchSQL can resolve candidates from the
+	// selective token component instead of the resources recency-walk / correlated
+	// CTE. Nested composites keep the correlated shape (prev == true).
+	if !prev {
+		b.captureCompositeDrive(comp1Name, cond1, comp2Name, cond2)
 	}
 	// Nest cond2 as a correlated EXISTS inside cond1's WHERE. The caller
 	// (combinedExists) wraps our return value in a single EXISTS(...), producing
@@ -461,6 +549,77 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 	// semi-joins driven by the more selective component's sp_* index, rather
 	// than a correlated subplan run once per candidate resource row.
 	return cond1 + " AND EXISTS (" + cond2 + ")", true
+}
+
+// compositeDrive holds a composite search decomposed into a candidate driver
+// (the selective token component's sp_* table) and a filter (the other
+// component, applied as a nested EXISTS correlated to the driver row). Both
+// bodies are correlation-free WHERE fragments; driverBody references alias s and
+// filterBody references alias s2. The $N placeholders they contain were bound
+// while the components were built, so compositeDriveSQL reuses them verbatim.
+type compositeDrive struct {
+	driverTable string
+	driverBody  string
+	filterTable string
+	filterBody  string
+}
+
+// captureCompositeDrive records a two-table drive for the composite when one
+// component is a token (a selective equality driver). cond1/cond2 are the
+// fully-formed correlated component subqueries. If neither component is a token,
+// or either body is too complex to safely re-alias, capture is skipped and the
+// search keeps the correlated id-first CTE.
+func (b *queryBuilder) captureCompositeDrive(name1, cond1, name2, cond2 string) {
+	t1, body1, ok1 := splitSimpleExists(cond1)
+	t2, body2, ok2 := splitSimpleExists(cond2)
+	if !ok1 || !ok2 {
+		return
+	}
+	tok1 := b.resolvedParamType(name1) == "token"
+	tok2 := b.resolvedParamType(name2) == "token"
+	var drvTable, drvBody, fltTable, fltBody string
+	switch {
+	case tok1:
+		drvTable, drvBody, fltTable, fltBody = t1, body1, t2, body2
+	case tok2:
+		drvTable, drvBody, fltTable, fltBody = t2, body2, t1, body1
+	default:
+		return // no selective equality driver — keep the correlated id-first CTE
+	}
+	b.comp = &compositeDrive{
+		driverTable: drvTable,
+		driverBody:  drvBody,
+		filterTable: fltTable,
+		// The filter runs as a nested EXISTS under alias s2 correlated to the
+		// driver's resource_id; re-alias its column references from s to s2. The
+		// body only ever references s.<column> (never a literal "s." — values are
+		// $N placeholders), so a plain replace is safe.
+		filterBody: strings.ReplaceAll(fltBody, "s.", "s2."),
+	}
+}
+
+// splitSimpleExists decomposes a component subquery of the exact shape
+// "SELECT 1 FROM <table> s WHERE s.resource_id = r.fhir_id AND <body>" into its
+// table and correlation-free body. Returns ok=false for any other shape (token
+// :in / heuristic UNION, terminology hierarchy, etc.) that embeds a further
+// SELECT and cannot be safely re-aliased into a driver row.
+func splitSimpleExists(cond string) (table, body string, ok bool) {
+	const pfx = "SELECT 1 FROM "
+	const mid = " s WHERE s.resource_id = r.fhir_id AND "
+	if !strings.HasPrefix(cond, pfx) {
+		return "", "", false
+	}
+	rest := cond[len(pfx):]
+	i := strings.Index(rest, mid)
+	if i < 0 {
+		return "", "", false
+	}
+	table = rest[:i]
+	body = rest[i+len(mid):]
+	if strings.Contains(body, "SELECT") || strings.Contains(body, "UNION") {
+		return "", "", false
+	}
+	return table, body, true
 }
 
 // resolveComponentName converts a component expression like "code",
@@ -624,9 +783,14 @@ func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, target
 	}
 
 	// Leaf hop: build the value predicate on the final target type.
+	// suppressDirectDrive so a numeric targetParam is not captured as a direct-drive
+	// candidate — it is a chained predicate on the target type, not a bare match.
 	saved := b.rt
 	b.rt = targetType
+	prevSuppress := b.suppressDirectDrive
+	b.suppressDirectDrive = true
 	inner := b.combinedExists(targetParam, targetModifier, value)
+	b.suppressDirectDrive = prevSuppress
 	b.rt = saved
 	if inner == "" {
 		return ""
@@ -641,6 +805,20 @@ func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, target
 // combinedExists builds the EXISTS predicate for a (possibly comma-separated)
 // value, OR-joining the parts. Returns "" when no part produced a condition.
 func (b *queryBuilder) combinedExists(param, modifier, value string) string {
+	// Multi-value reference searches (comma = logical OR): coalesce the targets
+	// into a single EXISTS with target_id = ANY(...) rather than OR-ing separate
+	// EXISTS subqueries. A lone EXISTS lets Postgres invert the plan and drive
+	// from the selective sp_reference target index; OR-of-EXISTS defeats that
+	// inversion and collapses to a full recency-walk over resources — measured on
+	// the perf dataset at 360ms / 672k buffers for an empty match set, vs
+	// 0.1ms / 19 buffers for the ANY form. :identifier is excluded (it matches on
+	// identifier_system/value, not target_id).
+	if modifier != "identifier" && strings.IndexByte(value, ',') >= 0 && b.resolvedParamType(param) == "reference" {
+		if expr, ok := b.buildReferenceAnyExists(param, modifier, value); ok {
+			return expr
+		}
+		// Fall through to the generic OR form if the values could not be coalesced.
+	}
 	var ors []string
 	for _, p := range strings.Split(value, ",") {
 		cond, ok := b.buildExistsForValue(param, modifier, strings.TrimSpace(p))
@@ -656,6 +834,79 @@ func (b *queryBuilder) combinedExists(param, modifier, value string) string {
 	default:
 		return "(" + strings.Join(ors, " OR ") + ")"
 	}
+}
+
+// resolvedParamType returns the FHIR search param type for param on the current
+// resource type, resolving universal meta params first, then the registry.
+// Returns "" when the type is unknown (heuristic path).
+func (b *queryBuilder) resolvedParamType(param string) string {
+	if pt, ok := universalParamType[param]; ok {
+		return pt
+	}
+	if b.reg != nil {
+		if def, ok := b.reg.Lookup(b.rt, param); ok {
+			return def.ParamType
+		}
+	}
+	return ""
+}
+
+// buildReferenceAnyExists builds a single EXISTS predicate for a multi-value
+// reference search, matching any of the comma-separated targets via
+// target_id = ANY(...). Values are grouped by target_type so a mixed-type list
+// (e.g. subject=Patient/1,Group/2) stays correct; each group contributes one
+// ANY clause OR-ed inside the single EXISTS. Bare ids (no Type/ prefix and no
+// type modifier) form an untyped group. Returns ok=false if any value has no
+// id, so the caller falls back to the generic OR-of-EXISTS form.
+func (b *queryBuilder) buildReferenceAnyExists(param, modifier, value string) (string, bool) {
+	rtP := b.next(b.rt)
+	pP := b.next(param)
+
+	typed := map[string][]string{} // target_type -> ids
+	var bare []string              // ids with no explicit type
+	for _, part := range strings.Split(value, ",") {
+		typ, id := parseSearchReference(strings.TrimSpace(part))
+		if typ == "" && modifier != "" {
+			// e.g. subject:Patient=1,2 — the modifier names the target type.
+			typ = modifier
+		}
+		if id == "" {
+			return "", false
+		}
+		if typ != "" {
+			typed[typ] = append(typed[typ], id)
+		} else {
+			bare = append(bare, id)
+		}
+	}
+
+	var clauses []string
+	types := make([]string, 0, len(typed))
+	for t := range typed {
+		types = append(types, t)
+	}
+	sort.Strings(types) // deterministic SQL for stable plans and tests
+	for _, typ := range types {
+		tP := b.next(typ)
+		idsP := b.next(typed[typ])
+		clauses = append(clauses, fmt.Sprintf("(s.target_type = %s AND s.target_id = ANY(%s))", tP, idsP))
+	}
+	if len(bare) > 0 {
+		idsP := b.next(bare)
+		clauses = append(clauses, fmt.Sprintf("s.target_id = ANY(%s)", idsP))
+	}
+	if len(clauses) == 0 {
+		return "", false
+	}
+	targetClause := clauses[0]
+	if len(clauses) > 1 {
+		targetClause = "(" + strings.Join(clauses, " OR ") + ")"
+	}
+	body := fmt.Sprintf(
+		"SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND %s",
+		rtP, pP, targetClause,
+	)
+	return "EXISTS (" + body + ")", true
 }
 
 // buildExistsForValue builds an EXISTS subquery for a single value, routing to
@@ -728,6 +979,48 @@ func (b *queryBuilder) buildTypedExists(def searchparam.Definition, param, modif
 		slog.Warn("unsupported search param type; failing request",
 			"resourceType", b.rt, "param", param, "paramType", paramType)
 		return "", false
+	}
+}
+
+// paramUsesIdFirst reports whether a positive value predicate on this search
+// param should select the id-first fetch strategy (see fetchSQL). It is enabled
+// only for the numeric, selectivity-mis-estimated params — quantity, number, and
+// composites built from them (see idFirstType) — where the ordered-scan plan
+// collapses to a full-table scan-with-probe when the result set is sparse or
+// empty (the source of the multi-second query tail on the perf dataset).
+//
+// token is deliberately excluded (idFirstType): its equality has reliable MCV
+// stats, so the planner already resolves id-first for selective/empty codes and
+// takes the ordered early-exit for dense ones. reference is excluded too —
+// Postgres already plans it id-first from the sp_reference target index — as are
+// date, string and uri, which live in small tables where a full scan is cheap.
+func (b *queryBuilder) paramUsesIdFirst(param string) bool {
+	if pt, ok := universalParamType[param]; ok {
+		return idFirstType(pt)
+	}
+	if b.reg != nil {
+		if def, ok := b.reg.Lookup(b.rt, param); ok {
+			return idFirstType(def.ParamType)
+		}
+	}
+	return false
+}
+
+func idFirstType(paramType string) bool {
+	switch paramType {
+	// quantity/number range predicates (and composite, which embeds one) are
+	// mis-estimated by the planner — it cannot judge the selectivity of an
+	// unbounded numeric range, so without the id-first barrier it may choose the
+	// ordered scan and walk the whole table for a sparse match set. token is
+	// deliberately NOT here: token equality has reliable MCV statistics, so the
+	// planner already resolves id-first for selective/empty codes and takes the
+	// ordered early-exit for dense ones. Forcing id-first on tokens instead
+	// pessimises the common dense case (e.g. a category code matching most rows),
+	// which then has to materialize and sort the entire match set.
+	case "quantity", "number", "composite":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -972,18 +1265,26 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	}
 	rtP := b.next(b.rt)
 	pP := b.next(param)
+	var cond string
 	switch prefix {
 	case "gt":
-		vP := b.next(f)
-		return fmt.Sprintf("SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_high > %s", rtP, pP, vP)
+		cond = fmt.Sprintf("s.value_high > %s", b.next(f))
 	case "lt":
-		vP := b.next(f)
-		return fmt.Sprintf("SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_low < %s", rtP, pP, vP)
+		cond = fmt.Sprintf("s.value_low < %s", b.next(f))
 	default: // eq
 		highP := b.next(f + eps)
 		lowP := b.next(f - eps)
-		return fmt.Sprintf("SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_low <= %s AND s.value_high >= %s", rtP, pP, highP, lowP)
+		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
 	}
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone number predicate can drive the
+	// id-first CTE straight off sp_number (see fetchSQL). Skipped inside a nested
+	// context (composite / chained / _has), whose full predicate is more than this.
+	if !b.suppressDirectDrive {
+		b.numericTable = "sp_number"
+		b.numericBodies = append(b.numericBodies, body)
+	}
+	return "SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND " + body
 }
 
 // buildReferenceExists matches a reference param against sp_reference. It accepts
@@ -1068,14 +1369,22 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", hP, lP)
 	}
 
-	q := fmt.Sprintf("SELECT 1 FROM sp_quantity s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
 	if system != "" {
-		q += fmt.Sprintf(" AND s.system = %s", b.next(system))
+		body += fmt.Sprintf(" AND s.system = %s", b.next(system))
 	}
 	if code != "" {
-		q += fmt.Sprintf(" AND s.code = %s", b.next(code))
+		body += fmt.Sprintf(" AND s.code = %s", b.next(code))
 	}
-	return q
+	// Capture the correlation-free body so a lone quantity predicate can drive the
+	// id-first CTE straight off sp_quantity (see fetchSQL). The same $N args are
+	// shared with the EXISTS form below. Skipped inside a nested context (composite
+	// / chained / _has), whose full predicate is more than this one body.
+	if !b.suppressDirectDrive {
+		b.numericTable = "sp_quantity"
+		b.numericBodies = append(b.numericBodies, body)
+	}
+	return "SELECT 1 FROM sp_quantity s WHERE s.resource_id = r.fhir_id AND " + body
 }
 
 // buildURIExists matches a uri param against sp_uri. Default is an exact match.
@@ -1173,15 +1482,26 @@ func (b *queryBuilder) addSort(value string) {
 	}
 }
 
-// orderByClause builds the SQL ORDER BY body (without the "ORDER BY" keyword)
-// from b.sort. Each search-param key becomes a correlated subquery into its
-// sp_* table — MIN(value) for ascending, MAX(value) for descending — so a
-// resource with multiple values sorts by its lowest/highest, with NULLS LAST
-// so unindexed resources sort to the end. _id and _lastUpdated sort directly
-// off the resources table. Falls back to last_updated DESC when no usable key
-// is supplied.
-func (b *queryBuilder) orderByClause() string {
-	var clauses []string
+// orderTerm is one resolved ORDER BY component: a SQL expression (referencing
+// the resources alias r) and its direction suffix (e.g. "DESC" or
+// "ASC NULLS LAST").
+type orderTerm struct {
+	expr string
+	dir  string
+}
+
+// orderTerms resolves b.sort into structured ORDER BY components. Each
+// search-param key becomes a correlated subquery into its sp_* table — MIN(value)
+// for ascending, MAX(value) for descending — so a resource with multiple values
+// sorts by its lowest/highest, with NULLS LAST so unindexed resources sort to the
+// end. _id and _lastUpdated sort directly off the resources table. Falls back to
+// last_updated DESC when no usable key is supplied.
+//
+// Returning structured terms (rather than a pre-joined string) lets fetch build
+// the id-first query, where the sort keys are computed once in the candidate CTE,
+// carried through the LIMIT, and re-applied after the resource_json join.
+func (b *queryBuilder) orderTerms() []orderTerm {
+	var terms []orderTerm
 	for _, k := range b.sort {
 		dir := "ASC"
 		if k.desc {
@@ -1189,10 +1509,10 @@ func (b *queryBuilder) orderByClause() string {
 		}
 		switch k.param {
 		case "_id":
-			clauses = append(clauses, "r.fhir_id "+dir)
+			terms = append(terms, orderTerm{"r.fhir_id", dir})
 			continue
 		case "_lastUpdated":
-			clauses = append(clauses, "r.last_updated "+dir)
+			terms = append(terms, orderTerm{"r.last_updated", dir})
 			continue
 		case "_score":
 			// relevance scoring is not implemented; skip rather than error.
@@ -1220,12 +1540,12 @@ func (b *queryBuilder) orderByClause() string {
 			"(SELECT %s(s.%s) FROM %s s WHERE s.resource_id = r.fhir_id AND s.resource_type = r.resource_type AND s.param_name = %s)",
 			agg, col, table, pP,
 		)
-		clauses = append(clauses, expr+" "+dir+" NULLS LAST")
+		terms = append(terms, orderTerm{expr, dir + " NULLS LAST"})
 	}
-	if len(clauses) == 0 {
-		return "r.last_updated DESC"
+	if len(terms) == 0 {
+		return []orderTerm{{"r.last_updated", "DESC"}}
 	}
-	return strings.Join(clauses, ", ")
+	return terms
 }
 
 // sortColumnForTable returns the value column to sort on for a given sp_* table.
@@ -1350,19 +1670,7 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 }
 
 func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset int) ([]map[string]any, error) {
-	// Build the ORDER BY before binding LIMIT/OFFSET so the positional args line
-	// up: [where args…, order-by param args…, limit, offset].
-	orderBy := b.orderByClause()
-	limitP := b.next(limit)
-	offsetP := b.next(offset)
-	q := fmt.Sprintf(`
-		SELECT r.resource_json, r.version_id, r.last_updated
-		FROM resources r
-		WHERE %s
-		ORDER BY %s
-		LIMIT %s OFFSET %s`,
-		b.where.String(), orderBy, limitP, offsetP,
-	)
+	q := b.fetchSQL(limit, offset)
 
 	rows, err := pool.Query(ctx, q, b.args...)
 	if err != nil {
@@ -1385,6 +1693,269 @@ func (b *queryBuilder) fetch(ctx context.Context, pool querier, limit, offset in
 		entries = append(entries, m)
 	}
 	return entries, rows.Err()
+}
+
+// fetchSQL builds the paginated result query. It binds the ORDER BY parameters
+// (for _sort on search params) before LIMIT/OFFSET, keeping b.args ordered as
+// [where args…, order-by args…, limit, offset, …].
+//
+// Three query shapes are produced:
+//
+//   - Single-scan form (no id-first sp_* predicate): ORDER BY r.last_updated
+//     served directly by idx_res_active, so the LIMIT terminates early after
+//     `limit` rows without visiting the whole match set. Used for plain browse,
+//     resources-column filters, and token/reference/date/string/uri predicates,
+//     where the planner has good enough statistics to pick the right plan.
+//
+//   - Direct-drive id-first form (a lone numeric quantity/number predicate sorted
+//     by a resources column — see directDrive): a MATERIALIZED CTE resolves the
+//     matching (resource_id, sort keys) straight off the sp_* value index. Because
+//     sp_* carries a denormalised last_updated in the covering index, the resolve
+//     is index-only for both a sparse match set (returns in well under a
+//     millisecond) and a dense one (a bounded index scan + top-N sort), so no
+//     density probe is needed. The surviving page then joins resources for JSON.
+//
+//   - Correlated id-first form (composite, or a multi-predicate search embedding a
+//     numeric one): a MATERIALIZED CTE resolves (fhir_id, sort keys) from resources
+//     with the correlated EXISTS predicates, so the planner still drives the match
+//     off the selective sp_* index rather than scanning resources in last_updated
+//     order. Used when the candidate set cannot be expressed as a single sp_* scan.
+//
+// The MATERIALIZED barrier is load-bearing for a sparse numeric predicate: without
+// it the planner (which cannot estimate an unbounded numeric range) collapses into
+// the single-scan shape and does a full resources scan with a per-row sp_* probe
+// that never reaches the LIMIT — multiple seconds per query on the perf dataset.
+func (b *queryBuilder) fetchSQL(limit, offset int) string {
+	terms := b.orderTerms()
+
+	if !b.usesSP {
+		var clauses []string
+		for _, t := range terms {
+			clauses = append(clauses, t.expr+" "+t.dir)
+		}
+		limitP := b.next(limit)
+		offsetP := b.next(offset)
+		return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM resources r
+		WHERE %s
+		ORDER BY %s
+		LIMIT %s OFFSET %s`,
+			b.where.String(), strings.Join(clauses, ", "), limitP, offsetP,
+		)
+	}
+
+	if b.directDrive(terms) {
+		return b.directDriveSQL(terms, limit, offset)
+	}
+
+	if b.compositeDriveOK(terms) {
+		return b.compositeDriveSQL(terms, limit, offset)
+	}
+
+	// Correlated id-first: compute fhir_id plus each sort key once in the candidate
+	// CTE, carry them through the LIMIT, then re-apply the sort after the json join.
+	selectList := []string{"r.fhir_id"}
+	innerCols := []string{"fhir_id"}
+	var innerOrder, outerOrder []string
+	for i, t := range terms {
+		alias := fmt.Sprintf("sort%d", i)
+		selectList = append(selectList, t.expr+" AS "+alias)
+		innerCols = append(innerCols, alias)
+		innerOrder = append(innerOrder, alias+" "+t.dir)
+		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+	rtP := b.next(b.rt)
+
+	return fmt.Sprintf(`
+		WITH candidates AS MATERIALIZED (
+			SELECT %s
+			FROM resources r
+			WHERE %s
+		)
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (SELECT %s FROM candidates ORDER BY %s LIMIT %s OFFSET %s) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+		ORDER BY %s`,
+		strings.Join(selectList, ", "),
+		b.where.String(),
+		strings.Join(innerCols, ", "), strings.Join(innerOrder, ", "), limitP, offsetP,
+		rtP,
+		strings.Join(outerOrder, ", "),
+	)
+}
+
+// directDrive reports whether the search is a lone numeric (quantity/number)
+// value predicate sorted by a resources column, so the id-first candidate CTE can
+// be driven straight off the sp_* value index (see directDriveSQL) instead of a
+// correlated EXISTS over resources. numericTable/numericBodies hold the captured
+// scan; predicateCount == 1 guarantees the bodies fully express the match (no
+// other WHERE predicate); orderByResourceIndex keeps the sort mappable to the
+// sp_* columns (last_updated / resource_id).
+func (b *queryBuilder) directDrive(terms []orderTerm) bool {
+	return b.numericTable != "" && len(b.numericBodies) > 0 &&
+		b.predicateCount == 1 && orderByResourceIndex(terms)
+}
+
+// compositeDriveOK reports whether a captured composite drive can be used: the
+// composite must be the sole predicate (predicateCount == 1, so its two
+// components fully express the match) and the sort must map to a resources
+// column (applied after the resources join, since the token driver table has no
+// denormalised sort column). Otherwise the search keeps the correlated id-first
+// CTE built from b.where.
+func (b *queryBuilder) compositeDriveOK(terms []orderTerm) bool {
+	return b.comp != nil && b.predicateCount == 1 && orderByResourceIndex(terms)
+}
+
+// compositeDriveSQL resolves candidate resource_ids from the composite's
+// selective token component (the driver), filtered by the other component as a
+// nested EXISTS, then joins resources once for the small candidate set and
+// sorts/limits there. This avoids both the resources recency-walk and the
+// correlated CTE's habit of joining resources for every single-component match
+// before intersecting. The driver/filter bodies reuse the $N args already bound
+// while the components were built; only limit/offset are appended here, and the
+// resources_type placeholder reuses writeBase's $1 (b.rtParam) so no bound
+// parameter is left unreferenced (SQLSTATE 42P18).
+func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) string {
+	selectList := []string{"s.resource_id AS fhir_id"}
+	var innerOrder, outerOrder []string
+	for i, t := range terms {
+		alias := fmt.Sprintf("sort%d", i)
+		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
+		innerOrder = append(innerOrder, alias+" "+t.dir)
+		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+
+	// Early-exit composite drive. DISTINCT + ORDER BY + LIMIT are pushed into the
+	// candidate subquery (no MATERIALIZED barrier) so the planner walks the
+	// driver's recency index (idx_sp_tok_recent: …, code, last_updated DESC)
+	// newest-first for the token component, probes the other component via EXISTS
+	// per row, and stops as soon as `limit` distinct resources are found — instead
+	// of resolving the whole intersection and top-N sorting it (which, for a common
+	// code with a loose value bound, was a multi-second materialise-and-sort plus a
+	// parallel hash join). The sort keys map from their resources columns to the
+	// denormalised sp_token columns (r.last_updated → s.last_updated, r.fhir_id →
+	// s.resource_id). DISTINCT dedupes a resource that carries the code more than
+	// once. Driver/filter bodies reuse the $N args bound while the components were
+	// built; the resource_type placeholder reuses writeBase's $1 (b.rtParam) so no
+	// bound parameter is left unreferenced (SQLSTATE 42P18).
+	return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT DISTINCT %s
+			FROM %s s
+			WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
+				AND EXISTS (SELECT 1 FROM %s s2 WHERE s2.resource_id = s.resource_id AND %s)
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+			AND r.is_deleted = FALSE
+		ORDER BY %s`,
+		strings.Join(selectList, ", "),
+		b.comp.driverTable, b.comp.driverBody,
+		b.comp.filterTable, b.comp.filterBody,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
+		b.rtParam,
+		strings.Join(outerOrder, ", "),
+	)
+}
+
+// directDriveSQL builds the id-first fetch that resolves candidates directly from
+// the numeric sp_* value index. The sort keys map from their resources columns to
+// the denormalised sp_* columns (r.last_updated → s.last_updated, r.fhir_id →
+// s.resource_id), both covered by the value index, so the candidate resolve is
+// index-only. The numericBodies reuse the $N args already bound during predicate
+// building; only limit/offset/rt are appended here.
+func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) string {
+	selectList := []string{"s.resource_id AS fhir_id"}
+	var innerOrder, outerOrder []string
+	for i, t := range terms {
+		alias := fmt.Sprintf("sort%d", i)
+		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
+		innerOrder = append(innerOrder, alias+" "+t.dir)
+		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
+	}
+	match := b.numericBodies[0]
+	if len(b.numericBodies) > 1 {
+		match = "(" + strings.Join(b.numericBodies, " OR ") + ")"
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+
+	// Early-exit id-first fetch. DISTINCT + ORDER BY + LIMIT are pushed into the
+	// candidate subquery (no MATERIALIZED barrier) so the planner drives it
+	// straight off an sp_* index and stops as soon as `limit` distinct resources
+	// are found:
+	//
+	//   - dense predicate sorted by last_updated → recency covering index
+	//     (…, last_updated DESC) INCLUDE (value_low, …): the page resolves after
+	//     scanning a few dozen index rows, instead of the older MATERIALIZED CTE's
+	//     full materialise-and-sort of the whole match set (e.g. value-quantity=le140
+	//     matched ~500k rows → multi-hundred-ms sort; now ~1ms early-exit).
+	//   - sparse/empty predicate → value index: returns few/zero rows directly,
+	//     never a resources full-scan.
+	//
+	// DISTINCT dedupes resources that have several matching sp_* rows so a page is
+	// always `limit` distinct resources (the old shape could emit duplicates).
+	// Reuse writeBase's resource_type placeholder (b.rtParam): b.where is not
+	// emitted by this shape, so binding a fresh one would orphan $1 (SQLSTATE 42P18).
+	return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT DISTINCT %s
+			FROM %s s
+			WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+			AND r.is_deleted = FALSE
+		ORDER BY %s`,
+		strings.Join(selectList, ", "),
+		b.numericTable, match,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
+		b.rtParam,
+		strings.Join(outerOrder, ", "),
+	)
+}
+
+// directDriveSortExpr maps a resources-column ORDER BY expression to the
+// equivalent denormalised sp_* column for the direct-drive candidate CTE. Only
+// reached for the two columns orderByResourceIndex admits.
+func directDriveSortExpr(resExpr string) string {
+	switch resExpr {
+	case "r.last_updated":
+		return "s.last_updated"
+	case "r.fhir_id":
+		return "s.resource_id"
+	default:
+		return resExpr
+	}
+}
+
+// orderByResourceIndex reports whether every ORDER BY term is a plain resources
+// column (last_updated / fhir_id), so the sort maps onto the sp_* value index's
+// denormalised columns (direct-drive). A _sort on an sp_* param orders by a
+// correlated subquery that no such index provides, so it keeps the correlated
+// id-first shape. It takes the already-resolved terms rather than calling
+// orderTerms() itself: orderTerms binds a $N arg per _sort param, so calling it
+// twice would orphan a placeholder (SQLSTATE 42P18).
+func orderByResourceIndex(terms []orderTerm) bool {
+	for _, t := range terms {
+		if t.expr != "r.last_updated" && t.expr != "r.fhir_id" {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchWithCount returns the page of matching rows plus the exact total match

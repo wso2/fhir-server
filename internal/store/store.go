@@ -159,7 +159,7 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 		resourceID, resourceType, now, raw,
 	)
 	slog.Debug("creating resource", "type", resourceType, "id", resourceID)
-	s.extractor.Queue(batch, resourceType, resourceID, body)
+	s.extractor.Queue(batch, resourceType, resourceID, body, now)
 	spCount := batch.Len() - 1 // number of sp_* statements queued
 	queueHistory(batch, resourceType, resourceID, 1, "POST", raw, now)
 
@@ -280,7 +280,7 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 		newVersion, lastUpdated, raw, resourceID, resourceType,
 	)
 	nDeletes := index.QueueDelete(batch, resourceType, resourceID) // nDeletes DELETEs at positions 1-nDeletes
-	s.extractor.Queue(batch, resourceType, resourceID, body)
+	s.extractor.Queue(batch, resourceType, resourceID, body, lastUpdated)
 	spInsertEnd := batch.Len() // position just before history INSERT
 	queueHistory(batch, resourceType, resourceID, newVersion, "PUT", raw, lastUpdated)
 
@@ -390,7 +390,7 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 		newVersion, now, mergedRaw, resourceID, resourceType,
 	)
 	nDeletes := index.QueueDelete(batch, resourceType, resourceID)
-	s.extractor.Queue(batch, resourceType, resourceID, merged)
+	s.extractor.Queue(batch, resourceType, resourceID, merged, now)
 	spInsertEnd := batch.Len()
 	queueHistory(batch, resourceType, resourceID, newVersion, "PATCH", mergedRaw, now)
 

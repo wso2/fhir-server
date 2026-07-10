@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS sp_token (
     system        VARCHAR(512),
     code          VARCHAR(191),
     display       VARCHAR(512),
+    -- Denormalised copy of resources.last_updated, set at index time. Lets the
+    -- composite early-exit drive (fetchSQL's composite shape) walk sp_token
+    -- newest-first for a code and stop after one page, without a resources lookup.
+    last_updated  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
@@ -165,10 +169,25 @@ CREATE TABLE IF NOT EXISTS sp_number (
     value         DECIMAL(20,6) NOT NULL,
     value_low     DECIMAL(20,6) NOT NULL,
     value_high    DECIMAL(20,6) NOT NULL,
+    -- Denormalised copy of resources.last_updated, set at index time to the exact
+    -- value written to resources. Lets the id-first fetch sort candidates straight
+    -- from idx_sp_num_range without a per-match resources lookup — see fetchSQL's
+    -- direct-drive shape.
+    last_updated  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high);
+-- Migration for pre-existing deployments: CREATE TABLE IF NOT EXISTS above does
+-- NOT add last_updated to an already-created sp_number, and the covering /
+-- recency indexes below reference it (idx_sp_num_recent keys on it). ADD COLUMN
+-- IF NOT EXISTS is a no-op on fresh installs and backfills existing rows with the
+-- DEFAULT, so both paths end up with the column before the indexes are built.
+ALTER TABLE sp_number ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- INCLUDE (resource_id, last_updated) makes the range scan covering: the id-first
+-- candidate resolve is index-only, yielding the fhir_id to join and the sort key
+-- to order by without touching the heap.
+CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
 -- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
 -- deletes; param_name + range columns keep the probe index-only. (Restored from
 -- the v5 diet's (resource_id, resource_type) — see the schema_version v8 note.)
@@ -193,11 +212,22 @@ CREATE TABLE IF NOT EXISTS sp_quantity (
     code             VARCHAR(64),
     canonical_value  DECIMAL(20,6),
     canonical_units  VARCHAR(64),
+    -- Denormalised copy of resources.last_updated, set at index time to the exact
+    -- value written to resources. Lets the id-first fetch sort candidates straight
+    -- from idx_sp_qty_raw without a per-match resources lookup — see fetchSQL's
+    -- direct-drive shape.
+    last_updated     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
 
+-- Migration for pre-existing deployments (see the sp_number note above): backfill
+-- last_updated before the covering / recency indexes that reference it are built.
+ALTER TABLE sp_quantity ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 -- Raw value range search (same system+code, no unit conversion needed).
-CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code);
+-- INCLUDE (resource_id, last_updated) makes the range scan covering so the
+-- id-first candidate resolve is index-only (fhir_id to join + sort key to order).
+CREATE INDEX IF NOT EXISTS idx_sp_qty_raw       ON sp_quantity (tenant_id, resource_type, param_name, value_low, value_high, system, code) INCLUDE (resource_id, last_updated);
 -- Serves the per-resource EXISTS probe of multi-parameter searches and re-index
 -- deletes. buildQuantityExists filters on value_low/value_high plus optional
 -- system/code, so those trail param_name to keep the probe index-only — matching
@@ -391,6 +421,32 @@ ALTER TABLE sp_token     ALTER COLUMN param_name    SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN target_id     SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN param_name    SET STATISTICS 1000;
 
+-- Multivariate statistics: the per-column targets above still let the planner
+-- assume resource_type / param_name / code are independent, so it badly
+-- under-estimates a common (resource_type, param_name, code) combination — e.g.
+-- Observation category=vital-signs (~20% of Observations) was estimated at <2%.
+-- That misestimate made it materialize + sort the entire match set (135k rows,
+-- one resources lookup each) instead of the abort-early ordered scan that stops
+-- at the first page: ~966ms vs ~15ms on the perf dataset. MCV/dependencies over
+-- the correlated columns correct the estimate so the planner picks the ordered
+-- scan for dense codes and the id-first-style materialize for sparse ones.
+-- Populated by ANALYZE (autoanalyze covers this after the bulk import).
+CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, code FROM sp_token;
+
+-- system|code searches (the common token form, e.g.
+-- class=http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB) filter on system
+-- AND code, which are strongly correlated — a code like AMB only ever appears
+-- under its own system. Without system in the stats the planner treats them as
+-- independent and badly UNDER-estimates a dense combination: Encounter class=AMB
+-- (62k rows) was estimated at 593, so it materialised + sorted every match and
+-- joined resources per row (~2.7s) instead of the abort-early ordered scan
+-- (~0.7ms). Adding system to the multivariate stat corrects the estimate so the
+-- planner takes the ordered early-exit for dense system|code tokens and keeps
+-- the id-first materialize for sparse ones. Populated by ANALYZE.
+CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_sys_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, system, code FROM sp_token;
+
 -- ─── Autovacuum tuning for high-churn tables ─────────────────────────────────
 -- Default autovacuum_vacuum_scale_factor=0.20 means PostgreSQL waits until 20%
 -- of a table is dead before cleaning up. On tables with millions of rows that
@@ -492,3 +548,78 @@ INSERT INTO schema_version (version) VALUES (7) ON CONFLICT DO NOTHING;
 --       ON sp_string (tenant_id, resource_id, resource_type, param_name, value_lower);
 -- (repeat for tok/date/num/qty/uri/ref with the column lists above).
 INSERT INTO schema_version (version) VALUES (8) ON CONFLICT DO NOTHING;
+
+-- v9: mark numeric comparison operators LEAKPROOF so quantity/number range and
+-- equality predicates push into the sp_quantity/sp_number indexes under RLS.
+--
+-- With Row-Level Security the sp_* tables are security barriers: a user WHERE
+-- qual is evaluated *inside* the index scan (as an index cond) only if its
+-- operator is LEAKPROOF; otherwise it is held back and applied as a post-filter
+-- above the barrier. PostgreSQL ships text and date/timestamptz comparisons
+-- LEAKPROOF, but NOT the numeric ones. So `value_low > $1` on sp_quantity
+-- (numeric(20,6)) could not use the (tenant_id, resource_type, param_name,
+-- value_low, …) index bound — every quantity/number search scanned the entire
+-- (tenant, type, param) partition and filtered value_low in memory (~50ms/query
+-- on the perf dataset, and far worse under concurrency where it spawned parallel
+-- seq scans). numeric comparison operators are pure arithmetic and do not leak
+-- argument values via errors or side channels, so marking them LEAKPROOF is safe.
+--
+-- Requires superuser: only a superuser may set LEAKPROOF. Wrapped so a non-super
+-- DDL role (or managed Postgres with no superuser, e.g. Azure Flexible Server)
+-- still applies the rest of the schema — the optimization is skipped with a
+-- notice and those searches fall back to the correct, slower post-filter path.
+DO $leakproof$
+BEGIN
+    ALTER FUNCTION numeric_eq(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_gt(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_ge(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_lt(numeric, numeric) LEAKPROOF;
+    ALTER FUNCTION numeric_le(numeric, numeric) LEAKPROOF;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE NOTICE 'skipping LEAKPROOF on numeric comparison operators (requires superuser); quantity/number range searches under RLS will use a slower post-filter';
+END
+$leakproof$;
+
+INSERT INTO schema_version (version) VALUES (9) ON CONFLICT DO NOTHING;
+
+-- v10: recency covering indexes on the numeric sp_* tables, ordered by
+-- last_updated DESC, for the early-exit id-first fetch (directDriveSQL).
+--
+-- The value indexes above (idx_sp_qty_raw / idx_sp_num_range) are ordered by
+-- value, so a search sorted by recency had to read the entire match set and
+-- top-N sort it — fine for a sparse predicate, but for a DENSE one (e.g.
+-- value-quantity=le140 matching ~500k rows) that was a multi-hundred-ms
+-- materialise-and-sort. Ordering the index by last_updated DESC lets the
+-- planner walk it newest-first, apply the value predicate from the INCLUDE'd
+-- columns, and stop after one page (~1ms), while a sparse/empty predicate still
+-- uses the value index. The planner chooses between the two per bound value
+-- (force_custom_plan) from the single sp_* table's own statistics — no
+-- application-level plan forcing.
+CREATE INDEX IF NOT EXISTS idx_sp_qty_recent ON sp_quantity (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id, system, code);
+CREATE INDEX IF NOT EXISTS idx_sp_num_recent ON sp_number   (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
+
+INSERT INTO schema_version (version) VALUES (10) ON CONFLICT DO NOTHING;
+
+-- v11: recency covering index on sp_token, ordered by last_updated DESC, for the
+-- composite early-exit drive (fetchSQL's composite shape, see search.go).
+--
+-- A composite token+quantity search (e.g. code-value-quantity) drives candidate
+-- resolution from the selective token component, then filters by the quantity
+-- component. Without a recency-ordered token index the drive had to resolve the
+-- whole intersection and top-N sort it — cheap for a selective code, but for a
+-- common code with a loose value bound (e.g. body-weight code + value>80, an
+-- 8k-row intersection) that was a multi-second materialise-and-sort that also
+-- tripped a parallel hash join. Ordering the index by last_updated DESC lets the
+-- drive walk sp_token newest-first for the code, probe the quantity component
+-- per row, and stop after one page. INCLUDE (resource_id, system) keeps the walk
+-- (and an optional system filter) index-only.
+--
+-- Migration for pre-existing deployments (mirrors the sp_number / sp_quantity
+-- v10 note): ADD COLUMN before the recency index that references it. Existing
+-- rows take the migration-time default; the exact resources.last_updated is
+-- written on the next re-index, matching how the numeric tables were populated.
+ALTER TABLE sp_token ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_sp_tok_recent ON sp_token (tenant_id, resource_type, param_name, code, last_updated DESC) INCLUDE (resource_id, system) WHERE code IS NOT NULL;
+
+INSERT INTO schema_version (version) VALUES (11) ON CONFLICT DO NOTHING;
