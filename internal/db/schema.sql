@@ -17,6 +17,17 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- No GIN index is created on resource_json because all searches go through the
 -- sp_* tables; indexing the entire document would cost ~2.4x on writes with no
 -- benefit to the query patterns used here.
+--
+-- resource_json is TEXT, not JSONB. The document is always read and written whole
+-- (the store binds/scans it as an opaque []byte — no ->/->>/@> operators or any
+-- other server-side JSON access anywhere), so JSONB bought nothing but its costs:
+-- parse-and-normalise on every write and the loss of key order / whitespace. TEXT
+-- keeps the exact bytes the store marshalled. COMPRESSION lz4 (PostgreSQL 14+)
+-- compresses the TOAST'd document far faster than the default pglz at a similar
+-- ratio, cutting write CPU on these large columns. Note: SET COMPRESSION only
+-- governs newly written values, so on an existing deployment the type/compression
+-- change applies to new writes; see the PR notes for the out-of-band rewrite to
+-- convert already-stored rows.
 
 CREATE TABLE IF NOT EXISTS resources (
     tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
@@ -25,7 +36,7 @@ CREATE TABLE IF NOT EXISTS resources (
     version_id    INT          NOT NULL DEFAULT 1,
     last_updated  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     is_deleted    BOOLEAN      NOT NULL DEFAULT FALSE,
-    resource_json JSONB        NOT NULL,
+    resource_json TEXT         COMPRESSION lz4 NOT NULL,
     search_text   TSVECTOR,
     PRIMARY KEY (tenant_id, resource_type, fhir_id)
 );
@@ -49,7 +60,7 @@ CREATE TABLE IF NOT EXISTS resource_history (
     version_id    INT          NOT NULL,
     operation     VARCHAR(10)  NOT NULL,   -- CREATE | UPDATE | DELETE
     recorded_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    resource_json JSONB,
+    resource_json TEXT COMPRESSION lz4,    -- opaque snapshot; see resources.resource_json
     UNIQUE (tenant_id, fhir_id, resource_type, version_id)
 );
 
