@@ -1349,6 +1349,19 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	// Compare the indexed range against the search range endpoints (mirrors
 	// buildDateExists) so boundary values are not matched incorrectly — e.g. an
 	// indexed 5 must not satisfy gt5.
+	//
+	// eq/ne/ge/le are interval overlap: the stored [value_low, value_high] band
+	// and the search band match iff value_low <= searchHigh AND value_high >=
+	// searchLow. Emitting that as a numrange && numrange (overlaps) lets the
+	// planner reach idx_sp_qty_range_gist (schema v12) instead of only the btree
+	// value indexes — the scalar two-bound form cannot touch the GiST expression
+	// index. The stored numrange bracket must match the index expression exactly
+	// (numrange(value_low, value_high, '[]')) or the planner won't recognise it.
+	// A NULL numrange bound is unbounded, giving the one-sided ge/le prefixes the
+	// half-open search band they need. gt/lt are strict — the stored band lies
+	// entirely above/below the search point, which is not overlap — so they stay
+	// as scalar bound comparisons (still served by idx_sp_qty_raw / _recent).
+	const stored = "numrange(s.value_low, s.value_high, '[]')"
 	var cond string
 	switch prefix {
 	case "gt":
@@ -1356,17 +1369,19 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	case "lt":
 		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "ge":
-		cond = fmt.Sprintf("s.value_high >= %s", b.next(low))
+		// [searchLow, ∞) — overlap iff value_high >= searchLow.
+		cond = fmt.Sprintf("%s && numrange(%s, NULL, '[]')", stored, b.next(low))
 	case "le":
-		cond = fmt.Sprintf("s.value_low <= %s", b.next(high))
+		// (-∞, searchHigh] — overlap iff value_low <= searchHigh.
+		cond = fmt.Sprintf("%s && numrange(NULL, %s, '[]')", stored, b.next(high))
 	case "ne":
-		hP := b.next(high)
 		lP := b.next(low)
-		cond = fmt.Sprintf("NOT (s.value_low <= %s AND s.value_high >= %s)", hP, lP)
+		hP := b.next(high)
+		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
 	default: // eq
-		hP := b.next(high)
 		lP := b.next(low)
-		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", hP, lP)
+		hP := b.next(high)
+		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
 	}
 
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)

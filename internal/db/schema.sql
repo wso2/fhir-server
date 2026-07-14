@@ -17,6 +17,17 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- No GIN index is created on resource_json because all searches go through the
 -- sp_* tables; indexing the entire document would cost ~2.4x on writes with no
 -- benefit to the query patterns used here.
+--
+-- resource_json is TEXT, not JSONB. The document is always read and written whole
+-- (the store binds/scans it as an opaque []byte — no ->/->>/@> operators or any
+-- other server-side JSON access anywhere), so JSONB bought nothing but its costs:
+-- parse-and-normalise on every write and the loss of key order / whitespace. TEXT
+-- keeps the exact bytes the store marshalled. COMPRESSION lz4 (PostgreSQL 14+)
+-- compresses the TOAST'd document far faster than the default pglz at a similar
+-- ratio, cutting write CPU on these large columns. Note: SET COMPRESSION only
+-- governs newly written values, so on an existing deployment the type/compression
+-- change applies to new writes; see the PR notes for the out-of-band rewrite to
+-- convert already-stored rows.
 
 CREATE TABLE IF NOT EXISTS resources (
     tenant_id     TEXT         NOT NULL DEFAULT current_setting('app.current_tenant', true),
@@ -25,7 +36,7 @@ CREATE TABLE IF NOT EXISTS resources (
     version_id    INT          NOT NULL DEFAULT 1,
     last_updated  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     is_deleted    BOOLEAN      NOT NULL DEFAULT FALSE,
-    resource_json JSONB        NOT NULL,
+    resource_json TEXT         COMPRESSION lz4 NOT NULL,
     search_text   TSVECTOR,
     PRIMARY KEY (tenant_id, resource_type, fhir_id)
 );
@@ -49,7 +60,7 @@ CREATE TABLE IF NOT EXISTS resource_history (
     version_id    INT          NOT NULL,
     operation     VARCHAR(10)  NOT NULL,   -- CREATE | UPDATE | DELETE
     recorded_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    resource_json JSONB,
+    resource_json TEXT COMPRESSION lz4,    -- opaque snapshot; see resources.resource_json
     UNIQUE (tenant_id, fhir_id, resource_type, version_id)
 );
 
@@ -623,3 +634,71 @@ ALTER TABLE sp_token ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL 
 CREATE INDEX IF NOT EXISTS idx_sp_tok_recent ON sp_token (tenant_id, resource_type, param_name, code, last_updated DESC) INCLUDE (resource_id, system) WHERE code IS NOT NULL;
 
 INSERT INTO schema_version (version) VALUES (11) ON CONFLICT DO NOTHING;
+
+-- v12: range-overlap GiST index on sp_quantity for the bounded quantity searches
+-- (eq / ne / ge / le), reachable only through the numrange && operator.
+--
+-- Those prefixes are interval overlap — value_low <= searchHigh AND value_high >=
+-- searchLow — but expressed as two independent numeric bounds the predicate can
+-- only ride the btree value indexes (idx_sp_qty_raw / idx_sp_qty_recent). A dense
+-- bounded window (e.g. value-quantity=ge10&le140 covering a large slice of one
+-- (tenant, type, param) partition) still had to scan-and-filter that whole
+-- partition. A GiST index over the stored interval answers the same overlap with
+-- a range probe. buildQuantityExists now emits the predicate as
+-- numrange(s.value_low, s.value_high, '[]') && numrange(searchLow, searchHigh, '[]');
+-- the index expression below must stay byte-for-byte identical to that stored
+-- numrange, or the planner will not match it. gt/lt stay scalar (strict, not
+-- overlap) and keep using the btree value indexes.
+--
+-- The leading (tenant_id, resource_type, param_name) equality columns are varchar,
+-- which have no default gist opclass, so the multicolumn GiST needs btree_gist.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE INDEX IF NOT EXISTS idx_sp_qty_range_gist ON sp_quantity
+    USING gist (tenant_id, resource_type, param_name, numrange(value_low, value_high, '[]'));
+-- Production build note: on an existing large sp_quantity, build this out of band
+-- with CREATE INDEX CONCURRENTLY before deploying the paired search.go change —
+-- CONCURRENTLY cannot run inside schema.sql's single implicit transaction:
+--   CREATE INDEX CONCURRENTLY idx_sp_qty_range_gist ON sp_quantity
+--       USING gist (tenant_id, resource_type, param_name,
+--                   numrange(value_low, value_high, '[]'));
+
+-- LEAKPROOF the two functions the overlap predicate is built from, so it reaches
+-- the GiST index under RLS. Under the FORCE ROW LEVEL SECURITY barrier on the
+-- sp_* tables (see the tenant_isolation policy above) a qual is only pushed below
+-- the barrier — and thus eligible to become an index cond — if EVERY function it
+-- calls is LEAKPROOF; otherwise it is held back as a post-filter above the
+-- barrier. This is the same barrier the v9 numeric-operator marking addressed. The
+-- predicate is  numrange(s.value_low, s.value_high, '[]') && numrange($lo, $hi, '[]'),
+-- so both the && operator (range_overlaps) AND the numrange constructor that runs
+-- per row on value_low/value_high must be leakproof. Verified: with only
+-- range_overlaps marked, the && stays a recheck filter under RLS and the GiST
+-- index is never used to narrow by range (measured on PostgreSQL 15); marking both
+-- pushes && into the GiST Index Cond. Leaving it half-done would also strand the
+-- v10 recency early-exit, whose value filter over idx_sp_qty_recent would no longer
+-- push into the scan.
+--
+-- Safety. range_overlaps is pure bound arithmetic and cannot leak. numrange is
+-- less obvious: its 3-arg constructor raises "range lower bound must be less than
+-- or equal to range upper bound" when lower > upper, and an argument-dependent
+-- error is normally a side channel that disqualifies LEAKPROOF. It is safe HERE
+-- because the expression index above computes the very same
+-- numrange(value_low, value_high, '[]') for every row at write time — a row that
+-- would make the constructor throw cannot be inserted while the index exists — so
+-- the query-time constructor never errors on stored data. Caveat: LEAKPROOF is a
+-- global property of the function, so it relaxes numrange() everywhere; this schema
+-- uses numrange only for this index, but a future RLS table that constructs
+-- numrange over unconstrained numerics would inherit the relaxed barrier. Same
+-- superuser caveat / defensive wrapper as v9: a non-super DDL role still applies
+-- the rest of the schema, and these searches fall back to the correct, slower
+-- post-filter path.
+DO $leakproof_range$
+BEGIN
+    ALTER FUNCTION range_overlaps(anyrange, anyrange) LEAKPROOF;
+    ALTER FUNCTION numrange(numeric, numeric, text) LEAKPROOF;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE NOTICE 'skipping LEAKPROOF on range_overlaps/numrange (requires superuser); bounded quantity searches under RLS will use a slower post-filter';
+END
+$leakproof_range$;
+
+INSERT INTO schema_version (version) VALUES (12) ON CONFLICT DO NOTHING;

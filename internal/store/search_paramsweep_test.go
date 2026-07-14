@@ -18,6 +18,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/wso2/fhir-server/internal/searchparam"
@@ -140,4 +141,81 @@ func TestParamSweep_NoOrphanParams(t *testing.T) {
 			assertParamsContiguous(t, b.fetchSQL(20, 0), len(b.args))
 		})
 	}
+}
+
+// TestQuantityRangeOverlap asserts that the bounded quantity prefixes (eq/ne/ge/le)
+// emit the numrange && (overlaps) form so the planner can reach the GiST index
+// idx_sp_qty_range_gist (schema v12), while the strict gt/lt prefixes stay as
+// scalar bound comparisons. The stored numrange must be byte-for-byte identical
+// to the index expression — numrange(s.value_low, s.value_high, '[]') — or the
+// planner will not match it, which is the whole point of the change.
+func TestQuantityRangeOverlap(t *testing.T) {
+	reg := paramSweepRegistry()
+	const storedRange = "numrange(s.value_low, s.value_high, '[]')"
+
+	overlap := []struct{ name, value string }{
+		{"eq", "170"},
+		{"ne", "ne170"},
+		{"ge", "ge170"},
+		{"le", "le170"},
+	}
+	for _, tc := range overlap {
+		t.Run("overlap/"+tc.name, func(t *testing.T) {
+			b := &queryBuilder{rt: "Observation", reg: reg}
+			b.writeBase()
+			b.applyParam("value-quantity", tc.value)
+			if b.err != nil {
+				t.Fatalf("build error: %v", b.err)
+			}
+			sql := b.where.String()
+			if !strings.Contains(sql, storedRange+" &&") {
+				t.Errorf("%s: expected numrange overlap against %q, got:\n%s", tc.name, storedRange, sql)
+			}
+			if strings.Contains(sql, "s.value_low <=") || strings.Contains(sql, "s.value_high >=") {
+				t.Errorf("%s: still emitting scalar two-bound predicate, got:\n%s", tc.name, sql)
+			}
+		})
+	}
+
+	scalar := []struct{ name, value, want string }{
+		{"gt", "gt170", "s.value_low >"},
+		{"lt", "lt170", "s.value_high <"},
+	}
+	for _, tc := range scalar {
+		t.Run("scalar/"+tc.name, func(t *testing.T) {
+			b := &queryBuilder{rt: "Observation", reg: reg}
+			b.writeBase()
+			b.applyParam("value-quantity", tc.value)
+			if b.err != nil {
+				t.Fatalf("build error: %v", b.err)
+			}
+			sql := b.where.String()
+			if !strings.Contains(sql, tc.want) {
+				t.Errorf("%s: expected scalar bound %q, got:\n%s", tc.name, tc.want, sql)
+			}
+			if strings.Contains(sql, "&&") {
+				t.Errorf("%s: strict prefix must not use range overlap, got:\n%s", tc.name, sql)
+			}
+		})
+	}
+
+	// One-sided bounds must be half-open: a NULL numrange bound is unbounded, so
+	// ge is [low, ∞) and le is (-∞, high] — the equivalents of value_high >= low
+	// and value_low <= high the scalar form computed.
+	t.Run("ge/half-open-low", func(t *testing.T) {
+		b := &queryBuilder{rt: "Observation", reg: reg}
+		b.writeBase()
+		b.applyParam("value-quantity", "ge170")
+		if got := b.where.String(); !strings.Contains(got, ", NULL, '[]')") {
+			t.Errorf("ge: expected unbounded upper (…, NULL, '[]'), got:\n%s", got)
+		}
+	})
+	t.Run("le/half-open-high", func(t *testing.T) {
+		b := &queryBuilder{rt: "Observation", reg: reg}
+		b.writeBase()
+		b.applyParam("value-quantity", "le170")
+		if got := b.where.String(); !strings.Contains(got, "numrange(NULL, ") {
+			t.Errorf("le: expected unbounded lower numrange(NULL, …), got:\n%s", got)
+		}
+	})
 }
