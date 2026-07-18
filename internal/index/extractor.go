@@ -117,7 +117,7 @@ func queueURIValue(batch *pgx.Batch, rt, rid, param, value string) {
 
 // Delete removes all sp_* rows for a resource in a single batched round-trip.
 func Delete(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) error {
-	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference"}
+	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference", "sp_composite_token_quantity"}
 	batch := &pgx.Batch{}
 	for _, tbl := range tables {
 		batch.Queue(
@@ -150,7 +150,7 @@ func (e *Extractor) Queue(batch *pgx.Batch, resourceType, resourceID string, res
 // QueueDelete adds one DELETE statement per sp_* table for the given resource
 // to an external batch without sending it. Returns the number of statements queued.
 func QueueDelete(batch *pgx.Batch, resourceType, resourceID string) int {
-	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference"}
+	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference", "sp_composite_token_quantity"}
 	for _, tbl := range tables {
 		batch.Queue(fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`, tbl), resourceID, resourceType)
 	}
@@ -192,6 +192,14 @@ func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string
 		queueURI(batch, resourceType, resourceID, d.ParamName, vals)
 	case "reference":
 		queueReference(batch, resourceType, resourceID, d.ParamName, vals)
+	case "composite":
+		// vals are the composite's element instances: the FHIRPath root expression
+		// (e.g. Observation, or Observation.component) evaluated against the
+		// resource. queueComposite pairs the two component values WITHIN each
+		// element so multi-component resources don't cross-match (FHIR composite
+		// semantics). Only token+quantity composites are materialised here; other
+		// component-type pairs keep the legacy query-time EXISTS path.
+		e.queueComposite(batch, resourceType, resourceID, d, vals, lastUpdated)
 	}
 }
 
@@ -432,15 +440,186 @@ func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpda
 		}
 		sys := asString(m["system"])
 		code := asString(m["code"])
-		eps := math.Abs(f) * 1e-7
+		low, high := precisionRange(f)
 		// last_updated mirrors resources.last_updated so the id-first fetch can
 		// sort candidates from idx_sp_qty_raw without a resources lookup.
 		batch.Queue(
 			`INSERT INTO sp_quantity (resource_id, resource_type, param_name, value, value_low, value_high, system, code, last_updated)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			rid, rt, param, f, f-eps, f+eps, sys, code, lastUpdated,
+			rid, rt, param, f, low, high, sys, code, lastUpdated,
 		)
 	}
+}
+
+// precisionRange returns the implicit-precision [low, high] band around f
+// (±~5 ULP), FHIR's "approximately equal" tolerance. sp_quantity and
+// sp_composite_token_quantity share it so both encode the same range for a
+// given quantity value; keep them identical or bounded composite searches
+// would disagree with plain quantity searches at the range edges.
+func precisionRange(f float64) (low, high float64) {
+	eps := math.Abs(f) * 1e-7
+	return f - eps, f + eps
+}
+
+// ─── sp_composite_token_quantity ────────────────────────────────────────────────
+
+// compositeCoding is one token value (system+code) of a composite's token
+// component, paired at write time with the quantity component of the same element.
+type compositeCoding struct {
+	system string
+	code   string
+}
+
+// queueComposite materialises token+quantity composite pairs for one composite
+// search parameter. elements are the composite's element instances — the root
+// FHIRPath (e.g. Observation, or Observation.component) already evaluated against
+// the resource. For each element it pairs that element's token codings with that
+// element's quantity value(s), never across elements, matching FHIR composite
+// semantics (a multi-component Observation must not cross-match component A's code
+// with component B's value). Only token+quantity composites are handled; other
+// component-type pairs return without writing and keep the legacy query path.
+func (e *Extractor) queueComposite(batch *pgx.Batch, rt, rid string, d searchparam.Definition, elements []any, lastUpdated time.Time) {
+	if len(d.Components) < 2 {
+		return
+	}
+	type0 := e.componentType(rt, d.Components[0].Expression)
+	type1 := e.componentType(rt, d.Components[1].Expression)
+	var tokenExpr, qtyExpr string
+	switch {
+	case type0 == "token" && type1 == "quantity":
+		tokenExpr, qtyExpr = d.Components[0].Expression, d.Components[1].Expression
+	case type0 == "quantity" && type1 == "token":
+		tokenExpr, qtyExpr = d.Components[1].Expression, d.Components[0].Expression
+	default:
+		return
+	}
+
+	for _, el := range elements {
+		em, ok := el.(map[string]any)
+		if !ok {
+			continue
+		}
+		tokenVals, err := fhirpath.EvaluatePolymorphic(normalizeAs(tokenExpr), em)
+		if err != nil || len(tokenVals) == 0 {
+			continue
+		}
+		qtyVals, err := fhirpath.EvaluatePolymorphic(normalizeAs(qtyExpr), em)
+		if err != nil || len(qtyVals) == 0 {
+			continue
+		}
+		codings := extractCompositeCodings(tokenVals)
+		if len(codings) == 0 {
+			continue
+		}
+		for _, qv := range qtyVals {
+			qm, ok := qv.(map[string]any)
+			if !ok {
+				continue
+			}
+			f, ok := toFloat(qm["value"])
+			if !ok {
+				continue
+			}
+			low, high := precisionRange(f)
+			qSys := asString(qm["system"])
+			qCode := asString(qm["code"])
+			for _, tc := range codings {
+				batch.Queue(
+					`INSERT INTO sp_composite_token_quantity
+					 (resource_id, resource_type, param_name, system, code, value, value_low, value_high, qty_system, qty_code, last_updated)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+					rid, rt, d.ParamName, tc.system, tc.code, f, low, high, qSys, qCode, lastUpdated,
+				)
+			}
+		}
+	}
+}
+
+// componentType resolves a composite component expression (relative FHIRPath such
+// as "code" or "value.as(Quantity)") to the FHIR search param type it indexes,
+// using the registry. Mirrors the resolution in internal/store (resolveComponentName)
+// but returns only the type, which is all the indexer needs to route the pair.
+func (e *Extractor) componentType(rt, expr string) string {
+	if expr == "" || e.registry == nil {
+		return ""
+	}
+	// Exact FHIRPath match.
+	for _, d := range e.registry.ForResource(rt) {
+		if d.FHIRPath == expr {
+			return d.ParamType
+		}
+	}
+	// Type hint from ".as(Type)".
+	typeHint := ""
+	plain := expr
+	if i := strings.Index(plain, ".as("); i >= 0 {
+		if end := strings.IndexByte(plain[i:], ')'); end >= 0 {
+			typeHint = plain[i+4 : i+end]
+		}
+		plain = plain[:i]
+	}
+	switch typeHint {
+	case "Quantity", "SampledData":
+		return "quantity"
+	case "CodeableConcept":
+		return "token"
+	}
+	// Strip a leading resource-type prefix, then match by param name.
+	if dot := strings.IndexByte(plain, '.'); dot >= 0 {
+		plain = plain[dot+1:]
+	}
+	for _, d := range e.registry.ForResource(rt) {
+		if d.ParamName == plain {
+			return d.ParamType
+		}
+	}
+	return ""
+}
+
+// normalizeAs rewrites the FHIRPath ".as(Type)" cast used in composite component
+// expressions (e.g. "value.as(Quantity)") into the ".ofType(Type)" form the
+// evaluator understands and resolves to the concrete polymorphic field.
+func normalizeAs(expr string) string {
+	return strings.ReplaceAll(expr, ".as(", ".ofType(")
+}
+
+// extractCompositeCodings flattens a token component's evaluated values
+// (CodeableConcepts, Codings, or bare code strings) into system+code pairs,
+// following the same fallback rules as queueToken (Identifier/ContactPoint carry
+// their token in "value"). Values with no usable code are dropped.
+func extractCompositeCodings(vals []any) []compositeCoding {
+	var out []compositeCoding
+	add := func(c any) {
+		m, ok := c.(map[string]any)
+		if !ok {
+			return
+		}
+		code := asString(m["code"])
+		if code == "" {
+			code = asString(m["value"])
+		}
+		if code == "" {
+			return
+		}
+		out = append(out, compositeCoding{system: asString(m["system"]), code: code})
+	}
+	for _, v := range vals {
+		switch val := v.(type) {
+		case map[string]any:
+			if codings, ok := val["coding"].([]any); ok {
+				for _, c := range codings {
+					add(c)
+				}
+			} else {
+				add(val)
+			}
+		case string:
+			if val != "" {
+				out = append(out, compositeCoding{code: val})
+			}
+		}
+	}
+	return out
 }
 
 // ─── sp_uri ───────────────────────────────────────────────────────────────────

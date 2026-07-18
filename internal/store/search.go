@@ -520,6 +520,23 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 		return "", false
 	}
 
+	// Token+quantity composites route to the dedicated single table
+	// sp_composite_token_quantity, where the code equality and value range live in
+	// one index scan (see buildCompositeTokenQuantityExists). The materialised rows
+	// pair the two components per element, so this is also the spec-correct path:
+	// the legacy fall-through below correlates the components only on resource_id,
+	// which false-matches multi-component resources. Other component-type pairs keep
+	// the legacy path.
+	type1 := b.resolvedParamType(comp1Name)
+	type2 := b.resolvedParamType(comp2Name)
+	if isTokenQuantityPair(type1, type2) {
+		tokVal, qtyVal := val1, val2
+		if type1 == "quantity" { // components in (quantity, token) order
+			tokVal, qtyVal = val2, val1
+		}
+		return b.buildCompositeTokenQuantityExists(param, tokVal, qtyVal)
+	}
+
 	// Build the two component SELECT bodies. Each is a fully-formed
 	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
 	// correlated to the outer resource row. suppressDirectDrive stops a numeric
@@ -549,6 +566,123 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 	// semi-joins driven by the more selective component's sp_* index, rather
 	// than a correlated subplan run once per candidate resource row.
 	return cond1 + " AND EXISTS (" + cond2 + ")", true
+}
+
+// isTokenQuantityPair reports whether two component types are exactly one token
+// and one quantity (in either order) — the pair materialised into
+// sp_composite_token_quantity.
+func isTokenQuantityPair(t1, t2 string) bool {
+	return (t1 == "token" && t2 == "quantity") || (t1 == "quantity" && t2 == "token")
+}
+
+// buildCompositeTokenQuantityExists builds the correlated EXISTS body for a
+// token+quantity composite against the single sp_composite_token_quantity table,
+// where each row is a per-element token+quantity pairing. tokVal is the token
+// component value ("system|code" or bare code); qtyVal is the quantity component
+// value ("[prefix]number|system|unit"). Placeholders are appended to b.args in
+// left-to-right order so the same body serves both the WHERE/count form and the
+// direct-drive candidate scan (captured below), exactly as buildQuantityExists
+// does for sp_quantity.
+func (b *queryBuilder) buildCompositeTokenQuantityExists(param, tokVal, qtyVal string) (string, bool) {
+	rtP := b.next(b.rt)
+	pP := b.next(param)
+
+	// Token component: system|code, bare system|, |code, or bare code. code is
+	// NOT NULL in the table, so a bare code always resolves to an equality.
+	var tokCond string
+	if parts := strings.SplitN(tokVal, "|", 2); len(parts) == 2 {
+		sys, code := parts[0], parts[1]
+		switch {
+		case sys != "" && code != "":
+			sP := b.next(sys)
+			cP := b.next(code)
+			tokCond = fmt.Sprintf("s.system = %s AND s.code = %s", sP, cP)
+		case sys != "":
+			tokCond = fmt.Sprintf("s.system = %s", b.next(sys))
+		default:
+			tokCond = fmt.Sprintf("s.code = %s", b.next(code))
+		}
+	} else {
+		tokCond = fmt.Sprintf("s.code = %s", b.next(tokVal))
+	}
+
+	qtyCond := b.compositeQtyCond(qtyVal)
+	if b.err != nil {
+		return "", false
+	}
+
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s AND %s", rtP, pP, tokCond, qtyCond)
+
+	// Capture the correlation-free body so fetchSQL can drive the id-first
+	// candidate scan straight off sp_composite_token_quantity (planner picks the
+	// value-driven code_value index or the recency walk). Skipped inside a nested
+	// context (chained / _has), whose full predicate is more than this one body.
+	if !b.suppressDirectDrive {
+		b.numericTable = "sp_composite_token_quantity"
+		b.numericBodies = append(b.numericBodies, body)
+	}
+	return "SELECT 1 FROM sp_composite_token_quantity s WHERE s.resource_id = r.fhir_id AND " + body, true
+}
+
+// compositeQtyCond builds the quantity-component predicate on the
+// sp_composite_token_quantity value columns. It mirrors buildQuantityExists
+// byte-for-byte for the numrange overlap (eq/ne/ge/le) and scalar (gt/lt) forms
+// so the emitted "numrange(s.value_low, s.value_high, '[]')" matches
+// idx_sp_comp_tokqty_range_gist exactly and the planner can use it. A unit-scoped
+// search ("…|system|unit") adds qty_system / qty_code equality, resolved from the
+// index INCLUDE columns without a heap fetch.
+func (b *queryBuilder) compositeQtyCond(value string) string {
+	numPart := value
+	var qsys, qcode string
+	if parts := strings.SplitN(value, "|", 3); len(parts) > 1 {
+		numPart = parts[0]
+		qsys = parts[1]
+		if len(parts) == 3 {
+			qcode = parts[2]
+		}
+	}
+	prefix, numStr := extractComparatorPrefix(numPart)
+	// Fail closed on a non-numeric or non-finite value rather than centring the
+	// range on zero (which would silently match value≈0 rows). Validate before
+	// binding any placeholder so nothing is left orphaned.
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("composite quantity component %q must be a finite number", value)}
+		return ""
+	}
+	eps := math.Abs(f) * 1e-7
+	if eps == 0 {
+		eps = 1e-7
+	}
+	low, high := f-eps, f+eps
+
+	const stored = "numrange(s.value_low, s.value_high, '[]')"
+	var cond string
+	switch prefix {
+	case "gt":
+		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
+	case "lt":
+		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
+	case "ge":
+		cond = fmt.Sprintf("%s && numrange(%s, NULL, '[]')", stored, b.next(low))
+	case "le":
+		cond = fmt.Sprintf("%s && numrange(NULL, %s, '[]')", stored, b.next(high))
+	case "ne":
+		lP := b.next(low)
+		hP := b.next(high)
+		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
+	default: // eq
+		lP := b.next(low)
+		hP := b.next(high)
+		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
+	}
+	if qsys != "" {
+		cond += fmt.Sprintf(" AND s.qty_system = %s", b.next(qsys))
+	}
+	if qcode != "" {
+		cond += fmt.Sprintf(" AND s.qty_code = %s", b.next(qcode))
+	}
+	return cond
 }
 
 // compositeDrive holds a composite search decomposed into a candidate driver

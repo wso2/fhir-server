@@ -219,3 +219,59 @@ func TestQuantityRangeOverlap(t *testing.T) {
 		}
 	})
 }
+
+// TestCompositeTokenQuantitySQL asserts that a token+quantity composite routes to
+// the single sp_composite_token_quantity table, keeps the numrange overlap
+// expression byte-for-byte identical to idx_sp_comp_tokqty_range_gist for the
+// GiST comparators (eq/ne/ge/le), uses the scalar bound for gt/lt, and drives the
+// fetch off that table.
+func TestCompositeTokenQuantitySQL(t *testing.T) {
+	reg := paramSweepRegistry()
+	const stored = "numrange(s.value_low, s.value_high, '[]')"
+
+	build := func(value string) *queryBuilder {
+		t.Helper()
+		b := &queryBuilder{rt: "Observation", reg: reg}
+		b.writeBase()
+		b.applyParam("code-value-quantity", value)
+		if b.err != nil {
+			t.Fatalf("build %q: %v", value, b.err)
+		}
+		return b
+	}
+
+	// lt → scalar bound on value_high, routed to and driven off the composite table.
+	b := build("8480-6$lt60")
+	where := b.where.String()
+	if !strings.Contains(where, "FROM sp_composite_token_quantity s") {
+		t.Errorf("lt: expected route to sp_composite_token_quantity, got:\n%s", where)
+	}
+	if !strings.Contains(where, "s.value_high <") {
+		t.Errorf("lt: expected scalar value_high bound, got:\n%s", where)
+	}
+	if !strings.Contains(where, "s.code =") {
+		t.Errorf("lt: expected token code equality, got:\n%s", where)
+	}
+	if strings.Contains(where, stored+" &&") {
+		t.Errorf("lt: strict prefix must not use range overlap, got:\n%s", where)
+	}
+	if fetch := b.fetchSQL(20, 0); !strings.Contains(fetch, "FROM sp_composite_token_quantity s") {
+		t.Errorf("lt: expected direct-drive fetch off sp_composite_token_quantity, got:\n%s", fetch)
+	}
+
+	// eq/ne/ge/le → numrange overlap, byte-for-byte the stored (indexed) expression.
+	for _, v := range []string{"8480-6$60", "8480-6$ne60", "8480-6$ge60", "8480-6$le60"} {
+		if w := build(v).where.String(); !strings.Contains(w, stored+" &&") {
+			t.Errorf("%s: expected numrange overlap against %q, got:\n%s", v, stored, w)
+		}
+	}
+
+	// system|code token form + unit-scoped quantity (value|system|unit).
+	w := build("http://loinc.org|8480-6$60|http://unitsofmeasure.org|mm[Hg]").where.String()
+	if !strings.Contains(w, "s.system =") || !strings.Contains(w, "s.code =") {
+		t.Errorf("system|code: expected system and code equality, got:\n%s", w)
+	}
+	if !strings.Contains(w, "s.qty_system =") || !strings.Contains(w, "s.qty_code =") {
+		t.Errorf("unit-scoped: expected qty_system and qty_code equality, got:\n%s", w)
+	}
+}

@@ -274,6 +274,61 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE INDEX IF NOT EXISTS idx_sp_qty_range_gist ON sp_quantity
     USING gist (tenant_id, resource_type, param_name, numrange(value_low, value_high, '[]'));
 
+-- ─── sp_composite_token_quantity ─────────────────────────────────────────────
+-- Materialized token+quantity composite search parameter pairs
+-- (code-value-quantity, component-code-value-quantity, ...).
+-- One row per composite param per element pairing where both components
+-- co-occur in the SAME element, per FHIR composite semantics. Written by the
+-- indexer alongside (not instead of) the component sp_token / sp_quantity rows.
+-- value_low / value_high carry the implicit-precision range of the quantity
+-- component, identical to sp_quantity. last_updated is the denormalised copy
+-- of resources.last_updated (see sp_token) for the recency early-exit.
+
+CREATE TABLE IF NOT EXISTS sp_composite_token_quantity (
+    id            BIGSERIAL     PRIMARY KEY,
+    tenant_id     TEXT          NOT NULL DEFAULT current_setting('app.current_tenant', true),
+    resource_id   VARCHAR(64)   NOT NULL,
+    resource_type VARCHAR(100)  NOT NULL,
+    param_name    VARCHAR(191)  NOT NULL,
+    system        VARCHAR(512),
+    code          VARCHAR(191)  NOT NULL,
+    value         DECIMAL(20,6) NOT NULL,
+    value_low     DECIMAL(20,6) NOT NULL,
+    value_high    DECIMAL(20,6) NOT NULL,
+    qty_system    VARCHAR(255),
+    qty_code      VARCHAR(64),
+    last_updated  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (tenant_id, resource_id, resource_type)
+        REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
+);
+
+-- Sparse-intersection drive: equality on code, range on value, one scan.
+-- Equality columns first, range columns last. INCLUDE keeps candidate resolve
+-- and the sort key index-only.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_code_value ON sp_composite_token_quantity
+    (tenant_id, resource_type, param_name, code, value_low, value_high)
+    INCLUDE (resource_id, system, qty_system, qty_code, last_updated);
+
+-- Dense-intersection drive: recency walk scoped to the code; early-exit for
+-- combinations where most rows match the value predicate.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_recent ON sp_composite_token_quantity
+    (tenant_id, resource_type, param_name, code, last_updated DESC)
+    INCLUDE (value_low, value_high, resource_id, system, qty_system, qty_code);
+
+-- Range-overlap GiST for eq / ge / le comparators (interval-overlap predicates),
+-- identical pattern to idx_sp_qty_range_gist. gt / lt stay scalar / exclusive-
+-- bound on the btree above. The expression must stay byte-for-byte identical to
+-- the predicate emitted by the store (numrange(value_low, value_high, '[]')) or
+-- the planner will not match it. btree_gist (needed because the leading equality
+-- columns are varchar) is already created above for idx_sp_qty_range_gist.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_range_gist ON sp_composite_token_quantity
+    USING gist (tenant_id, resource_type, param_name, code,
+                numrange(value_low, value_high, '[]'));
+
+-- Per-resource source probe + reindex DELETE / FK cascade support.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_source ON sp_composite_token_quantity
+    (tenant_id, resource_id, resource_type, param_name, code, value_low, value_high);
+
 -- ─── sp_uri ──────────────────────────────────────────────────────────────────
 -- FHIR uri search parameters (url, profile, etc.).
 -- Supports exact match and the :below modifier (prefix / hierarchy match).
@@ -481,6 +536,19 @@ CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_code (dependencies, ndisti
 CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_sys_code (dependencies, ndistinct, mcv)
     ON resource_type, param_name, system, code FROM sp_token;
 
+-- Composite token+quantity searches drive off (resource_type, param_name, code)
+-- in sp_composite_token_quantity. As with sp_token, the planner must not assume
+-- these columns are independent or it under-estimates a dense code and picks a
+-- materialise-and-sort over the abort-early ordered scan; the multivariate stat
+-- gives it the single-table estimate it needs to choose between the value-driven
+-- and recency-driven plan shapes.
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN code          SET STATISTICS 1000;
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN param_name    SET STATISTICS 1000;
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN resource_type SET STATISTICS 1000;
+
+CREATE STATISTICS IF NOT EXISTS stx_sp_comp_tokqty_rt_param_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, code FROM sp_composite_token_quantity;
+
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 6. Autovacuum tuning for high-churn tables
@@ -511,6 +579,7 @@ ALTER TABLE sp_quantity  SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_
 ALTER TABLE sp_uri       SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 ALTER TABLE sp_reference SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 ALTER TABLE sp_coords    SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
+ALTER TABLE sp_composite_token_quantity SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -537,7 +606,7 @@ DECLARE
     t             text;
     tenant_tables text[] := ARRAY['resources','resource_history','sp_string','sp_token',
                                   'sp_date','sp_number','sp_quantity','sp_uri',
-                                  'sp_reference','sp_coords'];
+                                  'sp_reference','sp_coords','sp_composite_token_quantity'];
 BEGIN
     FOREACH t IN ARRAY tenant_tables LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);

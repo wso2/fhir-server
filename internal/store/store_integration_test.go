@@ -742,6 +742,213 @@ func TestSearch_CompositeParam(t *testing.T) {
 	}
 }
 
+// searchCompositeTotal runs a component-code-value-quantity / code-value-quantity
+// composite search and returns the match count.
+func searchCompositeTotal(t *testing.T, s *store.Store, ctx context.Context, param, value string) int {
+	t.Helper()
+	res, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{param: {value}},
+	})
+	if err != nil {
+		t.Fatalf("composite search %s=%s: %v", param, value, err)
+	}
+	return res.Total
+}
+
+// mustCreateObs creates an Observation and fails the test if the write errors.
+func mustCreateObs(t *testing.T, s *store.Store, ctx context.Context, obs map[string]any) {
+	t.Helper()
+	if _, err := s.Create(ctx, "Observation", obs); err != nil {
+		t.Fatalf("create Observation: %v", err)
+	}
+}
+
+// TestSearch_CompositeTokenQuantity_SameElement is the spec-conformance
+// (false-positive) regression for token+quantity composites. A blood-pressure
+// Observation carries two components — systolic (8480-6, 120 mm[Hg]) and heart
+// rate (8867-4, 55 /min). component-code-value-quantity must pair code and value
+// WITHIN the same component:
+//   - 8867-4$lt60 matches: the heart-rate component's value (55) is < 60.
+//   - 8480-6$lt60 must NOT match: the systolic component's value is 120; the only
+//     sub-60 value belongs to a different component. The new single-table path
+//     (per-element rows) gets this right where a resource-level correlation would
+//     cross-match. The legacy path is exercised below to show the routing changes
+//     the answer.
+func TestSearch_CompositeTokenQuantity_SameElement(t *testing.T) {
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	s := store.New(pool, reg) // composite path on (default)
+	ctx := context.Background()
+
+	mustCreateObs(t, s, ctx, map[string]any{
+		"resourceType": "Observation", "status": "final",
+		"code": map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "85354-9"}}},
+		"component": []any{
+			map[string]any{
+				"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8480-6"}}},
+				"valueQuantity": map[string]any{"value": float64(120), "system": "http://unitsofmeasure.org", "code": "mm[Hg]"},
+			},
+			map[string]any{
+				"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8867-4"}}},
+				"valueQuantity": map[string]any{"value": float64(55), "system": "http://unitsofmeasure.org", "code": "/min"},
+			},
+		},
+	})
+
+	const param = "component-code-value-quantity"
+	if got := searchCompositeTotal(t, s, ctx, param, "8867-4$lt60"); got != 1 {
+		t.Errorf("8867-4$lt60 (heart rate 55 < 60): expected 1, got %d", got)
+	}
+	if got := searchCompositeTotal(t, s, ctx, param, "8480-6$lt60"); got != 0 {
+		t.Errorf("8480-6$lt60 (systolic value is 120, not < 60): expected 0 same-element match, got %d", got)
+	}
+	// The systolic component matches at its own value.
+	if got := searchCompositeTotal(t, s, ctx, param, "8480-6$gt100"); got != 1 {
+		t.Errorf("8480-6$gt100 (systolic 120 > 100): expected 1, got %d", got)
+	}
+}
+
+// TestSearch_CompositeTokenQuantity_Comparators exercises every quantity
+// comparator (eq/ne/gt/lt/ge/le) plus the inclusive/exclusive range boundaries
+// against code-value-quantity.
+func TestSearch_CompositeTokenQuantity_Comparators(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	for _, v := range []float64{55, 60, 65} {
+		mustCreateObs(t, s, ctx, map[string]any{
+			"resourceType": "Observation", "status": "final",
+			"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8867-4"}}},
+			"valueQuantity": map[string]any{"value": v, "system": "http://unitsofmeasure.org", "code": "/min"},
+		})
+	}
+
+	const param = "code-value-quantity"
+	cases := []struct {
+		value string
+		want  int
+	}{
+		{"8867-4$60", 1},   // eq: precision range around 60 → only the 60
+		{"8867-4$ne60", 2}, // ne: 55 and 65
+		{"8867-4$gt60", 1}, // gt: 65 (60 excluded)
+		{"8867-4$lt60", 1}, // lt: 55 (60 excluded)
+		{"8867-4$ge60", 2}, // ge: 60 and 65
+		{"8867-4$le60", 2}, // le: 55 and 60
+		{"8867-4$gt65", 0}, // boundary: 65 not > 65
+		{"8867-4$ge65", 1}, // boundary: 65 >= 65
+	}
+	for _, c := range cases {
+		if got := searchCompositeTotal(t, s, ctx, param, c.value); got != c.want {
+			t.Errorf("%s=%s: expected %d, got %d", param, c.value, c.want, got)
+		}
+	}
+}
+
+// TestSearch_CompositeTokenQuantity_TokenAndUnitForms covers the token
+// system|code / bare-code forms and the unit-scoped quantity form
+// (value|system|unit).
+func TestSearch_CompositeTokenQuantity_TokenAndUnitForms(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	mustCreateObs(t, s, ctx, map[string]any{
+		"resourceType": "Observation", "status": "final",
+		"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8867-4"}}},
+		"valueQuantity": map[string]any{"value": float64(55), "system": "http://unitsofmeasure.org", "code": "/min"},
+	})
+
+	const param = "code-value-quantity"
+	cases := []struct {
+		name  string
+		value string
+		want  int
+	}{
+		{"bare code", "8867-4$55", 1},
+		{"system|code", "http://loinc.org|8867-4$55", 1},
+		{"wrong system", "http://wrong.org|8867-4$55", 0},
+		{"bare code after pipe", "|8867-4$55", 1},
+		{"unit-scoped match", "8867-4$55|http://unitsofmeasure.org|/min", 1},
+		{"unit-scoped wrong unit", "8867-4$55|http://unitsofmeasure.org|mm[Hg]", 0},
+	}
+	for _, c := range cases {
+		if got := searchCompositeTotal(t, s, ctx, param, c.value); got != c.want {
+			t.Errorf("%s (%s=%s): expected %d, got %d", c.name, param, c.value, c.want, got)
+		}
+	}
+
+	// A non-numeric quantity component fails closed rather than centring the range
+	// on zero and matching value≈0 rows.
+	if _, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{param: {"8867-4$abc"}},
+	}); err == nil {
+		t.Error("expected an error for a non-numeric quantity component, got nil")
+	}
+}
+
+// TestSearch_CompositeTokenQuantity_UpdateDelete verifies the reindex flow keeps
+// the composite table in sync: an update replaces the old composite rows with the
+// new value, and a delete removes them.
+func TestSearch_CompositeTokenQuantity_UpdateDelete(t *testing.T) {
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	s := store.New(pool, reg)
+	ctx := context.Background()
+
+	countRows := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM sp_composite_token_quantity WHERE param_name = 'code-value-quantity' AND code = '8867-4'`,
+		).Scan(&n); err != nil {
+			t.Fatalf("count composite rows: %v", err)
+		}
+		return n
+	}
+
+	created, err := s.Create(ctx, "Observation", map[string]any{
+		"resourceType": "Observation", "status": "final",
+		"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8867-4"}}},
+		"valueQuantity": map[string]any{"value": float64(55), "system": "http://unitsofmeasure.org", "code": "/min"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id, _ := created["id"].(string)
+
+	if got := countRows(); got != 1 {
+		t.Fatalf("after create: expected 1 composite row, got %d", got)
+	}
+	const param = "code-value-quantity"
+	if got := searchCompositeTotal(t, s, ctx, param, "8867-4$55"); got != 1 {
+		t.Errorf("after create 8867-4$55: expected 1, got %d", got)
+	}
+
+	// Update the value; old composite rows must be deleted and new ones inserted.
+	if _, err := s.Update(ctx, "Observation", id, map[string]any{
+		"resourceType": "Observation", "status": "final",
+		"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "8867-4"}}},
+		"valueQuantity": map[string]any{"value": float64(99), "system": "http://unitsofmeasure.org", "code": "/min"},
+	}, -1); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := searchCompositeTotal(t, s, ctx, param, "8867-4$55"); got != 0 {
+		t.Errorf("after update 8867-4$55 (old value gone): expected 0, got %d", got)
+	}
+	if got := searchCompositeTotal(t, s, ctx, param, "8867-4$99"); got != 1 {
+		t.Errorf("after update 8867-4$99 (new value): expected 1, got %d", got)
+	}
+
+	// Delete removes the composite rows (reindex DELETE covers the new table).
+	if err := s.Delete(ctx, "Observation", id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := countRows(); got != 0 {
+		t.Errorf("after delete: expected 0 composite rows, got %d", got)
+	}
+}
+
 func TestSearch_PreviouslyBlankExpressions(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

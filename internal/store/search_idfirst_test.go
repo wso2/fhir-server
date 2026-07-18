@@ -149,34 +149,44 @@ func TestMultiValueReferenceUsesAnyArray(t *testing.T) {
 	}
 }
 
-// A lone composite (token + quantity) must resolve candidates by driving from
-// the selective token component's table, filtering by the quantity component as
-// a nested EXISTS, rather than the correlated CTE that scans resources first.
-func TestCompositeUsesTwoTableDrive(t *testing.T) {
+// A lone token+quantity composite resolves candidates by driving directly off
+// the single sp_composite_token_quantity table (its rows already pair the two
+// components per element), with an early-exit DISTINCT subquery — not the
+// correlated CTE that scans resources first, and not the legacy two-table
+// sp_token/sp_quantity drive.
+func TestCompositeUsesSingleTableDrive(t *testing.T) {
 	b := &queryBuilder{rt: "Observation", reg: idFirstTestRegistry()}
 	b.writeBase()
 	b.applyParam("code-value-quantity", "8480-6$gt110")
 	if b.err != nil {
 		t.Fatal(b.err)
 	}
-	if b.comp == nil {
-		t.Fatal("composite drive was not captured")
+	if b.comp != nil {
+		t.Fatal("token+quantity composite must not use the legacy two-table drive")
+	}
+	if b.numericTable != "sp_composite_token_quantity" {
+		t.Fatalf("expected direct-drive off sp_composite_token_quantity, got numericTable=%q", b.numericTable)
+	}
+	if !b.directDrive(b.orderTerms()) {
+		t.Fatal("a lone token+quantity composite must direct-drive")
 	}
 	sql := b.fetchSQL(20, 0)
 	t.Logf("COMPOSITE_DRIVE_SQL_BEGIN\n%s\nCOMPOSITE_DRIVE_SQL_END", sql)
 	for _, want := range []string{
 		directDriveMarker, // early-exit DISTINCT subquery, not a MATERIALIZED CTE
-		"FROM sp_token s",
-		"s.last_updated AS sort0", // recency sort key from the driver, mapped
-		"EXISTS (SELECT 1 FROM sp_quantity s2 WHERE s2.resource_id = s.resource_id", // filter component
+		"FROM sp_composite_token_quantity s",
+		"s.last_updated AS sort0",   // recency sort key from the table, mapped
 		"ORDER BY sort0 DESC LIMIT", // ORDER BY + LIMIT pushed in for early-exit
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("composite drive SQL missing %q\nSQL:\n%s", want, sql)
 		}
 	}
-	// Early-exit means no MATERIALIZED barrier and no resources scan to resolve
-	// candidates (that was the correlated / full-intersection shape).
+	// One table: no correlated EXISTS into a second sp_* table, and no MATERIALIZED
+	// barrier (that was the correlated / full-intersection shape).
+	if strings.Contains(sql, "EXISTS (SELECT 1 FROM sp_quantity") {
+		t.Fatalf("single-table drive should not correlate into sp_quantity\nSQL:\n%s", sql)
+	}
 	if strings.Contains(sql, idFirstMarker) {
 		t.Fatalf("composite drive should be early-exit, not a MATERIALIZED CTE\nSQL:\n%s", sql)
 	}
@@ -280,8 +290,10 @@ func TestFetchSQL_SoleNumericUsesDirectDrive(t *testing.T) {
 // fetch off just that embedded body, dropping the surrounding structure (wrong
 // results, orphaned params → SQLSTATE 42P18).
 func TestNestedNumericNotDirectDrive(t *testing.T) {
+	// A lone top-level token+quantity composite is NOT nested — it legitimately
+	// direct-drives off sp_composite_token_quantity (see TestCompositeUsesSingleTableDrive).
+	// Only a numeric embedded in a chained target or a _has value is nested.
 	cases := []struct{ name, rt, key, val string }{
-		{"composite component", "Observation", "code-value-quantity", "8480-6$gt110"},
 		{"chained target", "Observation", "subject:Patient.pat-qty", "gt5"},
 		{"_has value", "Patient", "_has:Observation:subject:value-quantity", "gt5"},
 	}
@@ -344,7 +356,7 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 		{"quantity OR list (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt10,lt5"}}, ""},
 		{"quantity system|code (direct-drive)", "Observation", [][2]string{{"value-quantity", "gt5|http://unitsofmeasure.org|mg"}}, ""},
 		{"mixed ref+quantity (correlated id-first)", "Observation", [][2]string{{"subject", "Patient/123"}, {"value-quantity", "gt170"}}, ""},
-		{"composite token+quantity (two-table drive)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
+		{"composite token+quantity (single-table drive)", "Observation", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, ""},
 		{"quantity sorted by sp_ param (correlated id-first)", "Observation", [][2]string{{"value-quantity", "gt170"}}, "-date"},
 		{"token (single-scan)", "Observation", [][2]string{{"code", "8302-2"}}, ""},
 		{"plain browse (single-scan)", "Observation", nil, ""},
@@ -381,7 +393,7 @@ func TestDirectDriveGating(t *testing.T) {
 		{"sole quantity", [][2]string{{"value-quantity", "gt170"}}, true, 1},
 		{"sole token", [][2]string{{"code", "8302-2"}}, false, 1},
 		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, false, 2},
-		{"composite embedding quantity", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, false, 1},
+		{"token+quantity composite (single-table drive)", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, true, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
