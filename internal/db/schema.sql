@@ -1,9 +1,10 @@
 -- FHIR Server PostgreSQL Schema
 -- One resources table holds all FHIR resource types. Separate sp_* tables
 -- store extracted search parameter values so searches never touch resource_json.
--- Requires PostgreSQL 14+ (resource_json uses COMPRESSION lz4). For Location
--- near-search, install PostGIS. The btree_gist extension is created by this
--- script for the quantity range GiST index (see sp_quantity).
+-- Requires PostgreSQL 14+ (resource_json uses COMPRESSION lz4); tested through
+-- PostgreSQL 18. For Location near-search, install PostGIS. The btree_gist
+-- extension is created by this script for the quantity range GiST index (see
+-- sp_quantity).
 --
 -- Layout:
 --   1. Schema version table

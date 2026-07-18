@@ -17,7 +17,7 @@ go test -tags integration -v -timeout 300s ./...
 
 All 107 **unit tests** have no database, no Docker, no network (IG cache-miss tests spin up an `httptest.Server` locally). They run in under 5 seconds on a laptop.
 
-**Integration tests** spin up a real PostgreSQL 16 container via [testcontainers-go](https://testcontainers.com/). Each test gets its own isolated database; containers are terminated automatically when the test finishes. Expect 30–90 seconds per package on first run (image pull) and 10–30 seconds on subsequent runs.
+**Integration tests** spin up a real PostgreSQL 18 container via [testcontainers-go](https://testcontainers.com/). Each test gets its own isolated database; containers are terminated automatically when the test finishes. Expect 30–90 seconds per package on first run (image pull) and 10–30 seconds on subsequent runs. Set `FHIR_TEST_POSTGRES_IMAGE` to run against another supported major (14 through 18), e.g. `FHIR_TEST_POSTGRES_IMAGE=postgres:14-alpine go test -tags integration ./...`.
 
 ---
 
@@ -51,7 +51,7 @@ Run with `go test -tags integration -timeout 300s <package>`. Requires Docker.
 
 Integration tests share a test helper in `internal/testutil/postgres.go` (build tag: `integration`):
 
-- **`MustDB(t)`** — starts a fresh `postgres:16-alpine` container, runs `db.CreateTables`, returns a pool; container terminates on `t.Cleanup`.
+- **`MustDB(t)`** — starts a fresh `postgres:18-alpine` container (or `FHIR_TEST_POSTGRES_IMAGE`), runs `db.CreateTables`, returns a pool; container terminates on `t.Cleanup`.
 - **`MustSeededDB(t)`** — like `MustDB` but also runs `seed.SeedSearchParams`.
 - **`MustRegistry(t, pool)`** — loads a `searchparam.Registry` from the pool.
 

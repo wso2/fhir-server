@@ -4,7 +4,7 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 
 **FHIR version:** R4 (4.0.1)  
 **Language:** Go 1.25  
-**Database:** PostgreSQL 13+
+**Database:** PostgreSQL 14+ (tested through 18)
 
 ---
 
@@ -95,7 +95,7 @@ docker build -t fhir-server:latest .
 
 Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)); the steps below invoke `./fhir-server`.
 
-**Prerequisites:** PostgreSQL 13+ running locally, and a built `fhir-server` binary
+**Prerequisites:** PostgreSQL 14+ running locally, and a built `fhir-server` binary
 
 ### Create the database and role
 

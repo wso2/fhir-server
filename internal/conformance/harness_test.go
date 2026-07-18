@@ -78,8 +78,15 @@ func TestMain(m *testing.M) {
 // package, runs the suite, and tears everything down. Returns the test exit code.
 func runWithContainer(m *testing.M) int {
 	ctx := context.Background()
+	// Defaults to the newest supported major (PostgreSQL 18); override with
+	// FHIR_TEST_POSTGRES_IMAGE to run the suite against another supported major
+	// (14 through 18). Kept in sync with testutil.PostgresImage.
+	image := os.Getenv("FHIR_TEST_POSTGRES_IMAGE")
+	if image == "" {
+		image = "postgres:18-alpine"
+	}
 	pgc, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
+		image,
 		tcpostgres.WithDatabase("testdb"),
 		tcpostgres.WithUsername("test"),
 		tcpostgres.WithPassword("test"),
