@@ -1438,6 +1438,78 @@ func TestSearch_ByQuantityParam(t *testing.T) {
 	}
 }
 
+// TestSearch_HalfBoundedQuantity_Straddle is the design's straddling-range
+// correctness check (§5). Half-bounded prefixes collapse the interval overlap to a
+// scalar on one bound column — value_high for ge/gt/eb, value_low for le/lt/sa — so
+// a stored band [tl, th] that straddles the search bound is matched via the correct
+// column: [50, 100050] satisfies ge99999 (value_high) and lt100 (value_low) but not
+// sa100051 or eb49. The store's ingest only writes narrow precision bands, so the
+// wide straddling band is injected directly. Matches are asserted by resource-id
+// membership, not Total, so the check is independent of any other seeded rows.
+func TestSearch_HalfBoundedQuantity_Straddle(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	s := store.New(pool, reg)
+
+	created, err := s.Create(ctx, "Observation", map[string]any{
+		"resourceType": "Observation", "status": "final",
+		"code":          map[string]any{"coding": []any{map[string]any{"system": "http://loinc.org", "code": "777-3"}}},
+		"valueQuantity": map[string]any{"value": float64(500), "system": "http://unitsofmeasure.org", "code": "10*9/L"},
+	})
+	if err != nil {
+		t.Fatalf("create observation: %v", err)
+	}
+	id, _ := created["id"].(string)
+	if id == "" {
+		t.Fatal("created observation has no id")
+	}
+
+	// Widen the stored precision band to straddle the search bounds: [50, 100050].
+	// The public ingest path only writes narrow ±precision bands, so inject the
+	// wide band directly on the row backing this resource's value-quantity index.
+	if _, err := pool.Exec(ctx,
+		"UPDATE sp_quantity SET value_low = 50, value_high = 100050 WHERE resource_id = $1", id); err != nil {
+		t.Fatalf("widen band: %v", err)
+	}
+
+	has := func(value string) bool {
+		t.Helper()
+		res, err := s.Search(ctx, store.SearchParams{
+			ResourceType: "Observation",
+			Params:       map[string][]string{"value-quantity": {value}},
+		})
+		if err != nil {
+			t.Fatalf("search value-quantity=%s: %v", value, err)
+		}
+		for _, e := range res.Entries {
+			if eid, _ := e["id"].(string); eid == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// tl=50, th=100050.
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"ge99999", true},   // value_high 100050 >= 99999
+		{"gt99999", true},   // value_high 100050 > 99999
+		{"eb100051", true},  // value_high 100050 < 100051 — target ends before search
+		{"eb49", false},     // value_high 100050 < 49 is false
+		{"lt100", true},     // value_low 50 < 100
+		{"le100", true},     // value_low 50 <= 100
+		{"sa49", true},      // value_low 50 > 49 — target starts after search
+		{"sa100051", false}, // value_low 50 > 100051 is false
+	} {
+		if got := has(tc.value); got != tc.want {
+			t.Errorf("value-quantity=%s: got match=%v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestSearch_MissingModifier(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

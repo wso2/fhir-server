@@ -26,9 +26,10 @@ import (
 	"github.com/wso2/fhir-server/internal/testutil"
 )
 
-// TestSearch_CompositeTokenQuantity_Plan is the design's plan verification (§6.2):
-// the value-driven scan must ride a composite index (no seq scan), and a bounded
-// ge/le search must reach the GiST range-overlap index via the && operator.
+// TestSearch_CompositeTokenQuantity_Plan is the design's plan verification (§6):
+// the value-driven scan must ride a composite index (no seq scan), and a
+// half-bounded ge search must reach a composite index via the scalar value_high
+// bound (idx_sp_comp_tokqty_code_high) — not a full scan and not the GiST overlap.
 func TestSearch_CompositeTokenQuantity_Plan(t *testing.T) {
 	pool := testutil.MustSeededDB(t)
 	reg := testutil.MustRegistry(t, pool)
@@ -91,18 +92,21 @@ func TestSearch_CompositeTokenQuantity_Plan(t *testing.T) {
 		t.Errorf("lt: expected a composite index scan, got:\n%s", ltPlan)
 	}
 
-	// Bounded ge search: served by a composite index, and the range-overlap
-	// operator (&&, the GiST-eligible predicate) must be what's applied — not a
-	// scalar-bound fallback that drops the overlap. We don't pin a specific index:
-	// depending on selectivity the planner may satisfy the sort via the recency
-	// index or drive off the range-GiST, and both are composite indexes, so
-	// pinning one would be flaky on small data.
+	// Half-bounded ge search: collapses to a scalar value_high bound, served by a
+	// composite index (no seq scan) and never the GiST overlap — a half-open probe
+	// would overlap nearly every GiST leaf. We don't pin a specific index: depending
+	// on selectivity the planner may seek idx_sp_comp_tokqty_code_high or satisfy the
+	// sort via the recency index, and both are composite indexes, so pinning one
+	// would be flaky on small data.
 	gePlan := plan("8867-4$ge60")
 	t.Logf("ge plan:\n%s", gePlan)
+	if strings.Contains(gePlan, "Seq Scan on sp_composite_token_quantity") {
+		t.Errorf("ge: unexpected seq scan on sp_composite_token_quantity:\n%s", gePlan)
+	}
 	if !strings.Contains(gePlan, "idx_sp_comp_tokqty") {
 		t.Errorf("ge: expected a composite index scan, got:\n%s", gePlan)
 	}
-	if !strings.Contains(gePlan, "&&") {
-		t.Errorf("ge: expected the numrange overlap (&&) predicate, not a scalar fallback, got:\n%s", gePlan)
+	if strings.Contains(gePlan, "&&") {
+		t.Errorf("ge: half-bounded prefix must use the scalar value_high bound, not the numrange overlap (&&), got:\n%s", gePlan)
 	}
 }

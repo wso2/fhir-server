@@ -626,11 +626,14 @@ func (b *queryBuilder) buildCompositeTokenQuantityExists(param, tokVal, qtyVal s
 
 // compositeQtyCond builds the quantity-component predicate on the
 // sp_composite_token_quantity value columns. It mirrors buildQuantityExists
-// byte-for-byte for the numrange overlap (eq/ne/ge/le) and scalar (gt/lt) forms
-// so the emitted "numrange(s.value_low, s.value_high, '[]')" matches
-// idx_sp_comp_tokqty_range_gist exactly and the planner can use it. A unit-scoped
-// search ("…|system|unit") adds qty_system / qty_code equality, resolved from the
-// index INCLUDE columns without a heap fetch.
+// byte-for-byte: doubly bounded eq/ne/ap emit the numrange overlap so the stored
+// "numrange(s.value_low, s.value_high, '[]')" matches idx_sp_comp_tokqty_range_gist
+// exactly, while the half-bounded prefixes collapse to a scalar on one bound column
+// (ge/gt/eb on value_high → idx_sp_comp_tokqty_code_high; le/lt/sa on value_low →
+// idx_sp_comp_tokqty_code_value). Keep the two functions in lockstep or bounded
+// composite searches would disagree with plain quantity searches at the edges. A
+// unit-scoped search ("…|system|unit") adds qty_system / qty_code equality,
+// resolved from the index INCLUDE columns without a heap fetch.
 func (b *queryBuilder) compositeQtyCond(value string) string {
 	numPart := value
 	var qsys, qcode string
@@ -654,24 +657,28 @@ func (b *queryBuilder) compositeQtyCond(value string) string {
 	if eps == 0 {
 		eps = 1e-7
 	}
-	low, high := f-eps, f+eps
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
 
 	const stored = "numrange(s.value_low, s.value_high, '[]')"
 	var cond string
 	switch prefix {
-	case "gt":
-		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
-	case "lt":
-		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "ge":
-		cond = fmt.Sprintf("%s && numrange(%s, NULL, '[]')", stored, b.next(low))
+		cond = fmt.Sprintf("s.value_high >= %s", b.next(low))
+	case "gt":
+		cond = fmt.Sprintf("s.value_high > %s", b.next(high))
+	case "eb":
+		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "le":
-		cond = fmt.Sprintf("%s && numrange(NULL, %s, '[]')", stored, b.next(high))
+		cond = fmt.Sprintf("s.value_low <= %s", b.next(high))
+	case "lt":
+		cond = fmt.Sprintf("s.value_low < %s", b.next(low))
+	case "sa":
+		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
 	case "ne":
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
-	default: // eq
+	default: // eq, ap — doubly bounded overlap, byte-identical to the GiST index expr
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
@@ -1476,7 +1483,7 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	if eps == 0 {
 		eps = 1e-7
 	}
-	low, high := f-eps, f+eps
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 
@@ -1484,35 +1491,52 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	// buildDateExists) so boundary values are not matched incorrectly — e.g. an
 	// indexed 5 must not satisfy gt5.
 	//
-	// eq/ne/ge/le are interval overlap: the stored [value_low, value_high] band
-	// and the search band match iff value_low <= searchHigh AND value_high >=
-	// searchLow. Emitting that as a numrange && numrange (overlaps) lets the
-	// planner reach idx_sp_qty_range_gist (schema v12) instead of only the btree
-	// value indexes — the scalar two-bound form cannot touch the GiST expression
-	// index. The stored numrange bracket must match the index expression exactly
-	// (numrange(value_low, value_high, '[]')) or the planner won't recognise it.
-	// A NULL numrange bound is unbounded, giving the one-sided ge/le prefixes the
-	// half-open search band they need. gt/lt are strict — the stored band lies
-	// entirely above/below the search point, which is not overlap — so they stay
-	// as scalar bound comparisons (still served by idx_sp_qty_raw / _recent).
+	// eq/ne/ap are doubly bounded: the stored [value_low, value_high] band and the
+	// search band match iff value_low <= searchHigh AND value_high >= searchLow.
+	// Emitting that as a numrange && numrange (overlaps) lets the planner reach
+	// idx_sp_qty_range_gist instead of only the btree value indexes — the scalar
+	// two-bound form cannot touch the GiST expression index. The stored numrange
+	// bracket must match the index expression exactly (numrange(value_low,
+	// value_high, '[]')) or the planner won't recognise it. This emission stays
+	// untouched so windowed queries keep riding the GiST path.
+	//
+	// The half-bounded prefixes each have one infinite search bound, so the overlap
+	// collapses to a single scalar comparison on one bound column (design "Fast
+	// Half-Bounded Quantity Searches", §2.1). Two families:
+	//   value_high-driven: ge (value_high >= searchLow), gt (value_high > searchHigh),
+	//                      eb (value_high < searchLow)          — served by idx_sp_qty_high
+	//   value_low-driven:  le (value_low <= searchHigh), lt (value_low < searchLow),
+	//                      sa (value_low > searchHigh)          — served by idx_sp_qty_raw
+	// Both seek the bound directly after the (tenant, type, param) equality prefix
+	// instead of scanning the whole partition and post-filtering (the old ge/le
+	// numrange && half-open probe overlapped nearly every GiST leaf; the old gt/lt
+	// scalar rode the wrong bound column). The comparator is the ONLY branch point,
+	// and the collapsed forms are algebraically the overlap forms with one infinite
+	// bound, so emitting the scalar on the *correct* column preserves straddling
+	// correctness: [50, 100050] matches ge99999 via value_high and lt100 via
+	// value_low. gt/lt stay against the search band edge (searchHigh / searchLow),
+	// not the bare value, so they remain exclusive against a stored value's own
+	// precision band — an indexed 5 still fails gt5 and lt5.
 	const stored = "numrange(s.value_low, s.value_high, '[]')"
 	var cond string
 	switch prefix {
-	case "gt":
-		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
-	case "lt":
-		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "ge":
-		// [searchLow, ∞) — overlap iff value_high >= searchLow.
-		cond = fmt.Sprintf("%s && numrange(%s, NULL, '[]')", stored, b.next(low))
+		cond = fmt.Sprintf("s.value_high >= %s", b.next(low))
+	case "gt":
+		cond = fmt.Sprintf("s.value_high > %s", b.next(high))
+	case "eb":
+		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "le":
-		// (-∞, searchHigh] — overlap iff value_low <= searchHigh.
-		cond = fmt.Sprintf("%s && numrange(NULL, %s, '[]')", stored, b.next(high))
+		cond = fmt.Sprintf("s.value_low <= %s", b.next(high))
+	case "lt":
+		cond = fmt.Sprintf("s.value_low < %s", b.next(low))
+	case "sa":
+		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
 	case "ne":
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
-	default: // eq
+	default: // eq, ap — doubly bounded overlap, byte-identical to the GiST index expr
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
@@ -2152,6 +2176,16 @@ func extractComparatorPrefix(s string) (prefix, rest string) {
 	}
 	return "eq", s
 }
+
+// quantizeBand rounds a search precision bound to the sp_* value column scale
+// (DECIMAL(20,6)). Stored value_low/value_high are rounded to 6 dp on write, so
+// the search band must live in the same 6-dp domain or the strict half-bounded
+// comparators leak a boundary value in: a stored 65 has value_high 65.000007
+// after rounding, and gt65's unrounded upper edge 65.0000065 would wrongly admit
+// it. Rounding both sides into the same domain keeps gt/lt boundary-exact while
+// leaving the inclusive (ge/le) and doubly bounded (eq/ne) forms unaffected —
+// their boundaries carry a full 2·eps gap that rounding cannot flip.
+func quantizeBand(x float64) float64 { return math.Round(x*1e6) / 1e6 }
 
 func expandDateRange(s string) (low, high time.Time) {
 	low, high, _ = expandDateStringForSearch(s)

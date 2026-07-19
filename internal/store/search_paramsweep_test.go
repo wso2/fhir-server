@@ -143,12 +143,14 @@ func TestParamSweep_NoOrphanParams(t *testing.T) {
 	}
 }
 
-// TestQuantityRangeOverlap asserts that the bounded quantity prefixes (eq/ne/ge/le)
-// emit the numrange && (overlaps) form so the planner can reach the GiST index
-// idx_sp_qty_range_gist (schema v12), while the strict gt/lt prefixes stay as
-// scalar bound comparisons. The stored numrange must be byte-for-byte identical
-// to the index expression — numrange(s.value_low, s.value_high, '[]') — or the
-// planner will not match it, which is the whole point of the change.
+// TestQuantityRangeOverlap asserts that the doubly bounded quantity prefixes
+// (eq/ne) emit the numrange && (overlaps) form so the planner can reach the GiST
+// index idx_sp_qty_range_gist, while the half-bounded prefixes collapse to a scalar
+// bound on the correct column: the value_high family (ge/gt/eb) rides idx_sp_qty_high
+// and the value_low family (le/lt/sa) rides idx_sp_qty_raw. The stored numrange must
+// be byte-for-byte identical to the index expression — numrange(s.value_low,
+// s.value_high, '[]') — or the planner will not match it, which is the whole point
+// of the overlap path.
 func TestQuantityRangeOverlap(t *testing.T) {
 	reg := paramSweepRegistry()
 	const storedRange = "numrange(s.value_low, s.value_high, '[]')"
@@ -156,8 +158,6 @@ func TestQuantityRangeOverlap(t *testing.T) {
 	overlap := []struct{ name, value string }{
 		{"eq", "170"},
 		{"ne", "ne170"},
-		{"ge", "ge170"},
-		{"le", "le170"},
 	}
 	for _, tc := range overlap {
 		t.Run("overlap/"+tc.name, func(t *testing.T) {
@@ -171,15 +171,19 @@ func TestQuantityRangeOverlap(t *testing.T) {
 			if !strings.Contains(sql, storedRange+" &&") {
 				t.Errorf("%s: expected numrange overlap against %q, got:\n%s", tc.name, storedRange, sql)
 			}
-			if strings.Contains(sql, "s.value_low <=") || strings.Contains(sql, "s.value_high >=") {
-				t.Errorf("%s: still emitting scalar two-bound predicate, got:\n%s", tc.name, sql)
-			}
 		})
 	}
 
+	// Half-bounded prefixes collapse to a scalar on one bound column — no numrange
+	// overlap, so the btree indexes serve them. The column choice preserves
+	// straddling correctness (see TestSearch_HalfBoundedQuantity_Straddle).
 	scalar := []struct{ name, value, want string }{
-		{"gt", "gt170", "s.value_low >"},
-		{"lt", "lt170", "s.value_high <"},
+		{"ge", "ge170", "s.value_high >="},
+		{"gt", "gt170", "s.value_high >"},
+		{"eb", "eb170", "s.value_high <"},
+		{"le", "le170", "s.value_low <="},
+		{"lt", "lt170", "s.value_low <"},
+		{"sa", "sa170", "s.value_low >"},
 	}
 	for _, tc := range scalar {
 		t.Run("scalar/"+tc.name, func(t *testing.T) {
@@ -194,37 +198,21 @@ func TestQuantityRangeOverlap(t *testing.T) {
 				t.Errorf("%s: expected scalar bound %q, got:\n%s", tc.name, tc.want, sql)
 			}
 			if strings.Contains(sql, "&&") {
-				t.Errorf("%s: strict prefix must not use range overlap, got:\n%s", tc.name, sql)
+				t.Errorf("%s: half-bounded prefix must not use range overlap, got:\n%s", tc.name, sql)
+			}
+			if strings.Contains(sql, "NULL, '[]'") || strings.Contains(sql, "numrange(NULL") {
+				t.Errorf("%s: half-bounded prefix must not use a half-open numrange, got:\n%s", tc.name, sql)
 			}
 		})
 	}
-
-	// One-sided bounds must be half-open: a NULL numrange bound is unbounded, so
-	// ge is [low, ∞) and le is (-∞, high] — the equivalents of value_high >= low
-	// and value_low <= high the scalar form computed.
-	t.Run("ge/half-open-low", func(t *testing.T) {
-		b := &queryBuilder{rt: "Observation", reg: reg}
-		b.writeBase()
-		b.applyParam("value-quantity", "ge170")
-		if got := b.where.String(); !strings.Contains(got, ", NULL, '[]')") {
-			t.Errorf("ge: expected unbounded upper (…, NULL, '[]'), got:\n%s", got)
-		}
-	})
-	t.Run("le/half-open-high", func(t *testing.T) {
-		b := &queryBuilder{rt: "Observation", reg: reg}
-		b.writeBase()
-		b.applyParam("value-quantity", "le170")
-		if got := b.where.String(); !strings.Contains(got, "numrange(NULL, ") {
-			t.Errorf("le: expected unbounded lower numrange(NULL, …), got:\n%s", got)
-		}
-	})
 }
 
 // TestCompositeTokenQuantitySQL asserts that a token+quantity composite routes to
 // the single sp_composite_token_quantity table, keeps the numrange overlap
 // expression byte-for-byte identical to idx_sp_comp_tokqty_range_gist for the
-// GiST comparators (eq/ne/ge/le), uses the scalar bound for gt/lt, and drives the
-// fetch off that table.
+// doubly bounded comparators (eq/ne), collapses the half-bounded prefixes to a
+// scalar bound on the correct column (ge/gt/eb → value_high, le/lt/sa → value_low),
+// and drives the fetch off that table.
 func TestCompositeTokenQuantitySQL(t *testing.T) {
 	reg := paramSweepRegistry()
 	const stored = "numrange(s.value_low, s.value_high, '[]')"
@@ -240,29 +228,47 @@ func TestCompositeTokenQuantitySQL(t *testing.T) {
 		return b
 	}
 
-	// lt → scalar bound on value_high, routed to and driven off the composite table.
+	// lt → scalar bound on value_low, routed to and driven off the composite table.
 	b := build("8480-6$lt60")
 	where := b.where.String()
 	if !strings.Contains(where, "FROM sp_composite_token_quantity s") {
 		t.Errorf("lt: expected route to sp_composite_token_quantity, got:\n%s", where)
 	}
-	if !strings.Contains(where, "s.value_high <") {
-		t.Errorf("lt: expected scalar value_high bound, got:\n%s", where)
+	if !strings.Contains(where, "s.value_low <") {
+		t.Errorf("lt: expected scalar value_low bound, got:\n%s", where)
 	}
 	if !strings.Contains(where, "s.code =") {
 		t.Errorf("lt: expected token code equality, got:\n%s", where)
 	}
 	if strings.Contains(where, stored+" &&") {
-		t.Errorf("lt: strict prefix must not use range overlap, got:\n%s", where)
+		t.Errorf("lt: half-bounded prefix must not use range overlap, got:\n%s", where)
 	}
 	if fetch := b.fetchSQL(20, 0); !strings.Contains(fetch, "FROM sp_composite_token_quantity s") {
 		t.Errorf("lt: expected direct-drive fetch off sp_composite_token_quantity, got:\n%s", fetch)
 	}
 
-	// eq/ne/ge/le → numrange overlap, byte-for-byte the stored (indexed) expression.
-	for _, v := range []string{"8480-6$60", "8480-6$ne60", "8480-6$ge60", "8480-6$le60"} {
+	// eq/ne → numrange overlap, byte-for-byte the stored (indexed) expression.
+	for _, v := range []string{"8480-6$60", "8480-6$ne60"} {
 		if w := build(v).where.String(); !strings.Contains(w, stored+" &&") {
 			t.Errorf("%s: expected numrange overlap against %q, got:\n%s", v, stored, w)
+		}
+	}
+
+	// Half-bounded prefixes → scalar on the correct bound column, never overlap.
+	for _, tc := range []struct{ value, want string }{
+		{"8480-6$ge60", "s.value_high >="},
+		{"8480-6$gt60", "s.value_high >"},
+		{"8480-6$eb60", "s.value_high <"},
+		{"8480-6$le60", "s.value_low <="},
+		{"8480-6$lt60", "s.value_low <"},
+		{"8480-6$sa60", "s.value_low >"},
+	} {
+		w := build(tc.value).where.String()
+		if !strings.Contains(w, tc.want) {
+			t.Errorf("%s: expected scalar bound %q, got:\n%s", tc.value, tc.want, w)
+		}
+		if strings.Contains(w, stored+" &&") {
+			t.Errorf("%s: half-bounded prefix must not use range overlap, got:\n%s", tc.value, w)
 		}
 	}
 
