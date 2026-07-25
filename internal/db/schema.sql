@@ -191,10 +191,28 @@ CREATE TABLE IF NOT EXISTS sp_date (
     value_low       TIMESTAMPTZ  NOT NULL,
     value_high      TIMESTAMPTZ  NOT NULL,
     value_precision VARCHAR(10)  NOT NULL DEFAULT 'SECOND',
+    -- last_updated mirrors resources.last_updated so the id-first date fetch can
+    -- sort candidates from the sp_date recency index without a resources lookup,
+    -- exactly like sp_quantity (design-addendum §2, Phase 2).
+    last_updated    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
+-- Existing installs created before the recency column gain it here (CREATE TABLE
+-- IF NOT EXISTS above is a no-op on them). DEFAULT now() backfills existing rows
+-- with a reasonable ordering key; a migration wanting exact resources.last_updated
+-- runs the backfill UPDATE from the addendum as superuser.
+ALTER TABLE sp_date ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT now();
 
-CREATE INDEX IF NOT EXISTS idx_sp_date_range  ON sp_date (tenant_id, resource_type, param_name, value_low, value_high);
+-- value_low family (le / lt / sa) — covering so the value_low seek resolves
+-- index-only; supersedes the old idx_sp_date_range (same key, no INCLUDE).
+CREATE INDEX IF NOT EXISTS idx_sp_date_low    ON sp_date (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
+-- value_high family (ge / gt / eb) — the sp_date mirror of idx_sp_qty_high.
+CREATE INDEX IF NOT EXISTS idx_sp_date_high   ON sp_date (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated);
+-- Recency walk for dense half-bounded date searches (the density probe picks it).
+CREATE INDEX IF NOT EXISTS idx_sp_date_recent ON sp_date (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
+-- idx_sp_date_range is superseded by idx_sp_date_low (same key columns + covering
+-- INCLUDE); drop it so it does not sit idle consuming write bandwidth.
+DROP INDEX IF EXISTS idx_sp_date_range;
 CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 
 -- ─── sp_number ───────────────────────────────────────────────────────────────
@@ -535,6 +553,12 @@ ALTER TABLE sp_token     ALTER COLUMN resource_type SET STATISTICS 1000;
 ALTER TABLE sp_token     ALTER COLUMN param_name    SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN target_id     SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN param_name    SET STATISTICS 1000;
+
+-- Date bound columns: statistics parity with sp_quantity so the half-bounded date
+-- plan choice has an honest per-column histogram to work from (design-addendum
+-- §2.5). The density probe is the backstop where the histogram still mis-estimates.
+ALTER TABLE sp_date      ALTER COLUMN value_low     SET STATISTICS 1000;
+ALTER TABLE sp_date      ALTER COLUMN value_high    SET STATISTICS 1000;
 
 -- Quantity bound columns: the half-bounded plan choice (seek idx_sp_qty_high /
 -- idx_sp_qty_raw for a sparse bound vs. the recency walk for a dense one) hinges

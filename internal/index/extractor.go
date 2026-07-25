@@ -183,7 +183,7 @@ func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string
 	case "token":
 		queueTokenValues(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "date", "dateTime", "instant", "Period":
-		queueDate(batch, resourceType, resourceID, d.ParamName, vals)
+		queueDate(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "number":
 		queueNumber(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "quantity":
@@ -310,16 +310,18 @@ func queueToken(batch *pgx.Batch, rt, rid, param string, v any, lastUpdated time
 
 // ─── sp_date ──────────────────────────────────────────────────────────────────
 
-func queueDate(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func queueDate(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		low, high, err := parseDateRange(v)
 		if err != nil {
 			continue
 		}
+		// last_updated mirrors resources.last_updated so the id-first date fetch can
+		// sort candidates from idx_sp_date_recent without a resources lookup.
 		batch.Queue(
-			`INSERT INTO sp_date (resource_id, resource_type, param_name, value_low, value_high)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			rid, rt, param, low, high,
+			`INSERT INTO sp_date (resource_id, resource_type, param_name, value_low, value_high, last_updated)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			rid, rt, param, low, high, lastUpdated,
 		)
 	}
 }

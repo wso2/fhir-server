@@ -86,7 +86,9 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 		{"quantity uses id-first", "Observation", "value-quantity", "gt170", true},
 		{"token keeps ordered scan", "Observation", "code", "8302-2", false},
 		{"reference keeps ordered scan", "Observation", "subject", "Patient/123", false},
-		{"date keeps ordered scan", "Observation", "date", "gt2020", false},
+		// sp_date joined the id-first family (design-addendum Phase 3.1) once it
+		// gained a last_updated recency column.
+		{"date uses id-first", "Observation", "date", "gt2020", true},
 		{"string keeps ordered scan", "Patient", "name", "Smith", false},
 		{"negated quantity keeps ordered scan", "Observation", "value-quantity:not", "gt170", false},
 		{"plain browse keeps ordered scan", "Observation", "_lastUpdated", "gt2020", false},

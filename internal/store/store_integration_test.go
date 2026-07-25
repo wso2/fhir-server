@@ -1317,6 +1317,66 @@ func TestSearch_ByDateParam(t *testing.T) {
 	}
 }
 
+// TestSearch_DatePeriodStraddle is the design-addendum Phase-1 correctness check.
+// Encounter.date indexes Encounter.period, a true range, so a straddling period
+// must be matched via the correct bound column: [2021-01-01, 2021-06-01] satisfies
+// gt2021-02-16 (value_high) and lt2021-02-16 (value_low) but not sa2021-06-02 or
+// eb2020-12-31. Before the fix gt read value_low (sa semantics) and lt read
+// value_high (eb), wrongly excluding the straddling period. Membership by id keeps
+// the assertions independent of other seeded rows and of the plan the probe picks.
+func TestSearch_DatePeriodStraddle(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	enc, err := s.Create(ctx, "Encounter", map[string]any{
+		"resourceType": "Encounter", "status": "finished",
+		"class":  map[string]any{"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+		"period": map[string]any{"start": "2021-01-01", "end": "2021-06-01"},
+	})
+	if err != nil {
+		t.Fatalf("create encounter: %v", err)
+	}
+	id, _ := enc["id"].(string)
+	if id == "" {
+		t.Fatal("encounter has no id")
+	}
+
+	has := func(value string) bool {
+		res, err := s.Search(ctx, store.SearchParams{
+			ResourceType: "Encounter",
+			Params:       map[string][]string{"date": {value}},
+		})
+		if err != nil {
+			t.Fatalf("search date=%s: %v", value, err)
+		}
+		for _, e := range res.Entries {
+			if eid, _ := e["id"].(string); eid == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// period [2021-01-01, 2021-06-01]
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"gt2021-02-16", true},  // value_high 2021-06-01 > 2021-02-16
+		{"ge2021-02-16", true},  // value_high >= searchLow
+		{"lt2021-02-16", true},  // value_low 2021-01-01 < 2021-02-16
+		{"le2021-02-16", true},  // value_low <= searchHigh
+		{"eb2021-06-02", true},  // value_high < 2021-06-02 — ends before
+		{"eb2020-12-31", false}, // value_high < 2020-12-31 is false
+		{"sa2020-12-31", true},  // value_low > 2020-12-31 — starts after
+		{"sa2021-06-02", false}, // value_low > 2021-06-02 is false
+	} {
+		if got := has(tc.value); got != tc.want {
+			t.Errorf("date=%s: got match=%v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestSearch_ByReferenceParam(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
