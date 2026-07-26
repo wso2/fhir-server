@@ -4,13 +4,15 @@
 -- Requires PostgreSQL 14+ (resource_json uses COMPRESSION lz4); tested through
 -- PostgreSQL 18. For Location near-search, install PostGIS. The btree_gist
 -- extension is created by this script for the quantity range GiST index (see
--- sp_quantity).
+-- sp_quantity); pg_stat_statements is created best-effort for query profiling
+-- (section 1).
 --
 -- Layout:
---   1. Schema version table
+--   1. Schema version + query profiling
 --   2. Core resource storage      (resources, resource_history)
 --   3. Search parameter indexes   (sp_string, sp_token, sp_date, sp_number,
---                                  sp_quantity, sp_uri, sp_reference, sp_coords)
+--                                  sp_quantity, sp_composite_token_quantity,
+--                                  sp_uri, sp_reference, sp_coords)
 --   4. Registry & reference data  (search_param_definitions, ig_*,
 --                                  base_definitions, closure tables)
 --   5. Planner statistics
@@ -18,9 +20,11 @@
 --   7. Row-Level Security
 --   8. LEAKPROOF operators
 --
--- Each table is defined together with all of its own indexes. Every statement is
--- idempotent (CREATE ... IF NOT EXISTS), so the schema can be (re)applied to a
--- fresh database and re-running is a no-op.
+-- Each table is defined together with all of its own indexes. The script is
+-- written for a fresh database and every statement is idempotent — creates are
+-- guarded with IF NOT EXISTS and columns with ADD COLUMN IF NOT EXISTS — so it
+-- can be (re)applied to a fresh or already-provisioned database and re-running is
+-- a no-op. It is purely additive: it never drops or rewrites existing objects.
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -220,15 +224,14 @@ CREATE TABLE IF NOT EXISTS sp_date (
 ALTER TABLE sp_date ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT now();
 
 -- value_low family (le / lt / sa) — covering so the value_low seek resolves
--- index-only; supersedes the old idx_sp_date_range (same key, no INCLUDE).
+-- index-only. (This replaces an earlier non-covering idx_sp_date_range; installs
+-- provisioned before that change can drop the old index — see
+-- docs/performance-tuning.md. A fresh database never creates it.)
 CREATE INDEX IF NOT EXISTS idx_sp_date_low    ON sp_date (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
 -- value_high family (ge / gt / eb) — the sp_date mirror of idx_sp_qty_high.
 CREATE INDEX IF NOT EXISTS idx_sp_date_high   ON sp_date (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated);
 -- Recency walk for dense half-bounded date searches (the density probe picks it).
 CREATE INDEX IF NOT EXISTS idx_sp_date_recent ON sp_date (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
--- idx_sp_date_range is superseded by idx_sp_date_low (same key columns + covering
--- INCLUDE); drop it so it does not sit idle consuming write bandwidth.
-DROP INDEX IF EXISTS idx_sp_date_range;
 CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 
 -- ─── sp_number ───────────────────────────────────────────────────────────────

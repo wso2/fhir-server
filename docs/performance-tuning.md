@@ -95,6 +95,11 @@ ALTER TABLE sp_quantity SET (autovacuum_vacuum_scale_factor = 0.01,
 -- Raise histogram resolution on a bound column, then re-analyze:
 ALTER TABLE sp_quantity ALTER COLUMN value_high SET STATISTICS 2000;
 ANALYZE sp_quantity;
+
+-- One-time cleanup on databases provisioned before the sp_date recency work:
+-- idx_sp_date_low (covering) supersedes the old non-covering idx_sp_date_range.
+-- A fresh schema never creates idx_sp_date_range; existing installs can drop it.
+DROP INDEX IF EXISTS idx_sp_date_range;
 ```
 
 `VACUUM`/`ANALYZE` must each run as their own statement (they cannot run inside a
