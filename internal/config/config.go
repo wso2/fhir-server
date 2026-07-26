@@ -57,6 +57,17 @@ type Config struct {
 	ReadTimeout  time.Duration // default 30s
 	WriteTimeout time.Duration // default 60s
 	IdleTimeout  time.Duration // default 120s
+
+	// Search performance tunables. Defaults equal the store's historical
+	// hardcoded constants — see docs/performance-tuning.md for the tuning rules.
+	SearchProbeCap        int // density-probe cap; default 5000
+	SearchDefaultPageSize int // page size when _count is omitted; default 20
+	SearchMaxPageSize     int // upper clamp on client _count; 0 = unlimited; default 0
+	SearchMaxChainDepth   int // chained-parameter recursion bound; default 5
+
+	// PlanCacheMode is the per-connection plan_cache_mode. force_custom_plan is
+	// load-bearing for the search probe architecture's per-bound plan choice.
+	PlanCacheMode string // default force_custom_plan
 }
 
 // FileConfig is the on-disk YAML schema. Each field is optional — anything
@@ -85,6 +96,8 @@ type FileConfig struct {
 		// CreateTables opts in to creating the schema's tables on startup.
 		// Pointer so an absent key is distinguishable from an explicit `false`.
 		CreateTables *bool `yaml:"createTables"`
+		// PlanCacheMode overrides the per-connection plan_cache_mode.
+		PlanCacheMode string `yaml:"planCacheMode"`
 	} `yaml:"database"`
 
 	IG struct {
@@ -93,6 +106,16 @@ type FileConfig struct {
 		ForceReload *bool    `yaml:"forceReload"` // pointer so absence is distinguishable from `false`
 		CacheDir    string   `yaml:"cacheDir"`
 	} `yaml:"ig"`
+
+	// Search performance tunables. Pointers so an absent key is distinguishable
+	// from an explicit value (matters for maxPageSize, where 0 is meaningful, and
+	// for validation, which must reject an explicit out-of-range 0 for probeCap).
+	Search struct {
+		ProbeCap        *int `yaml:"probeCap"`
+		DefaultPageSize *int `yaml:"defaultPageSize"`
+		MaxPageSize     *int `yaml:"maxPageSize"`
+		MaxChainDepth   *int `yaml:"maxChainDepth"`
+	} `yaml:"search"`
 }
 
 // Load reads configuration using the env-var-based discovery path. The
@@ -179,6 +202,33 @@ func resolve(fc *FileConfig) (*Config, error) {
 		return nil, err
 	}
 
+	// Search tunables. Defaults equal the store's historical constants, so an
+	// empty config reproduces current behavior exactly (see the default-equivalence
+	// test). Ranges per docs/performance-tuning.md; validation fails fast, naming
+	// the offending source (env var or config key) and the allowed range.
+	probeCap, err := resolveIntTunable("SEARCH_PROBE_CAP", "search.probeCap", fc.Search.ProbeCap, 5000, 100, 1_000_000)
+	if err != nil {
+		return nil, err
+	}
+	defaultPageSize, err := resolveIntTunable("SEARCH_DEFAULT_PAGE_SIZE", "search.defaultPageSize", fc.Search.DefaultPageSize, 20, 1, 1000)
+	if err != nil {
+		return nil, err
+	}
+	// maxPageSize: 0 = unlimited (legacy behavior), else a clamp in [1, 10000].
+	maxPageSize, err := resolveIntTunable("SEARCH_MAX_PAGE_SIZE", "search.maxPageSize", fc.Search.MaxPageSize, 0, 0, 10_000)
+	if err != nil {
+		return nil, err
+	}
+	maxChainDepth, err := resolveIntTunable("SEARCH_MAX_CHAIN_DEPTH", "search.maxChainDepth", fc.Search.MaxChainDepth, 5, 1, 10)
+	if err != nil {
+		return nil, err
+	}
+	planCacheMode, err := resolveEnumTunable("DATABASE_PLAN_CACHE_MODE", "database.planCacheMode", fc.Database.PlanCacheMode,
+		"force_custom_plan", []string{"force_custom_plan", "auto", "force_generic_plan"})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		DatabaseURL:     dbURL,
 		Port:            serverPort,
@@ -195,7 +245,60 @@ func resolve(fc *FileConfig) (*Config, error) {
 		ReadTimeout:     readTimeout,
 		WriteTimeout:    writeTimeout,
 		IdleTimeout:     idleTimeout,
+
+		SearchProbeCap:        probeCap,
+		SearchDefaultPageSize: defaultPageSize,
+		SearchMaxPageSize:     maxPageSize,
+		SearchMaxChainDepth:   maxChainDepth,
+		PlanCacheMode:         planCacheMode,
 	}, nil
+}
+
+// resolveIntTunable resolves one integer tunable: env var > config file > default,
+// then range-validates. An unparseable or out-of-range value fails fast, naming
+// the source that supplied it (env var or config key) and the allowed range. The
+// default must be within [min, max]. fileVal is a pointer so an absent key falls
+// through to the default while an explicit value (including 0) is honored and
+// validated.
+func resolveIntTunable(envVar, fileKey string, fileVal *int, def, min, max int) (int, error) {
+	val, source := def, ""
+	if raw := os.Getenv(envVar); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s %q: must be an integer", envVar, raw)
+		}
+		val, source = n, envVar
+	} else if fileVal != nil {
+		val, source = *fileVal, fileKey
+	}
+	if val < min || val > max {
+		if source == "" {
+			source = fileKey
+		}
+		return 0, fmt.Errorf("%s (%d) out of range: must be between %d and %d", source, val, min, max)
+	}
+	return val, nil
+}
+
+// resolveEnumTunable resolves one enumerated string tunable: env var > config
+// file > default, validated against the allowed set. An out-of-set value fails
+// fast, naming the source and the allowed values. The default must be in allowed.
+func resolveEnumTunable(envVar, fileKey, fileVal, def string, allowed []string) (string, error) {
+	val, source := def, ""
+	if raw := os.Getenv(envVar); raw != "" {
+		val, source = raw, envVar
+	} else if fileVal != "" {
+		val, source = fileVal, fileKey
+	}
+	for _, a := range allowed {
+		if val == a {
+			return val, nil
+		}
+	}
+	if source == "" {
+		source = fileKey
+	}
+	return "", fmt.Errorf("invalid %s %q: must be one of %s", source, val, strings.Join(allowed, ", "))
 }
 
 // resolveTimeout resolves one HTTP server timeout: env var > config file >

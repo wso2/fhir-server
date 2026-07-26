@@ -186,6 +186,11 @@ env var   >   config file   >   built-in default
 
 This lets you keep non-secret defaults in a checked-in `config.yaml` and inject secrets (like `DB_PASSWORD`) via environment variables at deploy time.
 
+> **Search performance tunables** (density-probe cap, page-size limits, chain
+> depth, `plan_cache_mode`) and the deploy-time DDL knobs are documented, with
+> sizing rules and regression gates, in
+> [docs/performance-tuning.md](docs/performance-tuning.md).
+
 ### Specifying the config file
 
 Pass the path explicitly — there is no implicit search of the working directory, so behavior is the same on every host.

@@ -57,7 +57,7 @@ func appRoleStore(t *testing.T) *store.Store {
 
 	cc := admin.Config().ConnConfig
 	dsn := fmt.Sprintf("postgres://fhir_app:app@%s:%d/%s?sslmode=disable", cc.Host, cc.Port, cc.Database)
-	appPool, err := db.Connect(ctx, dsn)
+	appPool, err := db.Connect(ctx, dsn, "")
 	if err != nil {
 		t.Fatalf("connect as app role: %v", err)
 	}

@@ -85,7 +85,7 @@ func run() error {
 	defer cancel()
 
 	// Database
-	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.PlanCacheMode)
 	if err != nil {
 		return fmt.Errorf("connect db: %w", err)
 	}
@@ -130,12 +130,27 @@ func run() error {
 	}
 
 	// Store + HTTP (server starts immediately; IGs load in background)
-	storeOpts := []func(*store.Store){}
+	searchTuning := store.SearchTuning{
+		ProbeCap:        cfg.SearchProbeCap,
+		DefaultPageSize: cfg.SearchDefaultPageSize,
+		MaxPageSize:     cfg.SearchMaxPageSize,
+		MaxChainDepth:   cfg.SearchMaxChainDepth,
+	}
+	storeOpts := []func(*store.Store){store.WithSearchTuning(searchTuning)}
 	if tc := terminology.New(cfg.TerminologyURL); tc != nil {
 		storeOpts = append(storeOpts, store.WithTerminology(tc))
 		slog.Info("terminology server configured", "url", cfg.TerminologyURL)
 	}
 	s := store.New(pool, registry, storeOpts...)
+	// Log the effective search tunables so an operator can confirm overrides took
+	// effect (docs/performance-tuning.md).
+	slog.Info("search tuning",
+		"probeCap", cfg.SearchProbeCap,
+		"defaultPageSize", cfg.SearchDefaultPageSize,
+		"maxPageSize", cfg.SearchMaxPageSize,
+		"maxChainDepth", cfg.SearchMaxChainDepth,
+		"planCacheMode", cfg.PlanCacheMode,
+	)
 
 	// igReady is set to 1 once all IGs finish loading.
 	var igReady atomic.Int32

@@ -33,7 +33,7 @@ import (
 //   - dense bound (probe hits the cap) → the recency walk, unpinned.
 //
 // It exercises both sp_date and sp_quantity. The dense case is forced cheaply by
-// injecting > probeCap sp_date rows for one resource (the probe counts rows, not
+// injecting > defaultProbeCap sp_date rows for one resource (the probe counts rows, not
 // distinct resources), avoiding a multi-thousand-resource seed.
 func TestSearch_DensityProbe_Plan(t *testing.T) {
 	ctx := context.Background()
@@ -51,12 +51,12 @@ func TestSearch_DensityProbe_Plan(t *testing.T) {
 	}
 	encID := enc["id"].(string)
 
-	// Inflate the 'date' partition past probeCap for this one resource so a
+	// Inflate the 'date' partition past defaultProbeCap for this one resource so a
 	// matching bound trips the dense branch without seeding thousands of rows.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO sp_date (resource_id, resource_type, param_name, value_low, value_high, last_updated)
 		SELECT $1, 'Encounter', 'date', '2020-01-01'::timestamptz, '2020-12-31'::timestamptz, now()
-		FROM generate_series(1, $2)`, encID, probeCap+1000); err != nil {
+		FROM generate_series(1, $2)`, encID, defaultProbeCap+1000); err != nil {
 		t.Fatalf("inflate date partition: %v", err)
 	}
 

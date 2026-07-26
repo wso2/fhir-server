@@ -40,6 +40,33 @@ database:
   # with a privileged role. Env equivalent: FHIR_CREATE_TABLES=true.
   # createTables: false
 
+  # Per-connection plan_cache_mode. force_custom_plan is required for the search
+  # probe architecture's per-bound plan choice — change only for experiments;
+  # auto / force_generic_plan re-expose the misestimate pathologies the probe
+  # exists to avoid. One of: force_custom_plan, auto, force_generic_plan.
+  # Env: DATABASE_PLAN_CACHE_MODE.
+  # planCacheMode: force_custom_plan
+
+search:
+  # Density-probe cap for half-bounded quantity/date/number searches.
+  # Probe < cap → sp-first seek (cost bounded by cap rows); probe hits cap →
+  # recency walk (cost bounded by pageSize × partitionRows / cap entries).
+  # Near-optimal at sqrt(pageSize × partitionRows): 5000 suits ~500k-row sp
+  # partitions; re-derive when the dataset grows 10x. Range 100–1000000.
+  # Env: SEARCH_PROBE_CAP.
+  # probeCap: 5000
+
+  # Page size when the request omits _count. Range 1–1000.
+  # Env: SEARCH_DEFAULT_PAGE_SIZE.
+  # defaultPageSize: 20
+
+  # Upper clamp on client-supplied _count. 0 = unlimited (legacy behavior).
+  # Recommended 200 in production. Range 0 or 1–10000. Env: SEARCH_MAX_PAGE_SIZE.
+  # maxPageSize: 0
+
+  # Chained-parameter recursion bound. Range 1–10. Env: SEARCH_MAX_CHAIN_DEPTH.
+  # maxChainDepth: 5
+
 ig:
   # Implementation guides to load at startup. None are loaded by default —
   # the server runs as a plain base FHIR R4 store until you opt in here.

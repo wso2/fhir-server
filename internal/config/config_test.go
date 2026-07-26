@@ -17,6 +17,7 @@
 package config_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,99 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if len(cfg.IGPackages) != 0 {
 		t.Errorf("default IGPackages should be empty, got %v", cfg.IGPackages)
+	}
+}
+
+// TestLoad_SearchTuning_DefaultEquivalence is the §0.1 proof: with no config,
+// every performance tunable resolves to the store's / db's historical hardcoded
+// value. Asserted against the literals (5000 / 20 / 0 / 5 / force_custom_plan),
+// not against a round-trip, so threading the config through the store (T2) and
+// db (T3) cannot silently move an effective value without failing here.
+func TestLoad_SearchTuning_DefaultEquivalence(t *testing.T) {
+	clearIGEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SearchProbeCap != 5000 {
+		t.Errorf("default SearchProbeCap: got %d, want 5000", cfg.SearchProbeCap)
+	}
+	if cfg.SearchDefaultPageSize != 20 {
+		t.Errorf("default SearchDefaultPageSize: got %d, want 20", cfg.SearchDefaultPageSize)
+	}
+	if cfg.SearchMaxPageSize != 0 {
+		t.Errorf("default SearchMaxPageSize: got %d, want 0 (unlimited)", cfg.SearchMaxPageSize)
+	}
+	if cfg.SearchMaxChainDepth != 5 {
+		t.Errorf("default SearchMaxChainDepth: got %d, want 5", cfg.SearchMaxChainDepth)
+	}
+	if cfg.PlanCacheMode != "force_custom_plan" {
+		t.Errorf("default PlanCacheMode: got %q, want force_custom_plan", cfg.PlanCacheMode)
+	}
+}
+
+func TestLoad_SearchProbeCap_EnvOverride(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("SEARCH_PROBE_CAP", "4999")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SearchProbeCap != 4999 {
+		t.Errorf("SearchProbeCap: got %d, want 4999", cfg.SearchProbeCap)
+	}
+}
+
+func TestLoad_InvalidProbeCap_OutOfRange(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("SEARCH_PROBE_CAP", "50") // below the 100 floor
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for out-of-range SEARCH_PROBE_CAP, got nil")
+	}
+	if !strings.Contains(err.Error(), "SEARCH_PROBE_CAP") {
+		t.Errorf("error should name the offending key, got: %v", err)
+	}
+}
+
+func TestLoad_InvalidProbeCap_NotInteger(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("SEARCH_PROBE_CAP", "lots")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for non-integer SEARCH_PROBE_CAP, got nil")
+	}
+}
+
+func TestLoad_InvalidPlanCacheMode(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("DATABASE_PLAN_CACHE_MODE", "turbo")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid DATABASE_PLAN_CACHE_MODE, got nil")
+	}
+	if !strings.Contains(err.Error(), "DATABASE_PLAN_CACHE_MODE") {
+		t.Errorf("error should name the offending key, got: %v", err)
+	}
+}
+
+func TestLoad_PlanCacheMode_ValidVariants(t *testing.T) {
+	for _, mode := range []string{"force_custom_plan", "auto", "force_generic_plan"} {
+		t.Run(mode, func(t *testing.T) {
+			clearIGEnv(t)
+			t.Setenv("DATABASE_PLAN_CACHE_MODE", mode)
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.PlanCacheMode != mode {
+				t.Errorf("PlanCacheMode: got %q, want %q", cfg.PlanCacheMode, mode)
+			}
+		})
 	}
 }
 
@@ -206,6 +300,8 @@ func clearIGEnv(t *testing.T) {
 		"SERVER_READ_TIMEOUT", "SERVER_WRITE_TIMEOUT", "SERVER_IDLE_TIMEOUT",
 		"IG_PACKAGES", "IG_REGISTRY_URL", "IG_FORCE_RELOAD", "IG_CACHE_DIR",
 		"FHIR_SERVER_CONFIG",
+		"SEARCH_PROBE_CAP", "SEARCH_DEFAULT_PAGE_SIZE", "SEARCH_MAX_PAGE_SIZE",
+		"SEARCH_MAX_CHAIN_DEPTH", "DATABASE_PLAN_CACHE_MODE",
 	} {
 		t.Setenv(k, "")
 	}

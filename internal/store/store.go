@@ -34,11 +34,34 @@ import (
 	"github.com/wso2/fhir-server/internal/terminology"
 )
 
+// SearchTuning carries the search performance knobs the store reads at query
+// time. They are configurable (see internal/config and docs/performance-tuning.md);
+// New fills any zero field with its built-in default, so callers that don't pass
+// WithSearchTuning keep the historical hardcoded behavior.
+type SearchTuning struct {
+	ProbeCap        int // density-probe cap (defaultProbeCap when 0)
+	DefaultPageSize int // page size when _count omitted (defaultSearchPageSize when 0)
+	MaxPageSize     int // clamp on client _count; 0 = unlimited
+	MaxChainDepth   int // chained-parameter recursion bound (defaultMaxChainDepth when 0)
+}
+
+// defaultSearchTuning returns the built-in tunable values, identical to the
+// store's historical hardcoded constants.
+func defaultSearchTuning() SearchTuning {
+	return SearchTuning{
+		ProbeCap:        defaultProbeCap,
+		DefaultPageSize: defaultSearchPageSize,
+		MaxPageSize:     defaultMaxPageSize,
+		MaxChainDepth:   defaultMaxChainDepth,
+	}
+}
+
 type Store struct {
 	pool        *pgxpool.Pool
 	extractor   *index.Extractor
 	registry    *searchparam.Registry
 	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning      SearchTuning
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
@@ -46,11 +69,30 @@ func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store
 		pool:      pool,
 		extractor: index.New(registry),
 		registry:  registry,
+		tuning:    defaultSearchTuning(),
 	}
 	for _, o := range opts {
 		o(s)
 	}
 	return s
+}
+
+// WithSearchTuning sets the search performance tunables (resolved from config).
+// Any non-positive field falls back to its built-in default, so a partially
+// populated struct is safe; MaxPageSize 0 is preserved (it means "unlimited").
+func WithSearchTuning(t SearchTuning) func(*Store) {
+	return func(s *Store) {
+		if t.ProbeCap <= 0 {
+			t.ProbeCap = defaultProbeCap
+		}
+		if t.DefaultPageSize <= 0 {
+			t.DefaultPageSize = defaultSearchPageSize
+		}
+		if t.MaxChainDepth <= 0 {
+			t.MaxChainDepth = defaultMaxChainDepth
+		}
+		s.tuning = t
+	}
 }
 
 // WithTerminology configures the store to call tc for :in/:not-in expansion.

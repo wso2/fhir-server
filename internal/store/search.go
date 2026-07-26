@@ -60,11 +60,27 @@ type UnsupportedParamError struct{ Msg string }
 
 func (e *UnsupportedParamError) Error() string { return e.Msg }
 
+// newQueryBuilder constructs a query builder carrying the store's configured
+// search tunables, so every search built here honors search.probeCap /
+// search.maxChainDepth (see SearchTuning).
+func (s *Store) newQueryBuilder(ctx context.Context, rt string) *queryBuilder {
+	return &queryBuilder{
+		rt: rt, reg: s.registry, terminology: s.terminology, ctx: ctx,
+		probeCap:      s.tuning.ProbeCap,
+		maxChainDepth: s.tuning.MaxChainDepth,
+	}
+}
+
 // Search executes a FHIR search against the resources + sp_* tables,
 // and resolves _include / _revinclude parameters.
 func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, error) {
 	if sp.PageSize <= 0 {
-		sp.PageSize = 20
+		sp.PageSize = s.tuning.DefaultPageSize
+	}
+	// Clamp a client-supplied _count to the configured maximum. MaxPageSize 0 is
+	// unlimited (legacy behavior), so the clamp is a no-op at the default.
+	if s.tuning.MaxPageSize > 0 && sp.PageSize > s.tuning.MaxPageSize {
+		sp.PageSize = s.tuning.MaxPageSize
 	}
 	if sp.Page <= 0 {
 		sp.Page = 1
@@ -92,7 +108,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		sp.Params = params
 	}
 
-	b := &queryBuilder{rt: sp.ResourceType, reg: s.registry, terminology: s.terminology, ctx: ctx}
+	b := s.newQueryBuilder(ctx, sp.ResourceType)
 	b.writeBase()
 
 	for rawKey, values := range sp.Params {
@@ -322,6 +338,12 @@ type queryBuilder struct {
 	// planner-chooses shape; planSparse pins the sp-first value-index seek with a
 	// MATERIALIZED CTE; planDenseWalk keeps the recency walk. Read by directDriveSQL.
 	planDense planVerdict
+	// probeCap and maxChainDepth are the performance tunables carried from the
+	// store's config (see SearchTuning). A zero value means "unset" — the builder
+	// falls back to the package default (defaultProbeCap / defaultMaxChainDepth),
+	// so a directly-constructed builder in tests behaves as before.
+	probeCap      int
+	maxChainDepth int
 }
 
 // densityProbe is a self-contained capped existence count for one half-bounded
@@ -344,12 +366,21 @@ const (
 	planDenseWalk
 )
 
-// probeCap bounds the density probe: the capped count stops at this many matches.
-// Below it the sp-first seek's worst case is a top-N sort over <probeCap narrow
-// index-only rows; at it, the match set is dense enough that the recency walk
-// fills a page within a few thousand covered entries. 5000 keeps both branches
-// comfortably under 10ms with no gray zone (design-addendum §3.2).
-const probeCap = 5000
+// defaultProbeCap is the built-in density-probe cap, used when the store carries
+// no configured value (SearchTuning.ProbeCap == 0). The probe's capped count stops
+// at this many matches: below it the sp-first seek's worst case is a top-N sort
+// over <cap narrow index-only rows; at it, the recency walk fills a page within a
+// few thousand covered entries. 5000 keeps both branches comfortably under 10ms.
+// Configurable via search.probeCap (see docs/performance-tuning.md).
+const defaultProbeCap = 5000
+
+// defaultSearchPageSize is the page size used when a request omits _count.
+// Configurable via search.defaultPageSize.
+const defaultSearchPageSize = 20
+
+// defaultMaxPageSize is the built-in clamp on client-supplied _count; 0 means
+// unlimited (legacy behavior). Configurable via search.maxPageSize.
+const defaultMaxPageSize = 0
 
 // sortKey is one component of a _sort directive: the search param name and
 // whether the order is descending (the param was prefixed with '-').
@@ -914,15 +945,22 @@ func (b *queryBuilder) applyChained(ref, targetType, targetParam, targetModifier
 	}
 }
 
-const maxChainDepth = 5 // prevent pathological queries
+// defaultMaxChainDepth is the built-in chained-parameter recursion bound, used
+// when the store carries no configured value (SearchTuning.MaxChainDepth == 0).
+// Configurable via search.maxChainDepth (see docs/performance-tuning.md).
+const defaultMaxChainDepth = 5 // prevent pathological queries
 
 // buildChainedCondition builds the EXISTS…IN SQL fragment for one hop of a
 // chained search, recursing for multi-hop chains.
 // sourceType is the type of the resource at the current hop (the one we're
 // filtering by the sp_reference table).
 func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, targetParam, targetModifier, value string, depth int) string {
-	if depth > maxChainDepth {
-		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("chained search exceeds maximum depth %d", maxChainDepth)}
+	maxDepth := b.maxChainDepth
+	if maxDepth <= 0 {
+		maxDepth = defaultMaxChainDepth
+	}
+	if depth > maxDepth {
+		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("chained search exceeds maximum depth %d", maxDepth)}
 		return ""
 	}
 
@@ -1936,12 +1974,16 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 		return nil
 	}
 	p := b.probe
+	cap := b.probeCap
+	if cap <= 0 {
+		cap = defaultProbeCap
+	}
 	q := fmt.Sprintf(`SELECT count(*) FROM (
 		SELECT 1 FROM %s s
 		WHERE s.tenant_id = current_setting('app.current_tenant', true)
 		  AND s.resource_type = $1 AND s.param_name = $2 AND s.%s %s $3
 		LIMIT %d
-	) t`, p.table, p.boundCol, p.op, probeCap)
+	) t`, p.table, p.boundCol, p.op, cap)
 	var n int
 	if err := pool.QueryRow(ctx, q, p.rt, p.param, p.bound).Scan(&n); err != nil {
 		return err
@@ -1949,11 +1991,11 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	// Two branches, keyed strictly on whether the probe hit the cap. The cap gives
 	// a lower bound only, never an upper one: a predicate matching most of the
 	// partition (e.g. value-quantity=le99999) hits it just the same as one matching
-	// exactly probeCap rows. So at the cap the recency walk is the only safe choice —
+	// exactly cap rows. So at the cap the recency walk is the only safe choice —
 	// materializing there would pull the whole match set (measured ~870ms / 41k
 	// buffers vs. ~1.6ms for the walk). Below the cap the true count is known and
 	// small, so the sp-first seek is pinned.
-	if n < probeCap {
+	if n < cap {
 		b.planDense = planSparse // sparse: pin the sp-first value-index seek
 	} else {
 		b.planDense = planDenseWalk // dense: recency walk, unconditionally
@@ -1973,7 +2015,7 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 	if maxN <= 0 {
 		maxN = 1
 	}
-	b := &queryBuilder{rt: "Observation", reg: s.registry, terminology: s.terminology, ctx: ctx}
+	b := s.newQueryBuilder(ctx, "Observation")
 	b.writeBase()
 	for k, vals := range params {
 		if k == "_sort" || k == "max" || k == "_count" || k == "_page" {
