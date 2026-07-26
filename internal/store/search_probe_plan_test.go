@@ -119,13 +119,15 @@ func TestSearch_DensityProbe_Plan(t *testing.T) {
 		}
 	})
 
-	t.Run("date dense stays unpinned for the recency walk", func(t *testing.T) {
-		// The probe hitting the cap must leave the fetch unpinned so the planner is
-		// free to take the early-exit recency walk on a large partition. We assert
-		// the scale-independent guarantees — dense verdict, no MATERIALIZED pin —
-		// not a specific index: on this tiny all-matching table a seq scan is
-		// legitimately cheaper than the walk, so pinning an index name would be
-		// flaky (cf. TestSearch_CompositeTokenQuantity_Plan).
+	t.Run("hitting the probe cap always walks, never materializes", func(t *testing.T) {
+		// Regression guard: the cap is a lower bound only, so a predicate matching
+		// most of the partition (here ~6001 of ~6002 date rows) hits it exactly like
+		// a borderline one. At the cap the verdict must be the recency walk
+		// unconditionally — materializing there would pull the whole match set
+		// (measured ~870ms / 41k buffers vs. ~1.6ms for the walk). We assert the
+		// scale-independent guarantees — dense verdict, no MATERIALIZED pin — not a
+		// specific index: on this tiny all-matching table a seq scan is legitimately
+		// cheaper than the walk, so pinning an index name would be flaky.
 		b, sql := build("Encounter", "date", "ge2019-01-01")
 		if b.planDense != planDenseWalk {
 			t.Fatalf("expected planDenseWalk, got %v", b.planDense)

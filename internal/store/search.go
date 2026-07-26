@@ -351,12 +351,6 @@ const (
 // comfortably under 10ms with no gray zone (design-addendum §3.2).
 const probeCap = 5000
 
-// grayZoneDensity is the partition-fraction threshold (§3.4) below which a
-// cap-sized match set is treated as the large-partition gray zone — the sp-first
-// materialize is pinned instead of the recency walk. At or above it the match is
-// dense enough that the walk fills a page quickly.
-const grayZoneDensity = 0.02
-
 // sortKey is one component of a _sort directive: the search param name and
 // whether the order is descending (the param was prefixed with '-').
 type sortKey struct {
@@ -1952,27 +1946,17 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	if err := pool.QueryRow(ctx, q, p.rt, p.param, p.bound).Scan(&n); err != nil {
 		return err
 	}
+	// Two branches, keyed strictly on whether the probe hit the cap. The cap gives
+	// a lower bound only, never an upper one: a predicate matching most of the
+	// partition (e.g. value-quantity=le99999) hits it just the same as one matching
+	// exactly probeCap rows. So at the cap the recency walk is the only safe choice —
+	// materializing there would pull the whole match set (measured ~870ms / 41k
+	// buffers vs. ~1.6ms for the walk). Below the cap the true count is known and
+	// small, so the sp-first seek is pinned.
 	if n < probeCap {
 		b.planDense = planSparse // sparse: pin the sp-first value-index seek
-		return nil
-	}
-	// Count hit the cap. Density-aware, not count-aware (§3.4): distinguish a
-	// genuinely dense small partition, where the recency walk fills a page in a few
-	// thousand entries, from the large-partition gray zone, where even a cap-sized
-	// match is a small fraction of the table and the sp-first materialize (~8ms)
-	// still beats the walk (25–30ms+). P is the partition-size proxy from
-	// pg_class.reltuples (whole-table here since sp tables are not partitioned by
-	// resource_type — an over-estimate of the (rt,param) partition, so this only
-	// switches to the walk once the whole table is small enough that cap is clearly
-	// dense). reltuples <= 0 means never-analyzed; fall back to the safe walk.
-	var reltuples float64
-	if err := pool.QueryRow(ctx, "SELECT reltuples FROM pg_class WHERE relname = $1", p.table).Scan(&reltuples); err != nil {
-		return err
-	}
-	if reltuples > 0 && float64(probeCap)/reltuples < grayZoneDensity {
-		b.planDense = planSparse // large-partition gray zone: pin the materialize
 	} else {
-		b.planDense = planDenseWalk // dense: the recency walk fills a page fast
+		b.planDense = planDenseWalk // dense: recency walk, unconditionally
 	}
 	return nil
 }
