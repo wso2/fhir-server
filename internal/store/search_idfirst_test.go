@@ -84,13 +84,17 @@ func TestFetchSQL_IdFirstGating(t *testing.T) {
 		wantIdFirst bool
 	}{
 		{"quantity uses id-first", "Observation", "value-quantity", "gt170", true},
-		{"token keeps ordered scan", "Observation", "code", "8302-2", false},
-		{"reference keeps ordered scan", "Observation", "subject", "Patient/123", false},
+		// token/reference equality now drive the sp-first ordered walk off their
+		// recency indexes (plan-selection standard §3.2).
+		{"token uses id-first", "Observation", "code", "8302-2", true},
+		{"reference uses id-first", "Observation", "subject", "Patient/123", true},
 		// sp_date joined the id-first family (design-addendum Phase 3.1) once it
 		// gained a last_updated recency column.
 		{"date uses id-first", "Observation", "date", "gt2020", true},
 		{"string keeps ordered scan", "Patient", "name", "Smith", false},
 		{"negated quantity keeps ordered scan", "Observation", "value-quantity:not", "gt170", false},
+		// :not token stays on the correlated path (negation cannot use the walk).
+		{"negated token keeps ordered scan", "Observation", "code:not", "8302-2", false},
 		{"plain browse keeps ordered scan", "Observation", "_lastUpdated", "gt2020", false},
 	}
 	for _, tc := range cases {
@@ -382,9 +386,10 @@ func TestFetchSQL_NoOrphanParams(t *testing.T) {
 	}
 }
 
-// directDrive engages only for a lone numeric predicate sorted by a resources
-// column. A token predicate (no id-first) and any multi-predicate search must not
-// qualify — they fall back to the ordered scan or the correlated id-first shape.
+// directDrive engages for a lone sp-drivable predicate sorted by a resources
+// column — numeric (quantity/number/date) or equality (token/reference). Any
+// multi-predicate search must not qualify — it falls back to the correlated
+// id-first shape.
 func TestDirectDriveGating(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -393,7 +398,7 @@ func TestDirectDriveGating(t *testing.T) {
 		wantCount  int
 	}{
 		{"sole quantity", [][2]string{{"value-quantity", "gt170"}}, true, 1},
-		{"sole token", [][2]string{{"code", "8302-2"}}, false, 1},
+		{"sole token", [][2]string{{"code", "8302-2"}}, true, 1},
 		{"quantity plus token", [][2]string{{"value-quantity", "gt170"}, {"code", "8302-2"}}, false, 2},
 		{"token+quantity composite (single-table drive)", [][2]string{{"code-value-quantity", "8480-6$gt110"}}, true, 1},
 	}

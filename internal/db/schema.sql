@@ -35,6 +35,22 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
 
+-- Query profiling (plan-selection standard §2): create the pg_stat_statements
+-- view so top-statement analysis works on any environment built from this schema.
+-- It only collects data when the library is preloaded (shared_preload_libraries,
+-- set in docker-compose.yml / the server config). Wrapped so a non-superuser role
+-- or an image without the extension files degrades to a NOTICE, not a failure.
+DO $pgss$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE NOTICE 'skipping CREATE EXTENSION pg_stat_statements (requires superuser); query profiling unavailable';
+    WHEN OTHERS THEN
+        RAISE NOTICE 'skipping pg_stat_statements: %', SQLERRM;
+END
+$pgss$;
+
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 2. Core resource storage
@@ -241,6 +257,10 @@ CREATE TABLE IF NOT EXISTS sp_number (
 CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
 CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 CREATE INDEX IF NOT EXISTS idx_sp_num_recent ON sp_number (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
+-- value_high family (ge / gt / eb) — the sp_number mirror of idx_sp_qty_high, so
+-- half-bounded high-side number searches seek instead of scanning the partition
+-- (plan-selection standard §4.3). value_low family already rides idx_sp_num_range.
+CREATE INDEX IF NOT EXISTS idx_sp_num_high   ON sp_number (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated);
 
 -- ─── sp_quantity ─────────────────────────────────────────────────────────────
 -- FHIR quantity search parameters.
@@ -409,8 +429,17 @@ CREATE TABLE IF NOT EXISTS sp_reference (
     identifier_system VARCHAR(512),
     identifier_value  VARCHAR(255),
     display           VARCHAR(255),
+    -- last_updated mirrors resources.last_updated so a single-value reference
+    -- search drives the sp-first ordered walk off idx_sp_ref_recent without a
+    -- resources lookup (plan-selection standard §2, §4.2).
+    last_updated      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
+-- Existing installs created before the recency column gain it here (CREATE TABLE
+-- IF NOT EXISTS above is a no-op on them). DEFAULT now() gives existing rows a
+-- reasonable ordering key; a migration wanting exact resources.last_updated runs
+-- the backfill UPDATE from the standard §4.2 as superuser.
+ALTER TABLE sp_reference ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, resource_id, resource_type, param_name, target_id);
 -- Search by target (e.g. ?patient=123): leading on target_id serves bare-id
@@ -418,6 +447,13 @@ CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, re
 CREATE INDEX IF NOT EXISTS idx_sp_ref_target_full ON sp_reference (tenant_id, target_id, target_type, param_name, resource_type, resource_id);
 -- The :identifier modifier (find references by Identifier value).
 CREATE INDEX IF NOT EXISTS idx_sp_ref_ident       ON sp_reference (tenant_id, target_type, identifier_system, identifier_value) WHERE identifier_value IS NOT NULL;
+-- Recency access path for the sp-first equality walk (§3.2): predicate columns
+-- (target_type, target_id) before last_updated so a scan seeks the reference and
+-- walks newest-first within only the matching entries, index-only. Partial on
+-- target_id IS NOT NULL to exclude external-URL rows, mirroring idx_sp_tok_recent.
+-- idx_sp_ref_target_full is kept — it leads with target_id for the different
+-- _include/_revinclude/$everything reverse-traversal access pattern.
+CREATE INDEX IF NOT EXISTS idx_sp_ref_recent      ON sp_reference (tenant_id, resource_type, param_name, target_type, target_id, last_updated DESC) INCLUDE (resource_id) WHERE target_id IS NOT NULL;
 
 -- ─── sp_coords ───────────────────────────────────────────────────────────────
 -- lat/lng for the Location.near search parameter.

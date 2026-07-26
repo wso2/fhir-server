@@ -351,6 +351,12 @@ const (
 // comfortably under 10ms with no gray zone (design-addendum §3.2).
 const probeCap = 5000
 
+// grayZoneDensity is the partition-fraction threshold (§3.4) below which a
+// cap-sized match set is treated as the large-partition gray zone — the sp-first
+// materialize is pinned instead of the recency walk. At or above it the match is
+// dense enough that the walk fills a page quickly.
+const grayZoneDensity = 0.02
+
 // sortKey is one component of a _sort directive: the search param name and
 // whether the order is descending (the param was prefixed with '-').
 type sortKey struct {
@@ -1281,32 +1287,61 @@ func (b *queryBuilder) buildStringExists(param, modifier, value string) string {
 	}
 }
 
+// captureEqualityDrive records a token/reference equality body so a lone such
+// predicate drives the sp-first ordered walk (§3.2/§3.3 of the plan-selection
+// standard) instead of a resources-first EXISTS: the predicate columns sit before
+// last_updated in the recency index, so a single scan seeks the value and walks
+// newest-first within only the matching entries — one plan, always optimal, no
+// probe. Guarded so nested predicates (composite / chained / _has, via
+// suppressDirectDrive) and the type-unknown heuristic path (resolvedParamType
+// returns "") never capture — a stray capture there would make directDrive emit
+// only this body and drop the surrounding structure. usesSP selects the id-first
+// fetch strategy; equality density is irrelevant so no density probe is set.
+func (b *queryBuilder) captureEqualityDrive(table, param, body string) {
+	if b.suppressDirectDrive {
+		return
+	}
+	pt := b.resolvedParamType(param)
+	if (table == "sp_token" && pt != "token") || (table == "sp_reference" && pt != "reference") {
+		return
+	}
+	b.numericTable = table
+	b.numericBodies = append(b.numericBodies, body)
+	b.usesSP = true
+}
+
 func (b *queryBuilder) buildTokenExists(param, modifier, value string) string {
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 	// :text matches the human-readable display/text of the token (case-insensitive
-	// substring), not its code.
+	// substring), not its code — a LIKE range scan, so it stays on the correlated
+	// path and is never captured for the equality walk.
 	if modifier == "text" {
 		vP := b.next("%" + strings.ToLower(value) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND LOWER(s.display) LIKE %s", rtP, pP, vP)
 	}
-	parts := strings.SplitN(value, "|", 2)
-	if len(parts) == 2 {
+	var cond string
+	if parts := strings.SplitN(value, "|", 2); len(parts) == 2 {
 		sys, code := parts[0], parts[1]
-		if sys == "" {
-			cP := b.next(code)
-			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, cP)
-		}
-		if code == "" {
+		switch {
+		case sys == "":
+			cond = fmt.Sprintf("s.code = %s", b.next(code))
+		case code == "":
+			cond = fmt.Sprintf("s.system = %s", b.next(sys))
+		default:
 			sP := b.next(sys)
-			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s", rtP, pP, sP)
+			cP := b.next(code)
+			cond = fmt.Sprintf("s.system = %s AND s.code = %s", sP, cP)
 		}
-		sP := b.next(sys)
-		cP := b.next(code)
-		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s AND s.code = %s", rtP, pP, sP, cP)
+	} else {
+		cond = fmt.Sprintf("s.code = %s", b.next(value))
 	}
-	vP := b.next(value)
-	return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, vP)
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone token equality search drives the
+	// sp-first walk off idx_sp_tok_recent. The explicit s.tenant_id below (also on
+	// the captured side, added by directDriveSQL) satisfies §3.5.
+	b.captureEqualityDrive("sp_token", param, body)
+	return "SELECT 1 FROM sp_token s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildTokenInExists expands a ValueSet URL and builds an IN/NOT IN subquery
@@ -1508,18 +1543,30 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	if eps == 0 {
 		eps = 1e-7
 	}
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 	var cond string
-	switch prefix {
-	case "gt":
-		cond = fmt.Sprintf("s.value_high > %s", b.next(f))
-	case "lt":
-		cond = fmt.Sprintf("s.value_low < %s", b.next(f))
-	default: // eq
-		highP := b.next(f + eps)
-		lowP := b.next(f - eps)
-		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
+	if col, op, useHigh, ok := halfBoundedColOp(prefix); ok {
+		// Half-bounded: collapse to the scalar on the correct bound column and set
+		// the density probe, exactly like sp_quantity (§3.1/§3.4). Previously ge/le/
+		// sa/eb fell through to the eq overlap — a latent correctness gap.
+		bound := low
+		if useHigh {
+			bound = high
+		}
+		cond = fmt.Sprintf("s.%s %s %s", col, op, b.next(bound))
+		if !b.suppressDirectDrive {
+			b.probe = &densityProbe{table: "sp_number", boundCol: col, op: op, rt: b.rt, param: param, bound: bound}
+		}
+	} else if prefix == "ne" {
+		hP := b.next(high)
+		lP := b.next(low)
+		cond = fmt.Sprintf("NOT (s.value_low <= %s AND s.value_high >= %s)", hP, lP)
+	} else { // eq, ap — doubly bounded interval overlap
+		hP := b.next(high)
+		lP := b.next(low)
+		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", hP, lP)
 	}
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
 	// Capture the correlation-free body so a lone number predicate can drive the
@@ -1529,7 +1576,7 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 		b.numericTable = "sp_number"
 		b.numericBodies = append(b.numericBodies, body)
 	}
-	return "SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND " + body
+	return "SELECT 1 FROM sp_number s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildReferenceExists matches a reference param against sp_reference. It accepts
@@ -1559,13 +1606,21 @@ func (b *queryBuilder) buildReferenceExists(param, modifier, value string) strin
 		// e.g. subject:Patient=123 — the modifier names the target type.
 		typ = modifier
 	}
+	var cond string
 	if typ != "" {
 		tP := b.next(typ)
 		iP := b.next(id)
-		return fmt.Sprintf("SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.target_type = %s AND s.target_id = %s", rtP, pP, tP, iP)
+		cond = fmt.Sprintf("s.target_type = %s AND s.target_id = %s", tP, iP)
+	} else {
+		cond = fmt.Sprintf("s.target_id = %s", b.next(id))
 	}
-	iP := b.next(id)
-	return fmt.Sprintf("SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.target_id = %s", rtP, pP, iP)
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone reference search drives the
+	// sp-first walk off idx_sp_ref_recent (typed form seeks target_type/target_id
+	// then walks last_updated). :identifier above stays on the correlated path —
+	// it matches identifier_system/value on a different index.
+	b.captureEqualityDrive("sp_reference", param, body)
+	return "SELECT 1 FROM sp_reference s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildQuantityExists matches a quantity param against sp_quantity. The value is
@@ -1897,10 +1952,27 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	if err := pool.QueryRow(ctx, q, p.rt, p.param, p.bound).Scan(&n); err != nil {
 		return err
 	}
-	if n >= probeCap {
-		b.planDense = planDenseWalk // dense: the recency walk fills a page fast
-	} else {
+	if n < probeCap {
 		b.planDense = planSparse // sparse: pin the sp-first value-index seek
+		return nil
+	}
+	// Count hit the cap. Density-aware, not count-aware (§3.4): distinguish a
+	// genuinely dense small partition, where the recency walk fills a page in a few
+	// thousand entries, from the large-partition gray zone, where even a cap-sized
+	// match is a small fraction of the table and the sp-first materialize (~8ms)
+	// still beats the walk (25–30ms+). P is the partition-size proxy from
+	// pg_class.reltuples (whole-table here since sp tables are not partitioned by
+	// resource_type — an over-estimate of the (rt,param) partition, so this only
+	// switches to the walk once the whole table is small enough that cap is clearly
+	// dense). reltuples <= 0 means never-analyzed; fall back to the safe walk.
+	var reltuples float64
+	if err := pool.QueryRow(ctx, "SELECT reltuples FROM pg_class WHERE relname = $1", p.table).Scan(&reltuples); err != nil {
+		return err
+	}
+	if reltuples > 0 && float64(probeCap)/reltuples < grayZoneDensity {
+		b.planDense = planSparse // large-partition gray zone: pin the materialize
+	} else {
+		b.planDense = planDenseWalk // dense: the recency walk fills a page fast
 	}
 	return nil
 }
@@ -2196,13 +2268,25 @@ func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) s
 // building; only limit/offset/rt are appended here.
 func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) string {
 	selectList := []string{"s.resource_id AS fhir_id"}
+	colAliases := []string{"fhir_id"}
 	var innerOrder, outerOrder []string
 	for i, t := range terms {
 		alias := fmt.Sprintf("sort%d", i)
 		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
+		colAliases = append(colAliases, alias)
 		innerOrder = append(innerOrder, alias+" "+t.dir)
 		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
 	}
+
+	// Multi-value equality search (token/reference comma list): per-value ordered
+	// walks UNION ALL'd, deduped, re-limited (§3.3). Never OR-of-bodies — Postgres
+	// cannot semi-join that and scans every matching sp row upfront. Each branch
+	// seeks one value on idx_sp_tok_recent / idx_sp_ref_recent and walks
+	// newest-first, so it touches ~page-size index-only entries.
+	if len(b.numericBodies) > 1 && isEqualityDriveTable(b.numericTable) {
+		return b.equalityUnionSQL(selectList, colAliases, innerOrder, outerOrder, limit, offset)
+	}
+
 	match := b.numericBodies[0]
 	if len(b.numericBodies) > 1 {
 		match = "(" + strings.Join(b.numericBodies, " OR ") + ")"
@@ -2272,6 +2356,57 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 		ORDER BY %s`,
 		strings.Join(selectList, ", "),
 		b.numericTable, match,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
+		b.rtParam,
+		strings.Join(outerOrder, ", "),
+	)
+}
+
+// isEqualityDriveTable reports whether a captured sp table is equality-shaped
+// (token/reference). These get the multi-value UNION ALL walk (§3.3); the range
+// tables (quantity/number/date) keep the OR-of-bodies form, which the density
+// probe never routes through anyway.
+func isEqualityDriveTable(table string) bool {
+	return table == "sp_token" || table == "sp_reference"
+}
+
+// equalityUnionSQL emits the §3.3 multi-value equality shape: one ordered,
+// per-value index walk per comma value, UNION ALL'd, deduped by fhir_id, then
+// re-sorted and paginated before the resources join. Each branch fetches up to
+// limit+offset rows (enough to satisfy the page after dedup); the DISTINCT ON
+// picks one row per resource (sort keys are equal across branches for the same
+// resource, so the arbitrary pick is deterministic in value), and the outer
+// sort+limit yields the page. The numericBodies reuse the $N args already bound;
+// only the per-branch limit, page limit, and offset are appended here. b.rtParam
+// is reused in the join so writeBase's $1 is not orphaned.
+func (b *queryBuilder) equalityUnionSQL(selectList, colAliases, innerOrder, outerOrder []string, limit, offset int) string {
+	perBranchP := b.next(limit + offset)
+	branches := make([]string, len(b.numericBodies))
+	for i, body := range b.numericBodies {
+		branches[i] = fmt.Sprintf(
+			"(SELECT %s FROM %s s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s ORDER BY %s LIMIT %s)",
+			strings.Join(selectList, ", "), b.numericTable, body, strings.Join(innerOrder, ", "), perBranchP)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+	return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT %s FROM (
+				SELECT DISTINCT ON (fhir_id) %s
+				FROM ( %s ) u
+				ORDER BY fhir_id
+			) d
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+			AND r.is_deleted = FALSE
+		ORDER BY %s`,
+		strings.Join(colAliases, ", "),
+		strings.Join(colAliases, ", "),
+		strings.Join(branches, " UNION ALL "),
 		strings.Join(innerOrder, ", "), limitP, offsetP,
 		b.rtParam,
 		strings.Join(outerOrder, ", "),

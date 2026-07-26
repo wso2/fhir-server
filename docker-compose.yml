@@ -1,6 +1,14 @@
 services:
   db:
     image: postgres:18-alpine
+    # Preload pg_stat_statements so the query-profiling view collects data; the
+    # extension itself is created by schema.sql (plan-selection standard §2).
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
     environment:
       POSTGRES_DB: fhirdb
       POSTGRES_USER: fhir

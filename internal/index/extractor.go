@@ -191,7 +191,7 @@ func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string
 	case "uri":
 		queueURI(batch, resourceType, resourceID, d.ParamName, vals)
 	case "reference":
-		queueReference(batch, resourceType, resourceID, d.ParamName, vals)
+		queueReference(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "composite":
 		// vals are the composite's element instances: the FHIRPath root expression
 		// (e.g. Observation, or Observation.component) evaluated against the
@@ -642,17 +642,19 @@ func queueURI(batch *pgx.Batch, rt, rid, param string, vals []any) {
 
 // ─── sp_reference ─────────────────────────────────────────────────────────────
 
-func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		m, ok := v.(map[string]any)
 		if !ok {
 			// May be a plain reference string
 			if s := asString(v); s != "" {
 				tType, tID := parseRefString(s)
+				// last_updated mirrors resources.last_updated so the sp-first
+				// reference walk sorts candidates from idx_sp_ref_recent directly.
 				batch.Queue(
-					`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value)
-					 VALUES ($1, $2, $3, $4, $5, '', '')`,
-					rid, rt, param, tType, tID,
+					`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value, last_updated)
+					 VALUES ($1, $2, $3, $4, $5, '', '', $6)`,
+					rid, rt, param, tType, tID, lastUpdated,
 				)
 			}
 			continue
@@ -667,9 +669,9 @@ func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any) {
 		}
 
 		batch.Queue(
-			`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			rid, rt, param, tType, tID, idSys, idVal,
+			`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value, last_updated)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			rid, rt, param, tType, tID, idSys, idVal, lastUpdated,
 		)
 	}
 }
