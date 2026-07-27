@@ -162,15 +162,40 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 		return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
 	}
 
+	// A resource created by a POST can have its resources row buffered for a
+	// batched COPY only if no later entry reads it back within this transaction
+	// (an instance GET, or a PUT/PATCH/DELETE targeting the same id). readSet
+	// collects those read/mutate targets so a created row that something observes
+	// is written immediately instead.
+	readSet := make(map[string]bool)
+	for i := range ops {
+		o := ops[i]
+		if o.skip || o.id == "" {
+			continue
+		}
+		switch o.method {
+		case "GET", "PUT", "PATCH", "DELETE":
+			readSet[o.resourceType+"/"+o.id] = true
+		}
+	}
+
+	w := s.newBundleWriter(ctx)
 	results := make([]BundleEntryResult, len(ops))
 	for _, idx := range order {
 		op := ops[idx]
-		res, berr := s.execOpInTx(ctx, tx, op)
+		deferResource := op.method == "POST" && op.id != "" && !readSet[op.resourceType+"/"+op.id]
+		res, berr := s.execOpInTx(ctx, tx, op, w, deferResource)
 		if berr != nil {
 			berr.EntryIndex = op.origIndex
 			return nil, berr // defer rolls the whole transaction back
 		}
 		results[op.origIndex] = res
+	}
+
+	// Flush the whole bundle's buffered index, resources, and history writes as a
+	// handful of COPY / batched-DELETE statements before COMMIT.
+	if err := w.flush(ctx, tx); err != nil {
+		return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -185,8 +210,8 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 // result with the interaction's method/type/id so the caller can run post-commit
 // maintenance (e.g. SearchParameter registry sync) uniformly. A returned
 // *BundleError aborts (and rolls back) the whole transaction.
-func (s *Store) execOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEntryResult, *BundleError) {
-	res, berr := s.runOpInTx(ctx, tx, op)
+func (s *Store) execOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp, w *bundleWriter, deferResource bool) (BundleEntryResult, *BundleError) {
+	res, berr := s.runOpInTx(ctx, tx, op, w, deferResource)
 	if berr != nil {
 		return res, berr
 	}
@@ -203,8 +228,10 @@ func (s *Store) execOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleE
 	return res, nil
 }
 
-// runOpInTx executes a single planned op against the open transaction.
-func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEntryResult, *BundleError) {
+// runOpInTx executes a single planned op against the open transaction. Index,
+// history, and (when deferResource is set) resources writes are buffered into w
+// for the bundle-level batched flush.
+func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp, w *bundleWriter, deferResource bool) (BundleEntryResult, *BundleError) {
 	if op.skip {
 		return BundleEntryResult{
 			Status:   op.skipStatus,
@@ -214,7 +241,7 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEn
 
 	switch op.method {
 	case "POST":
-		res, err := s.createInTx(ctx, tx, op.resourceType, op.body)
+		res, err := s.createInTx(ctx, tx, op.resourceType, op.body, w, deferResource)
 		if err != nil {
 			return BundleEntryResult{}, storeErrToBundleErr(err)
 		}
@@ -227,14 +254,16 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEn
 		}, nil
 
 	case "PUT":
-		res, err := s.updateInTx(ctx, tx, op.resourceType, op.id, op.body, op.ifMatch)
+		res, err := s.updateInTx(ctx, tx, op.resourceType, op.id, op.body, op.ifMatch, w)
 		if err != nil {
 			// A conditional update that matched zero resources creates the target;
 			// a plain PUT to a missing id is a 404 (the server does not do
 			// update-as-create), which in a transaction rolls everything back.
 			if _, ok := err.(NotFoundError); ok && op.allowCreate {
 				op.body["id"] = op.id
-				cres, cerr := s.createInTx(ctx, tx, op.resourceType, op.body)
+				// Write this created row immediately (deferResource=false): the
+				// conditional target id may be referenced by a later entry.
+				cres, cerr := s.createInTx(ctx, tx, op.resourceType, op.body, w, false)
 				if cerr != nil {
 					return BundleEntryResult{}, storeErrToBundleErr(cerr)
 				}
@@ -257,7 +286,7 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEn
 		}, nil
 
 	case "PATCH":
-		res, _, err := s.patchInTx(ctx, tx, op.resourceType, op.id, op.body)
+		res, _, err := s.patchInTx(ctx, tx, op.resourceType, op.id, op.body, w)
 		if err != nil {
 			return BundleEntryResult{}, storeErrToBundleErr(err)
 		}
@@ -270,7 +299,7 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp) (BundleEn
 		}, nil
 
 	case "DELETE":
-		if err := s.deleteInTx(ctx, tx, op.resourceType, op.id); err != nil {
+		if err := s.deleteInTx(ctx, tx, op.resourceType, op.id, w); err != nil {
 			if _, ok := err.(NotFoundError); ok {
 				// Deleting something that does not exist is a no-op success.
 				return BundleEntryResult{Status: "204 No Content"}, nil
@@ -348,10 +377,18 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 			results[i] = batchFailure(&BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: txerr.Error()})
 			continue
 		}
-		res, berr := s.execOpInTx(ctx, tx, op)
+		// Each batch entry is its own transaction, so it uses its own writer and,
+		// like a single create, writes any resources row immediately.
+		w := s.newBundleWriter(ctx)
+		res, berr := s.execOpInTx(ctx, tx, op, w, false)
 		if berr != nil {
 			tx.Rollback(ctx)
 			results[i] = batchFailure(berr)
+			continue
+		}
+		if ferr := w.flush(ctx, tx); ferr != nil {
+			tx.Rollback(ctx)
+			results[i] = batchFailure(&BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: ferr.Error()})
 			continue
 		}
 		if cerr := tx.Commit(ctx); cerr != nil {
@@ -519,21 +556,27 @@ func (s *Store) ConditionalMatch(ctx context.Context, resourceType, rawQuery str
 	return s.conditionalMatch(ctx, resourceType, rawQuery)
 }
 
-// conditionalMatch runs a search and returns the single matched id (if count==1),
-// the total match count, and any error.
+// conditionalMatch runs a search and returns the single matched id (if count==1)
+// and the number of matches, capped at 2. FHIR's conditional create/update/delete
+// decision needs only whether zero, exactly one, or more than one resource
+// matches, so this fetches at most two rows (PageSize 2) with Total="none" —
+// skipping the exact COUNT(*) that would otherwise scan the entire match set.
+// The returned count is therefore 0, 1, or 2 (2 meaning "more than one"), which
+// the callers already branch on (>1 → 412, ==1 → reuse/target, ==0 → create).
 func (s *Store) conditionalMatch(ctx context.Context, resourceType, rawQuery string) (id string, count int, err error) {
 	q, perr := url.ParseQuery(rawQuery)
 	if perr != nil {
 		return "", 0, perr
 	}
-	result, serr := s.Search(ctx, SearchParams{ResourceType: resourceType, Params: valuesToMap(q), PageSize: 2})
+	result, serr := s.Search(ctx, SearchParams{ResourceType: resourceType, Params: valuesToMap(q), PageSize: 2, Total: "none"})
 	if serr != nil {
 		return "", 0, serr
 	}
-	if result.Total == 1 && len(result.Entries) == 1 {
+	count = len(result.Entries)
+	if count == 1 {
 		id, _ = result.Entries[0]["id"].(string)
 	}
-	return id, result.Total, nil
+	return id, count, nil
 }
 
 // ─── URL / reference helpers ───────────────────────────────────────────────────

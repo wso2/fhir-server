@@ -122,7 +122,54 @@ been reintroduced (see §2). Confirm plan shape with `EXPLAIN (ANALYZE, BUFFERS)
 the tenant GUC set: the sparse case should ride `idx_sp_qty_high` under a
 `MATERIALIZED` CTE; the dense case should be a recency walk with no `MATERIALIZED`.
 
-## 5. Reserved keys (roadmap — not yet implemented)
+## 5. Bulk import & the write path
+
+The search sections above tune reads. Transaction-bundle import is the hot write
+path, and it has its own rules. Index and history writes for a whole bundle are
+batched: each entry's sp\_\* rows are accumulated in one transaction and flushed as
+a handful of multi-row `INSERT`s (plus one re-index `DELETE` per sp table),
+instead of one round trip per row. That collapses a ~1,000-entry bundle from
+~13k single-row statements to a few dozen. Two consequences to tune for:
+
+### `SERVER_WRITE_TIMEOUT` must exceed the worst-case bundle import
+
+A transaction bundle is **one** DB transaction and **one** HTTP handler
+invocation, so `SERVER_WRITE_TIMEOUT` (`server.writeTimeout`, default **60s**)
+bounds the entire import. If a large bundle's import can exceed it, the server
+kills the handler mid-flight — the client sees a connection reset (EOF) and the
+transaction rolls back, wasting the whole attempt. Size the timeout above your
+largest expected bundle's import time with headroom; for dedicated import windows
+(multi-thousand-entry bundles, many concurrent loaders) `SERVER_WRITE_TIMEOUT=300s`
+is a reasonable starting point. This is a ceiling, not a target: normal small
+writes are unaffected.
+
+### Autovacuum interacts with bulk import — post-load `VACUUM (ANALYZE)` is mandatory
+
+The aggressive per-table autovacuum thresholds from §3
+(`autovacuum_vacuum_scale_factor = 0.02` / `autovacuum_analyze_scale_factor = 0.01`)
+keep the visibility map and statistics fresh for the index-only read fast paths.
+A bulk import inserts far faster than autovacuum can keep up, so immediately after
+a load the visibility map is stale (index-only scans degrade ~2x) and planner
+statistics lag the new row counts (misestimated plans). **After any bulk import,
+run `VACUUM (ANALYZE)` on `resources` and every sp table before measuring or
+serving read traffic** — this is not optional, and it is the same requirement
+called out in §3. Each `VACUUM`/`ANALYZE` runs as its own statement (never inside
+a transaction).
+
+### Optional: `synchronous_commit = off` for import-only environments
+
+For a throwaway or reloadable import environment, setting
+`synchronous_commit = off` lets commits return without waiting for WAL flush to
+disk, which materially speeds up a write-heavy import. **The tradeoff is a
+data-loss window:** on an OS/hardware crash the most recent committed transactions
+can be lost (the database stays *consistent* — this is not corruption — but
+acknowledged writes may vanish). Never default it, and never enable it where an
+acknowledged write must survive a crash (i.e. any environment holding real
+patient data). Scope it as tightly as possible — e.g. per-session
+`SET synchronous_commit = off` on the import connection — and turn it off again
+before the environment takes production traffic.
+
+## 6. Reserved keys (roadmap — not yet implemented)
 
 Reserved so future work does not collide with these names:
 

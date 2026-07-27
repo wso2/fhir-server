@@ -21,7 +21,6 @@ package index
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math"
 	"strconv"
 	"strings"
@@ -42,77 +41,69 @@ func New(registry *searchparam.Registry) *Extractor {
 	return &Extractor{registry: registry}
 }
 
-// Index extracts all search parameter values from resource and inserts them
-// into the sp_* tables within tx using a single batched round-trip.
+// Index extracts all search parameter values from resource and writes them to
+// the sp_* tables within tx. It builds a single-resource RowSet and flushes it
+// via the batched COPY path, so the standalone indexer shares one write
+// implementation with the CRUD and bundle paths.
 func (e *Extractor) Index(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) error {
-	slog.Debug("Starting index extraction", "resourceType", resourceType, "resourceID", resourceID)
-	batch := &pgx.Batch{}
+	var tenant string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('app.current_tenant', true)`).Scan(&tenant); err != nil {
+		return fmt.Errorf("resolve tenant for index: %w", err)
+	}
+	rs := NewRowSet(tenant)
+	e.Extract(rs, resourceType, resourceID, resource, lastUpdated)
+	return rs.Flush(ctx, tx)
+}
 
+// Extract appends all search parameter rows for the given resource to rs without
+// writing them. The caller flushes rs (RowSet.Flush) once per transaction, so
+// index writes for every resource in a bundle collapse into a handful of COPY
+// statements. Replaces the former per-row INSERT batch.
+func (e *Extractor) Extract(rs *RowSet, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) {
 	defs := e.registry.ForResource(resourceType)
 	for _, d := range defs {
-		e.queueParam(batch, resourceType, resourceID, resource, d, lastUpdated)
+		e.appendParam(rs, resourceType, resourceID, resource, d, lastUpdated)
 	}
 	// Universal meta.* params (_tag/_security/_profile/_source) and the
 	// resource-level language. These live on Resource/DomainResource and so
 	// aren't in the per-resource registry; index them uniformly for every type.
-	queueMeta(batch, resourceType, resourceID, resource, lastUpdated)
-
-	if batch.Len() == 0 {
-		return nil
-	}
-
-	br := tx.SendBatch(ctx, batch)
-	n := batch.Len()
-	slog.Debug("sending index batch", "batchSize", n, "resourceType", resourceType)
-	for i := 0; i < n; i++ {
-		if _, err := br.Exec(); err != nil {
-			slog.Warn("index batch exec failed", "type", resourceType, "i", i, "err", err)
-			// Non-fatal — continue draining the batch
-		}
-	}
-	return br.Close()
+	appendMeta(rs, resourceType, resourceID, resource, lastUpdated)
 }
 
-// queueMeta queues sp_* rows for the universal meta search params:
+// appendMeta appends sp_* rows for the universal meta search params:
 //
 //	_tag, _security  → sp_token  (Codings from meta.tag / meta.security)
 //	_profile, _source → sp_uri   (meta.profile URLs, meta.source URI)
 //	_language        → sp_token  (top-level language code)
-func queueMeta(batch *pgx.Batch, rt, rid string, resource map[string]any, lastUpdated time.Time) {
+func appendMeta(rs *RowSet, rt, rid string, resource map[string]any, lastUpdated time.Time) {
 	if meta, ok := resource["meta"].(map[string]any); ok {
 		for _, m := range []struct{ field, param string }{{"tag", "_tag"}, {"security", "_security"}} {
 			if arr, ok := meta[m.field].([]any); ok {
 				for _, c := range arr {
-					queueToken(batch, rt, rid, m.param, c, lastUpdated)
+					appendToken(rs, rt, rid, m.param, c, lastUpdated)
 				}
 			}
 		}
 		if arr, ok := meta["profile"].([]any); ok {
 			for _, p := range arr {
-				queueURIValue(batch, rt, rid, "_profile", asString(p))
+				appendURIValue(rs, rt, rid, "_profile", asString(p))
 			}
 		}
-		queueURIValue(batch, rt, rid, "_source", asString(meta["source"]))
+		appendURIValue(rs, rt, rid, "_source", asString(meta["source"]))
 	}
 	if lang := asString(resource["language"]); lang != "" {
-		batch.Queue(
-			`INSERT INTO sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
-			 VALUES ($1, $2, '_language', '', $3, '', $4)`,
-			rid, rt, lang, lastUpdated,
-		)
+		// sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
+		// with param_name '_language', empty system/display, code = lang.
+		rs.spToken = append(rs.spToken, []any{rs.tenant, rid, rt, "_language", "", lang, "", lastUpdated})
 	}
 }
 
-// queueURIValue queues a single sp_uri row, skipping empty values.
-func queueURIValue(batch *pgx.Batch, rt, rid, param, value string) {
+// appendURIValue appends a single sp_uri row, skipping empty values.
+func appendURIValue(rs *RowSet, rt, rid, param, value string) {
 	if value == "" {
 		return
 	}
-	batch.Queue(
-		`INSERT INTO sp_uri (resource_id, resource_type, param_name, value)
-		 VALUES ($1, $2, $3, $4)`,
-		rid, rt, param, value,
-	)
+	rs.spURI = append(rs.spURI, []any{rs.tenant, rid, rt, param, value})
 }
 
 // Delete removes all sp_* rows for a resource in a single batched round-trip.
@@ -135,28 +126,6 @@ func Delete(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) err
 	return br.Close()
 }
 
-// Queue adds all search parameter insert statements for the given resource to
-// an external batch without sending it. The caller is responsible for sending
-// and draining the batch. This allows callers to merge index inserts with other
-// write operations into a single round-trip.
-func (e *Extractor) Queue(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) {
-	defs := e.registry.ForResource(resourceType)
-	for _, d := range defs {
-		e.queueParam(batch, resourceType, resourceID, resource, d, lastUpdated)
-	}
-	queueMeta(batch, resourceType, resourceID, resource, lastUpdated)
-}
-
-// QueueDelete adds one DELETE statement per sp_* table for the given resource
-// to an external batch without sending it. Returns the number of statements queued.
-func QueueDelete(batch *pgx.Batch, resourceType, resourceID string) int {
-	tables := []string{"sp_string", "sp_token", "sp_date", "sp_number", "sp_quantity", "sp_uri", "sp_reference", "sp_composite_token_quantity"}
-	for _, tbl := range tables {
-		batch.Queue(fmt.Sprintf(`DELETE FROM %s WHERE resource_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true)`, tbl), resourceID, resourceType)
-	}
-	return len(tables)
-}
-
 // DeleteWithPool removes all sp_* rows using a pool (for soft-delete paths
 // where no transaction is provided yet).
 func DeleteWithPool(ctx context.Context, pool *pgxpool.Pool, resourceType, resourceID string) error {
@@ -171,7 +140,7 @@ func DeleteWithPool(ctx context.Context, pool *pgxpool.Pool, resourceType, resou
 	return tx.Commit(ctx)
 }
 
-func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string, resource map[string]any, d searchparam.Definition, lastUpdated time.Time) {
+func (e *Extractor) appendParam(rs *RowSet, resourceType, resourceID string, resource map[string]any, d searchparam.Definition, lastUpdated time.Time) {
 	vals, err := fhirpath.EvaluatePolymorphic(d.FHIRPath, resource)
 	if err != nil || len(vals) == 0 {
 		return
@@ -179,76 +148,64 @@ func (e *Extractor) queueParam(batch *pgx.Batch, resourceType, resourceID string
 
 	switch d.ParamType {
 	case "string":
-		queueString(batch, resourceType, resourceID, d.ParamName, vals)
+		appendString(rs, resourceType, resourceID, d.ParamName, vals)
 	case "token":
-		queueTokenValues(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
+		appendTokenValues(rs, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "date", "dateTime", "instant", "Period":
-		queueDate(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
+		appendDate(rs, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "number":
-		queueNumber(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
+		appendNumber(rs, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "quantity":
-		queueQuantity(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
+		appendQuantity(rs, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "uri":
-		queueURI(batch, resourceType, resourceID, d.ParamName, vals)
+		appendURI(rs, resourceType, resourceID, d.ParamName, vals)
 	case "reference":
-		queueReference(batch, resourceType, resourceID, d.ParamName, vals, lastUpdated)
+		appendReference(rs, resourceType, resourceID, d.ParamName, vals, lastUpdated)
 	case "composite":
 		// vals are the composite's element instances: the FHIRPath root expression
 		// (e.g. Observation, or Observation.component) evaluated against the
-		// resource. queueComposite pairs the two component values WITHIN each
+		// resource. appendComposite pairs the two component values WITHIN each
 		// element so multi-component resources don't cross-match (FHIR composite
 		// semantics). Only token+quantity composites are materialised here; other
 		// component-type pairs keep the legacy query-time EXISTS path.
-		e.queueComposite(batch, resourceType, resourceID, d, vals, lastUpdated)
+		e.appendComposite(rs, resourceType, resourceID, d, vals, lastUpdated)
 	}
 }
 
 // ─── sp_string ────────────────────────────────────────────────────────────────
 
-func queueString(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func appendString(rs *RowSet, rt, rid, param string, vals []any) {
 	for _, v := range vals {
 		s := asString(v)
 		if s == "" {
 			continue
 		}
-		batch.Queue(
-			`INSERT INTO sp_string (resource_id, resource_type, param_name, value_exact, value_lower)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			rid, rt, param, s, strings.ToLower(s),
-		)
+		rs.spString = append(rs.spString, []any{rs.tenant, rid, rt, param, s, strings.ToLower(s)})
 	}
 }
 
 // ─── sp_token ─────────────────────────────────────────────────────────────────
 
-func queueTokenValues(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
+func appendTokenValues(rs *RowSet, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		switch val := v.(type) {
 		case map[string]any: // Coding or CodeableConcept
 			if codings, ok := val["coding"].([]any); ok {
 				for _, c := range codings {
-					queueToken(batch, rt, rid, param, c, lastUpdated)
+					appendToken(rs, rt, rid, param, c, lastUpdated)
 				}
 			} else {
 				// Plain Coding
-				queueToken(batch, rt, rid, param, val, lastUpdated)
+				appendToken(rs, rt, rid, param, val, lastUpdated)
 			}
 		case bool:
 			code := "false"
 			if val {
 				code = "true"
 			}
-			batch.Queue(
-				`INSERT INTO sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
-				 VALUES ($1, $2, $3, '', $4, '', $5)`,
-				rid, rt, param, code, lastUpdated,
-			)
+			rs.spToken = append(rs.spToken, []any{rs.tenant, rid, rt, param, "", code, "", lastUpdated})
 		case string:
-			batch.Queue(
-				`INSERT INTO sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
-				 VALUES ($1, $2, $3, '', $4, '', $5)`,
-				rid, rt, param, val, lastUpdated,
-			)
+			rs.spToken = append(rs.spToken, []any{rs.tenant, rid, rt, param, "", val, "", lastUpdated})
 		}
 	}
 }
@@ -258,7 +215,7 @@ func queueTokenValues(batch *pgx.Batch, rt, rid, param string, vals []any, lastU
 // coding (system, code) plus the identifier value in the display column.
 const OfTypeSuffix = ":of-type"
 
-func queueToken(batch *pgx.Batch, rt, rid, param string, v any, lastUpdated time.Time) {
+func appendToken(rs *RowSet, rt, rid, param string, v any, lastUpdated time.Time) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return
@@ -275,11 +232,7 @@ func queueToken(batch *pgx.Batch, rt, rid, param string, v any, lastUpdated time
 	if code == "" {
 		return
 	}
-	batch.Queue(
-		`INSERT INTO sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		rid, rt, param, sys, code, display, lastUpdated,
-	)
+	rs.spToken = append(rs.spToken, []any{rs.tenant, rid, rt, param, sys, code, display, lastUpdated})
 
 	// :of-type support — only for Identifiers that carry a type.coding and a value.
 	// Store an auxiliary row keyed by "<param>:of-type" with the type's
@@ -297,11 +250,7 @@ func queueToken(batch *pgx.Batch, rt, rid, param string, v any, lastUpdated time
 					if tCode == "" {
 						continue
 					}
-					batch.Queue(
-						`INSERT INTO sp_token (resource_id, resource_type, param_name, system, code, display, last_updated)
-						 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-						rid, rt, param+OfTypeSuffix, tSys, tCode, value, lastUpdated,
-					)
+					rs.spToken = append(rs.spToken, []any{rs.tenant, rid, rt, param + OfTypeSuffix, tSys, tCode, value, lastUpdated})
 				}
 			}
 		}
@@ -310,7 +259,7 @@ func queueToken(batch *pgx.Batch, rt, rid, param string, v any, lastUpdated time
 
 // ─── sp_date ──────────────────────────────────────────────────────────────────
 
-func queueDate(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
+func appendDate(rs *RowSet, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		low, high, err := parseDateRange(v)
 		if err != nil {
@@ -318,11 +267,7 @@ func queueDate(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated 
 		}
 		// last_updated mirrors resources.last_updated so the id-first date fetch can
 		// sort candidates from idx_sp_date_recent without a resources lookup.
-		batch.Queue(
-			`INSERT INTO sp_date (resource_id, resource_type, param_name, value_low, value_high, last_updated)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			rid, rt, param, low, high, lastUpdated,
-		)
+		rs.spDate = append(rs.spDate, []any{rs.tenant, rid, rt, param, low, high, lastUpdated})
 	}
 }
 
@@ -410,7 +355,7 @@ func expandDateString(s string) (low, high time.Time, err error) {
 
 // ─── sp_number ────────────────────────────────────────────────────────────────
 
-func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
+func appendNumber(rs *RowSet, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		f, ok := toFloat(v)
 		if !ok {
@@ -420,17 +365,13 @@ func queueNumber(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdate
 		eps := math.Abs(f) * 1e-7
 		// last_updated mirrors resources.last_updated so the id-first fetch can
 		// sort candidates from idx_sp_num_range without a resources lookup.
-		batch.Queue(
-			`INSERT INTO sp_number (resource_id, resource_type, param_name, value, value_low, value_high, last_updated)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			rid, rt, param, f, f-eps, f+eps, lastUpdated,
-		)
+		rs.spNumber = append(rs.spNumber, []any{rs.tenant, rid, rt, param, f, f - eps, f + eps, lastUpdated})
 	}
 }
 
 // ─── sp_quantity ──────────────────────────────────────────────────────────────
 
-func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
+func appendQuantity(rs *RowSet, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		m, ok := v.(map[string]any)
 		if !ok {
@@ -445,11 +386,7 @@ func queueQuantity(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpda
 		low, high := precisionRange(f)
 		// last_updated mirrors resources.last_updated so the id-first fetch can
 		// sort candidates from idx_sp_qty_raw without a resources lookup.
-		batch.Queue(
-			`INSERT INTO sp_quantity (resource_id, resource_type, param_name, value, value_low, value_high, system, code, last_updated)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			rid, rt, param, f, low, high, sys, code, lastUpdated,
-		)
+		rs.spQuantity = append(rs.spQuantity, []any{rs.tenant, rid, rt, param, f, low, high, sys, code, lastUpdated})
 	}
 }
 
@@ -472,7 +409,7 @@ type compositeCoding struct {
 	code   string
 }
 
-// queueComposite materialises token+quantity composite pairs for one composite
+// appendComposite materialises token+quantity composite pairs for one composite
 // search parameter. elements are the composite's element instances — the root
 // FHIRPath (e.g. Observation, or Observation.component) already evaluated against
 // the resource. For each element it pairs that element's token codings with that
@@ -480,7 +417,7 @@ type compositeCoding struct {
 // semantics (a multi-component Observation must not cross-match component A's code
 // with component B's value). Only token+quantity composites are handled; other
 // component-type pairs return without writing and keep the legacy query path.
-func (e *Extractor) queueComposite(batch *pgx.Batch, rt, rid string, d searchparam.Definition, elements []any, lastUpdated time.Time) {
+func (e *Extractor) appendComposite(rs *RowSet, rt, rid string, d searchparam.Definition, elements []any, lastUpdated time.Time) {
 	if len(d.Components) < 2 {
 		return
 	}
@@ -526,12 +463,7 @@ func (e *Extractor) queueComposite(batch *pgx.Batch, rt, rid string, d searchpar
 			qSys := asString(qm["system"])
 			qCode := asString(qm["code"])
 			for _, tc := range codings {
-				batch.Queue(
-					`INSERT INTO sp_composite_token_quantity
-					 (resource_id, resource_type, param_name, system, code, value, value_low, value_high, qty_system, qty_code, last_updated)
-					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-					rid, rt, d.ParamName, tc.system, tc.code, f, low, high, qSys, qCode, lastUpdated,
-				)
+				rs.spComposite = append(rs.spComposite, []any{rs.tenant, rid, rt, d.ParamName, tc.system, tc.code, f, low, high, qSys, qCode, lastUpdated})
 			}
 		}
 	}
@@ -587,7 +519,7 @@ func normalizeAs(expr string) string {
 
 // extractCompositeCodings flattens a token component's evaluated values
 // (CodeableConcepts, Codings, or bare code strings) into system+code pairs,
-// following the same fallback rules as queueToken (Identifier/ContactPoint carry
+// following the same fallback rules as appendToken (Identifier/ContactPoint carry
 // their token in "value"). Values with no usable code are dropped.
 func extractCompositeCodings(vals []any) []compositeCoding {
 	var out []compositeCoding
@@ -626,23 +558,19 @@ func extractCompositeCodings(vals []any) []compositeCoding {
 
 // ─── sp_uri ───────────────────────────────────────────────────────────────────
 
-func queueURI(batch *pgx.Batch, rt, rid, param string, vals []any) {
+func appendURI(rs *RowSet, rt, rid, param string, vals []any) {
 	for _, v := range vals {
 		s := asString(v)
 		if s == "" {
 			continue
 		}
-		batch.Queue(
-			`INSERT INTO sp_uri (resource_id, resource_type, param_name, value)
-			 VALUES ($1, $2, $3, $4)`,
-			rid, rt, param, s,
-		)
+		rs.spURI = append(rs.spURI, []any{rs.tenant, rid, rt, param, s})
 	}
 }
 
 // ─── sp_reference ─────────────────────────────────────────────────────────────
 
-func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpdated time.Time) {
+func appendReference(rs *RowSet, rt, rid, param string, vals []any, lastUpdated time.Time) {
 	for _, v := range vals {
 		m, ok := v.(map[string]any)
 		if !ok {
@@ -651,11 +579,8 @@ func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpd
 				tType, tID := parseRefString(s)
 				// last_updated mirrors resources.last_updated so the sp-first
 				// reference walk sorts candidates from idx_sp_ref_recent directly.
-				batch.Queue(
-					`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value, last_updated)
-					 VALUES ($1, $2, $3, $4, $5, '', '', $6)`,
-					rid, rt, param, tType, tID, lastUpdated,
-				)
+				// identifier_system / identifier_value are empty for a bare reference.
+				rs.spReference = append(rs.spReference, []any{rs.tenant, rid, rt, param, tType, tID, "", "", lastUpdated})
 			}
 			continue
 		}
@@ -668,11 +593,7 @@ func queueReference(batch *pgx.Batch, rt, rid, param string, vals []any, lastUpd
 			idVal = asString(id["value"])
 		}
 
-		batch.Queue(
-			`INSERT INTO sp_reference (resource_id, resource_type, param_name, target_type, target_id, identifier_system, identifier_value, last_updated)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			rid, rt, param, tType, tID, idSys, idVal, lastUpdated,
-		)
+		rs.spReference = append(rs.spReference, []any{rs.tenant, rid, rt, param, tType, tID, idSys, idVal, lastUpdated})
 	}
 }
 

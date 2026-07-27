@@ -1,0 +1,69 @@
+=== resources (5 rows) ===
+obs-new|Observation|1|false|<TS>|{"category":[{"coding":[{"code":"vital-signs","system":"http://terminology.hl7.org/CodeSystem/observation-category"}]}],"code":{"coding":[{"code":"8867-4","display":"Heart rate","system":"http://loinc.org"}]},"component":[{"code":{"coding":[{"code":"8480-6","system":"http://loinc.org"}]},"valueQuantity":{"code":"mm[Hg]","system":"http://unitsofmeasure.org","value":107}}],"effectiveDateTime":"2015-02-07T13:28:17-05:00","id":"obs-new","meta":{"lastUpdated":"<TS>","versionId":"1"},"resourceType":"Observation","status":"final","subject":{"reference":"Patient/pat-new"},"valueQuantity":{"code":"/min","system":"http://unitsofmeasure.org","unit":"beats/minute","value":72}}
+org-existing|Organization|1|false|<TS>|{"id":"org-existing","identifier":[{"system":"http://example.org/orgs","value":"ORG-1"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":"Existing Org","resourceType":"Organization"}
+org-new|Organization|1|false|<TS>|{"id":"org-new","identifier":[{"system":"http://example.org/orgs","value":"ORG-2"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":"Brand New Org","resourceType":"Organization"}
+pat-new|Patient|1|false|<TS>|{"birthDate":"1991-06-15","gender":"other","id":"pat-new","identifier":[{"system":"http://example.org/mrn","value":"MRN-Newman"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":[{"family":"Newman","given":["Alfred"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
+pat-update|Patient|2|false|<TS>|{"birthDate":"1980-01-02","gender":"other","id":"pat-update","identifier":[{"system":"http://example.org/mrn","value":"MRN-Updated"}],"meta":{"lastUpdated":"<TS>","versionId":"2"},"name":[{"family":"Updated","given":["Newname"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
+
+=== resource_history (6 rows) ===
+obs-new|Observation|1|POST|<TS>|{"category":[{"coding":[{"code":"vital-signs","system":"http://terminology.hl7.org/CodeSystem/observation-category"}]}],"code":{"coding":[{"code":"8867-4","display":"Heart rate","system":"http://loinc.org"}]},"component":[{"code":{"coding":[{"code":"8480-6","system":"http://loinc.org"}]},"valueQuantity":{"code":"mm[Hg]","system":"http://unitsofmeasure.org","value":107}}],"effectiveDateTime":"2015-02-07T13:28:17-05:00","id":"obs-new","meta":{"lastUpdated":"<TS>","versionId":"1"},"resourceType":"Observation","status":"final","subject":{"reference":"Patient/pat-new"},"valueQuantity":{"code":"/min","system":"http://unitsofmeasure.org","unit":"beats/minute","value":72}}
+org-existing|Organization|1|POST|<TS>|{"id":"org-existing","identifier":[{"system":"http://example.org/orgs","value":"ORG-1"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":"Existing Org","resourceType":"Organization"}
+org-new|Organization|1|POST|<TS>|{"id":"org-new","identifier":[{"system":"http://example.org/orgs","value":"ORG-2"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":"Brand New Org","resourceType":"Organization"}
+pat-new|Patient|1|POST|<TS>|{"birthDate":"1991-06-15","gender":"other","id":"pat-new","identifier":[{"system":"http://example.org/mrn","value":"MRN-Newman"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":[{"family":"Newman","given":["Alfred"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
+pat-update|Patient|1|POST|<TS>|{"birthDate":"1980-01-01","gender":"other","id":"pat-update","identifier":[{"system":"http://example.org/mrn","value":"MRN-Original"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":[{"family":"Original","given":["OG"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
+pat-update|Patient|2|PUT|<TS>|{"birthDate":"1980-01-02","gender":"other","id":"pat-update","identifier":[{"system":"http://example.org/mrn","value":"MRN-Updated"}],"meta":{"lastUpdated":"<TS>","versionId":"2"},"name":[{"family":"Updated","given":["Newname"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
+
+=== sp_string (12 rows) ===
+org-existing|Organization|name|Existing Org|existing org
+org-existing|Organization|phonetic|Existing Org|existing org
+org-new|Organization|name|Brand New Org|brand new org
+org-new|Organization|phonetic|Brand New Org|brand new org
+pat-new|Patient|family|Newman|newman
+pat-new|Patient|given|Alfred|alfred
+pat-new|Patient|name|map[family:Newman given:[Alfred]]|map[family:newman given:[alfred]]
+pat-new|Patient|phonetic|map[family:Newman given:[Alfred]]|map[family:newman given:[alfred]]
+pat-update|Patient|family|Updated|updated
+pat-update|Patient|given|Newname|newname
+pat-update|Patient|name|map[family:Updated given:[Newname]]|map[family:updated given:[newname]]
+pat-update|Patient|phonetic|map[family:Updated given:[Newname]]|map[family:updated given:[newname]]
+
+=== sp_token (15 rows) ===
+obs-new|Observation|category|http://terminology.hl7.org/CodeSystem/observation-category|vital-signs||<TS>
+obs-new|Observation|code|http://loinc.org|8867-4|Heart rate|<TS>
+obs-new|Observation|combo-code|http://loinc.org|8867-4|Heart rate|<TS>
+obs-new|Observation|component-code|http://loinc.org|8480-6||<TS>
+obs-new|Observation|status||final||<TS>
+org-existing|Organization|identifier|http://example.org/orgs|ORG-1||<TS>
+org-new|Organization|identifier|http://example.org/orgs|ORG-2||<TS>
+pat-new|Patient|gender||other||<TS>
+pat-new|Patient|identifier|http://example.org/mrn|MRN-Newman||<TS>
+pat-new|Patient|phone|phone|555-0100||<TS>
+pat-new|Patient|telecom|phone|555-0100||<TS>
+pat-update|Patient|gender||other||<TS>
+pat-update|Patient|identifier|http://example.org/mrn|MRN-Updated||<TS>
+pat-update|Patient|phone|phone|555-0100||<TS>
+pat-update|Patient|telecom|phone|555-0100||<TS>
+
+=== sp_date (2 rows) ===
+pat-new|Patient|birthdate|1991-06-15 00:00:00+00|1991-06-15 23:59:59+00|SECOND|<TS>
+pat-update|Patient|birthdate|1980-01-02 00:00:00+00|1980-01-02 23:59:59+00|SECOND|<TS>
+
+=== sp_number (0 rows) ===
+
+=== sp_quantity (4 rows) ===
+obs-new|Observation|combo-value-quantity|107.000000|106.999989|107.000011|http://unitsofmeasure.org|mm[Hg]|||<TS>
+obs-new|Observation|combo-value-quantity|72.000000|71.999993|72.000007|http://unitsofmeasure.org|/min|||<TS>
+obs-new|Observation|component-value-quantity|107.000000|106.999989|107.000011|http://unitsofmeasure.org|mm[Hg]|||<TS>
+obs-new|Observation|value-quantity|72.000000|71.999993|72.000007|http://unitsofmeasure.org|/min|||<TS>
+
+=== sp_uri (0 rows) ===
+
+=== sp_reference (2 rows) ===
+obs-new|Observation|patient|Patient|pat-new||||||<TS>
+obs-new|Observation|subject|Patient|pat-new||||||<TS>
+
+=== sp_composite_token_quantity (3 rows) ===
+obs-new|Observation|code-value-quantity|http://loinc.org|8867-4|72.000000|71.999993|72.000007|http://unitsofmeasure.org|/min|<TS>
+obs-new|Observation|combo-code-value-quantity|http://loinc.org|8867-4|72.000000|71.999993|72.000007|http://unitsofmeasure.org|/min|<TS>
+obs-new|Observation|component-code-value-quantity|http://loinc.org|8480-6|107.000000|106.999989|107.000011|http://unitsofmeasure.org|mm[Hg]|<TS>
+
