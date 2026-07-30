@@ -17,6 +17,7 @@
 package fhirpath_test
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/wso2/fhir-server/internal/fhirpath"
@@ -266,6 +267,54 @@ func TestEvaluatePolymorphic_NoOfType_PassThrough(t *testing.T) {
 	got, err := fhirpath.EvaluatePolymorphic("Observation.status", r)
 	assertNoErr(t, err)
 	assertStrings(t, got, "final")
+}
+
+func TestEvaluatePolymorphic_BareChoiceField(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource map[string]any
+		want     any
+	}{
+		{
+			name:     "dateTime",
+			resource: map[string]any{"effectiveDateTime": "2026-06-30T06:45:00Z"},
+			want:     "2026-06-30T06:45:00Z",
+		},
+		{
+			name:     "period",
+			resource: map[string]any{"effectivePeriod": map[string]any{"start": "2026-06-30"}},
+			want:     map[string]any{"start": "2026-06-30"},
+		},
+		{
+			name:     "timing",
+			resource: map[string]any{"effectiveTiming": map[string]any{"event": []any{"2026-06-30"}}},
+			want:     map[string]any{"event": []any{"2026-06-30"}},
+		},
+		{
+			name:     "instant",
+			resource: map[string]any{"effectiveInstant": "2026-06-30T06:45:00Z"},
+			want:     "2026-06-30T06:45:00Z",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := fhirpath.EvaluatePolymorphic("Observation.effective", tt.resource)
+			assertNoErr(t, err)
+			if len(got) != 1 || !reflect.DeepEqual(got[0], tt.want) {
+				t.Fatalf("got %v, want [%v]", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluatePolymorphic_BareChoiceFieldDoesNotUseArbitraryPrefix(t *testing.T) {
+	r := map[string]any{"valueSet": "http://example.org/ValueSet/test"}
+	got, err := fhirpath.EvaluatePolymorphic("Observation.value", r)
+	assertNoErr(t, err)
+	if len(got) != 0 {
+		t.Fatalf("got %v, want no match", got)
+	}
 }
 
 func TestEvaluatePolymorphic_MultipleOfType(t *testing.T) {
