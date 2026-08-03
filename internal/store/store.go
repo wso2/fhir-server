@@ -292,7 +292,11 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 	}
 
 	id, _ := result["id"].(string)
-	slog.Info("created resource", "type", resourceType, "id", id)
+	// Per-resource success is Debug, not Info: at import throughput (thousands of
+	// writes/sec) an Info line per write serializes every request on the log
+	// handler's write mutex and adds a marshal + syscall to the hot path. Bundle
+	// processing still logs one Info summary per transaction (see ExecuteBundle).
+	slog.Debug("created resource", "type", resourceType, "id", id)
 	return result, nil
 }
 
@@ -400,7 +404,7 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 		return nil, err
 	}
 
-	slog.Info("updated resource", "type", resourceType, "id", resourceID, "version", metaVersionID(result))
+	slog.Debug("updated resource", "type", resourceType, "id", resourceID, "version", metaVersionID(result))
 	return result, nil
 }
 
@@ -472,7 +476,7 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 		return nil, err
 	}
 
-	slog.Info("patched resource", "type", resourceType, "id", resourceID, "version", newVersion)
+	slog.Debug("patched resource", "type", resourceType, "id", resourceID, "version", newVersion)
 	return merged, nil
 }
 
@@ -576,7 +580,7 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 		return err
 	}
 
-	slog.Info("deleted resource", "type", resourceType, "id", resourceID)
+	slog.Debug("deleted resource", "type", resourceType, "id", resourceID)
 	return nil
 }
 
