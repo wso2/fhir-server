@@ -130,6 +130,23 @@ func (rs *RowSet) atLimit() bool {
 	return rs.maxRows > 0 && rs.Count() >= rs.maxRows
 }
 
+// TableCounts returns the per-table buffered row counts. Used to diagnose which
+// sp_* table dominates when a write is rejected for exceeding the row cap — a
+// disproportionate sp_composite_token_quantity count points at a composite
+// extraction explosion rather than a merely large bundle.
+func (rs *RowSet) TableCounts() map[string]int {
+	return map[string]int{
+		"sp_string":                   len(rs.spString),
+		"sp_token":                    len(rs.spToken),
+		"sp_date":                     len(rs.spDate),
+		"sp_number":                   len(rs.spNumber),
+		"sp_quantity":                 len(rs.spQuantity),
+		"sp_uri":                      len(rs.spURI),
+		"sp_reference":                len(rs.spReference),
+		"sp_composite_token_quantity": len(rs.spComposite),
+	}
+}
+
 // AddDelete records that resource (resourceType, resourceID) must have its
 // existing sp_* rows removed at flush (re-index), and drops any rows already
 // accumulated for it earlier in this transaction. The purge keeps a

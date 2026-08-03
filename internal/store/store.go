@@ -251,6 +251,26 @@ func (w *bundleWriter) totalRows() int {
 // writes (version bumps, non-deferred resource inserts) the entries already made.
 func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
 	if w.maxRowsPerBundle > 0 && (w.rs.LimitHit || w.totalRows() > w.maxRowsPerBundle) {
+		// Log the per-table breakdown so an operator can tell a genuinely large
+		// bundle (counts spread proportionally) from an extraction explosion (one
+		// table, typically sp_composite_token_quantity, dominating). resources is
+		// the number of write ops in this transaction, so index-rows / resources
+		// is the rows-per-resource ratio — a normal resource is ~10–40; hundreds+
+		// signals over-extraction.
+		tc := w.rs.TableCounts()
+		slog.Warn("write exceeded per-transaction row limit",
+			"limit", w.maxRowsPerBundle,
+			"indexRows", w.rs.Count(),
+			"resources", len(w.history),
+			"sp_composite_token_quantity", tc["sp_composite_token_quantity"],
+			"sp_token", tc["sp_token"],
+			"sp_string", tc["sp_string"],
+			"sp_reference", tc["sp_reference"],
+			"sp_quantity", tc["sp_quantity"],
+			"sp_date", tc["sp_date"],
+			"sp_number", tc["sp_number"],
+			"sp_uri", tc["sp_uri"],
+		)
 		return WriteLimitError{Rows: w.totalRows(), Limit: w.maxRowsPerBundle}
 	}
 	if err := index.InsertBatched(ctx, tx, "resources", resourcesCols, w.resources, w.maxRowsPerStmt); err != nil {
