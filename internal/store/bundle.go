@@ -205,7 +205,7 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 		return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
 	}
 
-	slog.Info("processed transaction bundle", "entries", len(entries))
+	slog.Debug("processed transaction bundle", "entries", len(entries))
 	return results, nil
 }
 
@@ -400,7 +400,7 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 		}
 		results[i] = res
 	}
-	slog.Info("processed batch bundle", "entries", len(entries))
+	slog.Debug("processed batch bundle", "entries", len(entries))
 	return results
 }
 
