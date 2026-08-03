@@ -56,25 +56,62 @@ func defaultSearchTuning() SearchTuning {
 	}
 }
 
+// WriteTuning bounds the bundle writer's batched inserts so a single transaction
+// cannot drive the database out of memory. MaxRowsPerStatement caps one multi-row
+// INSERT; MaxRowsPerBundle caps the total index rows one transaction may buffer
+// before it is rejected with a bounded 413. Both are configurable — see
+// internal/config and docs/performance-tuning.md.
+type WriteTuning struct {
+	MaxRowsPerStatement int // rows per multi-row INSERT (defaultWriteMaxRowsPerStatement when 0)
+	MaxRowsPerBundle    int // total index rows per transaction; 0 = unlimited (unsafe)
+}
+
+const (
+	defaultWriteMaxRowsPerStatement = 1000
+	defaultWriteMaxRowsPerBundle    = 100_000
+)
+
+// defaultWriteTuning returns the built-in write-path limits.
+func defaultWriteTuning() WriteTuning {
+	return WriteTuning{
+		MaxRowsPerStatement: defaultWriteMaxRowsPerStatement,
+		MaxRowsPerBundle:    defaultWriteMaxRowsPerBundle,
+	}
+}
+
 type Store struct {
 	pool        *pgxpool.Pool
 	extractor   *index.Extractor
 	registry    *searchparam.Registry
 	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
 	tuning      SearchTuning
+	writeTuning WriteTuning
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
 	s := &Store{
-		pool:      pool,
-		extractor: index.New(registry),
-		registry:  registry,
-		tuning:    defaultSearchTuning(),
+		pool:        pool,
+		extractor:   index.New(registry),
+		registry:    registry,
+		tuning:      defaultSearchTuning(),
+		writeTuning: defaultWriteTuning(),
 	}
 	for _, o := range opts {
 		o(s)
 	}
 	return s
+}
+
+// WithWriteTuning sets the write-path batching limits (resolved from config).
+// Any non-positive MaxRowsPerStatement falls back to its default; MaxRowsPerBundle
+// is preserved as given (0 means unlimited — unsafe, use only for trusted paths).
+func WithWriteTuning(t WriteTuning) func(*Store) {
+	return func(s *Store) {
+		if t.MaxRowsPerStatement <= 0 {
+			t.MaxRowsPerStatement = defaultWriteMaxRowsPerStatement
+		}
+		s.writeTuning = t
+	}
 }
 
 // WithSearchTuning sets the search performance tunables (resolved from config).
@@ -179,25 +216,50 @@ type bundleWriter struct {
 	tenant    string
 	resources [][]any // deferred resources creates
 	history   [][]any // every create/update/patch/delete history row
+
+	maxRowsPerStmt   int
+	maxRowsPerBundle int
 }
 
 func (s *Store) newBundleWriter(ctx context.Context) *bundleWriter {
 	t := tenant.From(ctx)
-	return &bundleWriter{rs: index.NewRowSet(t), tenant: t}
+	wt := s.writeTuning
+	return &bundleWriter{
+		rs:               index.NewRowSet(t, wt.MaxRowsPerBundle),
+		tenant:           t,
+		maxRowsPerStmt:   wt.MaxRowsPerStatement,
+		maxRowsPerBundle: wt.MaxRowsPerBundle,
+	}
+}
+
+// totalRows is the total number of rows this transaction would write across the
+// index, resources, and history tables.
+func (w *bundleWriter) totalRows() int {
+	return w.rs.Count() + len(w.resources) + len(w.history)
 }
 
 // flush writes the buffer to tx in FK-safe order: parent resources first (sp_*
 // rows carry a FK to resources), then the index rows (batched re-index DELETEs +
-// COPYs), then resource_history. Called once, after all entries are processed and
-// before COMMIT.
+// INSERTs), then resource_history. Called once, after all entries are processed
+// and before COMMIT.
+//
+// Before writing anything it enforces the per-transaction row cap: if extraction
+// stopped at the limit, or the buffered total exceeds MaxRowsPerBundle, it aborts
+// with a WriteLimitError (mapped to HTTP 413) so a pathological bundle fails
+// cleanly instead of driving the database out of memory. Nothing is sent to the
+// database in that case; the caller's deferred Rollback unwinds any immediate
+// writes (version bumps, non-deferred resource inserts) the entries already made.
 func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
-	if err := index.InsertBatched(ctx, tx, "resources", resourcesCols, w.resources); err != nil {
+	if w.maxRowsPerBundle > 0 && (w.rs.LimitHit || w.totalRows() > w.maxRowsPerBundle) {
+		return WriteLimitError{Rows: w.totalRows(), Limit: w.maxRowsPerBundle}
+	}
+	if err := index.InsertBatched(ctx, tx, "resources", resourcesCols, w.resources, w.maxRowsPerStmt); err != nil {
 		return err
 	}
-	if err := w.rs.Flush(ctx, tx); err != nil {
+	if err := w.rs.Flush(ctx, tx, w.maxRowsPerStmt); err != nil {
 		return err
 	}
-	return index.InsertBatched(ctx, tx, "resource_history", historyCols, w.history)
+	return index.InsertBatched(ctx, tx, "resource_history", historyCols, w.history, w.maxRowsPerStmt)
 }
 
 // ─── Create ───────────────────────────────────────────────────────────────────
@@ -1002,4 +1064,18 @@ type ConflictError struct {
 
 func (e ConflictError) Error() string {
 	return e.Message
+}
+
+// WriteLimitError is returned when a single write transaction would buffer more
+// index rows than the configured per-bundle cap (WriteTuning.MaxRowsPerBundle).
+// It maps to HTTP 413 (Payload Too Large): the write is rejected and rolled back
+// so one pathological bundle cannot exhaust database memory. Raise the cap
+// (WRITE_MAX_ROWS_PER_BUNDLE) for trusted bulk-import environments.
+type WriteLimitError struct {
+	Rows  int // rows the transaction attempted (at least the cap; may undercount once extraction stops)
+	Limit int // the configured MaxRowsPerBundle
+}
+
+func (e WriteLimitError) Error() string {
+	return fmt.Sprintf("write exceeds the per-transaction index-row limit of %d (raise write.maxRowsPerBundle to allow larger bundles)", e.Limit)
 }

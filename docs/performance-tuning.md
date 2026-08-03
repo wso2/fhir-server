@@ -23,6 +23,8 @@ line to confirm an override took effect.
 | `search.maxPageSize` | `SEARCH_MAX_PAGE_SIZE` | `0` | 0 or 1–10,000 | Upper clamp on a client-supplied `_count`. `0` = unlimited (legacy behavior). Recommended `200` in production. |
 | `search.maxChainDepth` | `SEARCH_MAX_CHAIN_DEPTH` | `5` | 1–10 | Bounds chained-parameter recursion depth. |
 | `database.planCacheMode` | `DATABASE_PLAN_CACHE_MODE` | `force_custom_plan` | `force_custom_plan` \| `auto` \| `force_generic_plan` | Per-connection `plan_cache_mode`. **Load-bearing** — see the warning below. |
+| `write.maxRowsPerStatement` | `WRITE_MAX_ROWS_PER_STATEMENT` | `1000` | 100–20,000 | Rows per multi-row `INSERT` in the bundle writer. Also clamped by Postgres's 65,535-parameter protocol limit at write time. Smaller → smaller per-statement parse tree (less backend memory). |
+| `write.maxRowsPerBundle` | `WRITE_MAX_ROWS_PER_BUNDLE` | `100000` | 1,000–100,000,000 | Max index rows a single write transaction may buffer. A write that would exceed it is rejected with **HTTP 413** and rolled back — the safety valve that stops a pathological bundle from OOM-ing the database. Raise for trusted bulk-import windows. |
 
 ### Sizing `probeCap`: the √ rule
 
@@ -130,6 +132,24 @@ batched: each entry's sp\_\* rows are accumulated in one transaction and flushed
 a handful of multi-row `INSERT`s (plus one re-index `DELETE` per sp table),
 instead of one round trip per row. That collapses a ~1,000-entry bundle from
 ~13k single-row statements to a few dozen. Two consequences to tune for:
+
+### Bounding batched writes so one bundle can't OOM the database
+
+The writer buffers a transaction's index rows and emits them as multi-row
+`INSERT`s. Two limits keep that bounded (see the table in §1):
+
+- **`write.maxRowsPerStatement`** (default 1,000) bounds one statement's parse
+  tree — the per-backend memory a runaway insert would otherwise inflate. It is
+  additionally clamped to Postgres's 65,535-parameter protocol ceiling, so a
+  large value can never produce an invalid statement.
+- **`write.maxRowsPerBundle`** (default 100,000) is the safety valve: if a single
+  write transaction would buffer more index rows than this, it is rejected with
+  **HTTP 413** and rolled back before anything is sent to the database. This
+  turns a pathological bundle (e.g. a resource that extracts a runaway number of
+  composite rows) into a failed *request* instead of an out-of-memory *cluster*.
+  A realistic large bundle is ~30–50k index rows, so the default leaves headroom;
+  raise it for trusted bulk-import environments where you accept the larger
+  transaction, and pair the raise with adequate database memory.
 
 ### `SERVER_WRITE_TIMEOUT` must exceed the worst-case bundle import
 

@@ -67,6 +67,19 @@ search:
   # Chained-parameter recursion bound. Range 1–10. Env: SEARCH_MAX_CHAIN_DEPTH.
   # maxChainDepth: 5
 
+write:
+  # Rows per multi-row INSERT in the bundle writer. Kept small so each statement's
+  # parse tree stays modest; additionally clamped by the 65535-parameter protocol
+  # limit at write time. Range 100–20000. Env: WRITE_MAX_ROWS_PER_STATEMENT.
+  # maxRowsPerStatement: 1000
+
+  # Maximum index rows a single write transaction (bundle or resource) may buffer.
+  # A write that would exceed this is rejected with HTTP 413 and rolled back, so a
+  # pathological bundle fails the request instead of exhausting database memory.
+  # Raise for trusted bulk-import environments. Range 1000–100000000.
+  # Env: WRITE_MAX_ROWS_PER_BUNDLE.
+  # maxRowsPerBundle: 100000
+
 ig:
   # Implementation guides to load at startup. None are loaded by default —
   # the server runs as a plain base FHIR R4 store until you opt in here.

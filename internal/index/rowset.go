@@ -25,10 +25,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// maxInsertParams caps the bind parameters in one multi-row INSERT, safely under
-// PostgreSQL's 65535-parameter protocol limit. The batched writer picks the
-// largest whole number of rows per statement that fits, so a table's rows are
-// inserted in as few statements as the limit allows.
+// maxInsertParams is the hard ceiling on bind parameters in one multi-row INSERT,
+// safely under PostgreSQL's 65535-parameter protocol limit. It clamps the
+// caller-supplied rows-per-statement so a large (or misconfigured) value can
+// never produce a statement the wire protocol rejects.
 //
 // The write path uses multi-row INSERT rather than binary COPY because the sp_*
 // (and resources / resource_history) tables run under FORCE ROW LEVEL SECURITY,
@@ -39,6 +39,12 @@ import (
 // a handful of statements (one parse/plan per chunk of rows) while the RLS
 // WITH CHECK policy validates every row.
 const maxInsertParams = 60000
+
+// defaultMaxRowsPerStmt is the built-in rows-per-statement chunk used by the
+// standalone indexer and as the store's default (config key
+// write.maxRowsPerStatement). Kept well under maxInsertParams for the widest
+// (12-column) table so each statement's parse tree stays small.
+const defaultMaxRowsPerStmt = 1000
 
 // Column lists for every batched sp_* INSERT. Each MUST match the value order the
 // append* helpers build, and each begins with tenant_id, supplied explicitly and
@@ -81,6 +87,15 @@ type refKey struct {
 type RowSet struct {
 	tenant string
 
+	// maxRows bounds the total sp_* rows one transaction may buffer (0 = unlimited).
+	// Extraction stops appending once the count reaches it and sets LimitHit, so a
+	// pathological resource cannot balloon the in-memory set (and, via the writer's
+	// pre-flush check, cannot drive the database out of memory with a giant insert).
+	maxRows int
+	// LimitHit is set (sticky) when extraction was stopped by maxRows. The writer
+	// reads it to abort the transaction with a bounded "payload too large" error.
+	LimitHit bool
+
 	spString    [][]any
 	spToken     [][]any
 	spDate      [][]any
@@ -96,10 +111,23 @@ type RowSet struct {
 	deleteSeen map[refKey]struct{}
 }
 
-// NewRowSet returns an empty RowSet stamped with the transaction's tenant, which
-// is written into every row's tenant_id column.
-func NewRowSet(tenant string) *RowSet {
-	return &RowSet{tenant: tenant, deleteSeen: map[refKey]struct{}{}}
+// NewRowSet returns an empty RowSet stamped with the transaction's tenant (written
+// into every row's tenant_id column) and bounded to maxRows total sp_* rows
+// (0 = unlimited).
+func NewRowSet(tenant string, maxRows int) *RowSet {
+	return &RowSet{tenant: tenant, maxRows: maxRows, deleteSeen: map[refKey]struct{}{}}
+}
+
+// Count returns the total number of sp_* rows currently buffered across all tables.
+func (rs *RowSet) Count() int {
+	return len(rs.spString) + len(rs.spToken) + len(rs.spDate) + len(rs.spNumber) +
+		len(rs.spQuantity) + len(rs.spURI) + len(rs.spReference) + len(rs.spComposite)
+}
+
+// atLimit reports whether the buffered row count has reached the configured cap.
+// Extraction checks this at its loop boundaries to stop early and set LimitHit.
+func (rs *RowSet) atLimit() bool {
+	return rs.maxRows > 0 && rs.Count() >= rs.maxRows
 }
 
 // AddDelete records that resource (resourceType, resourceID) must have its
@@ -147,7 +175,7 @@ func (rs *RowSet) purge(k refKey) {
 // caller runs this inside the bundle's transaction, after all entries are
 // processed and after the parent resources rows exist (the sp_* FK), and before
 // COMMIT.
-func (rs *RowSet) Flush(ctx context.Context, tx pgx.Tx) error {
+func (rs *RowSet) Flush(ctx context.Context, tx pgx.Tx, maxRowsPerStmt int) error {
 	if len(rs.deletes) > 0 {
 		ids := make([]string, len(rs.deletes))
 		types := make([]string, len(rs.deletes))
@@ -185,7 +213,7 @@ func (rs *RowSet) Flush(ctx context.Context, tx pgx.Tx) error {
 		{"sp_composite_token_quantity", spCompositeCols, rs.spComposite},
 	}
 	for _, t := range tables {
-		if err := InsertBatched(ctx, tx, t.name, t.cols, t.rows); err != nil {
+		if err := InsertBatched(ctx, tx, t.name, t.cols, t.rows, maxRowsPerStmt); err != nil {
 			return err
 		}
 	}
@@ -193,17 +221,21 @@ func (rs *RowSet) Flush(ctx context.Context, tx pgx.Tx) error {
 }
 
 // InsertBatched inserts rows into table with multi-row INSERT ... VALUES
-// statements, chunked so no single statement exceeds maxInsertParams bind
-// parameters. It is a no-op for an empty slice. Exported so the store reuses it
-// for the resources and resource_history batched writes, keeping one write
-// mechanism. Every value is passed as a bind parameter, so the RLS WITH CHECK
-// policy validates each row exactly as the former per-row INSERTs did.
-func InsertBatched(ctx context.Context, tx pgx.Tx, table string, cols []string, rows [][]any) error {
+// statements. Each statement carries at most maxRowsPerStmt rows, additionally
+// clamped so no statement exceeds maxInsertParams bind parameters (the wire
+// protocol's hard limit). It is a no-op for an empty slice. Exported so the store
+// reuses it for the resources and resource_history batched writes, keeping one
+// write mechanism. Every value is passed as a bind parameter, so the RLS
+// WITH CHECK policy validates each row exactly as the former per-row INSERTs did.
+func InsertBatched(ctx context.Context, tx pgx.Tx, table string, cols []string, rows [][]any, maxRowsPerStmt int) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	ncol := len(cols)
-	rowsPerChunk := maxInsertParams / ncol
+	rowsPerChunk := maxRowsPerStmt
+	if paramCap := maxInsertParams / ncol; rowsPerChunk > paramCap {
+		rowsPerChunk = paramCap
+	}
 	if rowsPerChunk < 1 {
 		rowsPerChunk = 1
 	}

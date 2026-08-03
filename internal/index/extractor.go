@@ -50,9 +50,11 @@ func (e *Extractor) Index(ctx context.Context, tx pgx.Tx, resourceType, resource
 	if err := tx.QueryRow(ctx, `SELECT current_setting('app.current_tenant', true)`).Scan(&tenant); err != nil {
 		return fmt.Errorf("resolve tenant for index: %w", err)
 	}
-	rs := NewRowSet(tenant)
+	// Standalone single-resource indexing (used by maintenance/reindex paths and
+	// tests) is unbounded (maxRows 0) and uses the default per-statement chunk.
+	rs := NewRowSet(tenant, 0)
 	e.Extract(rs, resourceType, resourceID, resource, lastUpdated)
-	return rs.Flush(ctx, tx)
+	return rs.Flush(ctx, tx, defaultMaxRowsPerStmt)
 }
 
 // Extract appends all search parameter rows for the given resource to rs without
@@ -62,7 +64,18 @@ func (e *Extractor) Index(ctx context.Context, tx pgx.Tx, resourceType, resource
 func (e *Extractor) Extract(rs *RowSet, resourceType, resourceID string, resource map[string]any, lastUpdated time.Time) {
 	defs := e.registry.ForResource(resourceType)
 	for _, d := range defs {
+		// Stop early once the transaction's row cap is reached; the writer turns a
+		// set LimitHit into a bounded "payload too large" abort. Checking at the
+		// loop boundary keeps the overshoot to at most one param's rows.
+		if rs.atLimit() {
+			rs.LimitHit = true
+			return
+		}
 		e.appendParam(rs, resourceType, resourceID, resource, d, lastUpdated)
+	}
+	if rs.atLimit() {
+		rs.LimitHit = true
+		return
 	}
 	// Universal meta.* params (_tag/_security/_profile/_source) and the
 	// resource-level language. These live on Resource/DomainResource and so
@@ -434,6 +447,13 @@ func (e *Extractor) appendComposite(rs *RowSet, rt, rid string, d searchparam.De
 	}
 
 	for _, el := range elements {
+		// The token×quantity pairing below is the write path's one combinatorial
+		// loop, so it is the most likely place to explode; guard both loop levels
+		// against the row cap so a single element cannot balloon the row set.
+		if rs.atLimit() {
+			rs.LimitHit = true
+			return
+		}
 		em, ok := el.(map[string]any)
 		if !ok {
 			continue
@@ -451,6 +471,10 @@ func (e *Extractor) appendComposite(rs *RowSet, rt, rid string, d searchparam.De
 			continue
 		}
 		for _, qv := range qtyVals {
+			if rs.atLimit() {
+				rs.LimitHit = true
+				return
+			}
 			qm, ok := qv.(map[string]any)
 			if !ok {
 				continue

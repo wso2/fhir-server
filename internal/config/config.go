@@ -68,6 +68,13 @@ type Config struct {
 	// PlanCacheMode is the per-connection plan_cache_mode. force_custom_plan is
 	// load-bearing for the search probe architecture's per-bound plan choice.
 	PlanCacheMode string // default force_custom_plan
+
+	// Write-path batching limits. The bundle writer batches a whole transaction's
+	// index rows into multi-row INSERTs; these bound how large one statement and
+	// one transaction may grow so a pathological bundle fails with a 413 instead
+	// of driving the database out of memory. See docs/performance-tuning.md.
+	WriteMaxRowsPerStatement int // rows per multi-row INSERT; default 1000
+	WriteMaxRowsPerBundle    int // total index rows one transaction may buffer; default 100000
 }
 
 // FileConfig is the on-disk YAML schema. Each field is optional — anything
@@ -116,6 +123,13 @@ type FileConfig struct {
 		MaxPageSize     *int `yaml:"maxPageSize"`
 		MaxChainDepth   *int `yaml:"maxChainDepth"`
 	} `yaml:"search"`
+
+	// Write-path batching limits. Pointers so an absent key falls through to the
+	// default while an explicit value is honored and range-validated.
+	Write struct {
+		MaxRowsPerStatement *int `yaml:"maxRowsPerStatement"`
+		MaxRowsPerBundle    *int `yaml:"maxRowsPerBundle"`
+	} `yaml:"write"`
 }
 
 // Load reads configuration using the env-var-based discovery path. The
@@ -229,6 +243,19 @@ func resolve(fc *FileConfig) (*Config, error) {
 		return nil, err
 	}
 
+	// Write-path batching limits. Defaults are conservative; raise maxRowsPerBundle
+	// for trusted bulk-import environments (see docs/performance-tuning.md). The
+	// per-statement value is additionally clamped by the 65535-parameter protocol
+	// ceiling at write time, so a large value can never produce an invalid statement.
+	writeMaxRowsPerStatement, err := resolveIntTunable("WRITE_MAX_ROWS_PER_STATEMENT", "write.maxRowsPerStatement", fc.Write.MaxRowsPerStatement, 1000, 100, 20_000)
+	if err != nil {
+		return nil, err
+	}
+	writeMaxRowsPerBundle, err := resolveIntTunable("WRITE_MAX_ROWS_PER_BUNDLE", "write.maxRowsPerBundle", fc.Write.MaxRowsPerBundle, 100_000, 1000, 100_000_000)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		DatabaseURL:     dbURL,
 		Port:            serverPort,
@@ -251,6 +278,9 @@ func resolve(fc *FileConfig) (*Config, error) {
 		SearchMaxPageSize:     maxPageSize,
 		SearchMaxChainDepth:   maxChainDepth,
 		PlanCacheMode:         planCacheMode,
+
+		WriteMaxRowsPerStatement: writeMaxRowsPerStatement,
+		WriteMaxRowsPerBundle:    writeMaxRowsPerBundle,
 	}, nil
 }
 

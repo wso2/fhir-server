@@ -136,20 +136,28 @@ func run() error {
 		MaxPageSize:     cfg.SearchMaxPageSize,
 		MaxChainDepth:   cfg.SearchMaxChainDepth,
 	}
-	storeOpts := []func(*store.Store){store.WithSearchTuning(searchTuning)}
+	writeTuning := store.WriteTuning{
+		MaxRowsPerStatement: cfg.WriteMaxRowsPerStatement,
+		MaxRowsPerBundle:    cfg.WriteMaxRowsPerBundle,
+	}
+	storeOpts := []func(*store.Store){store.WithSearchTuning(searchTuning), store.WithWriteTuning(writeTuning)}
 	if tc := terminology.New(cfg.TerminologyURL); tc != nil {
 		storeOpts = append(storeOpts, store.WithTerminology(tc))
 		slog.Info("terminology server configured", "url", cfg.TerminologyURL)
 	}
 	s := store.New(pool, registry, storeOpts...)
-	// Log the effective search tunables so an operator can confirm overrides took
-	// effect (docs/performance-tuning.md).
+	// Log the effective search + write tunables so an operator can confirm overrides
+	// took effect (docs/performance-tuning.md).
 	slog.Info("search tuning",
 		"probeCap", cfg.SearchProbeCap,
 		"defaultPageSize", cfg.SearchDefaultPageSize,
 		"maxPageSize", cfg.SearchMaxPageSize,
 		"maxChainDepth", cfg.SearchMaxChainDepth,
 		"planCacheMode", cfg.PlanCacheMode,
+	)
+	slog.Info("write tuning",
+		"maxRowsPerStatement", cfg.WriteMaxRowsPerStatement,
+		"maxRowsPerBundle", cfg.WriteMaxRowsPerBundle,
 	)
 
 	// igReady is set to 1 once all IGs finish loading.

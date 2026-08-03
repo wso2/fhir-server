@@ -193,9 +193,12 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	}
 
 	// Flush the whole bundle's buffered index, resources, and history writes as a
-	// handful of COPY / batched-DELETE statements before COMMIT.
+	// handful of batched INSERT / DELETE statements before COMMIT. A row-limit
+	// overflow surfaces here as a 413 (WriteLimitError → storeErrToBundleErr).
 	if err := w.flush(ctx, tx); err != nil {
-		return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+		be := storeErrToBundleErr(err)
+		be.EntryIndex = -1
+		return nil, be
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -388,7 +391,7 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 		}
 		if ferr := w.flush(ctx, tx); ferr != nil {
 			tx.Rollback(ctx)
-			results[i] = batchFailure(&BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: ferr.Error()})
+			results[i] = batchFailure(storeErrToBundleErr(ferr))
 			continue
 		}
 		if cerr := tx.Commit(ctx); cerr != nil {
@@ -735,6 +738,8 @@ func storeErrToBundleErr(err error) *BundleError {
 		return &BundleError{HTTPStatus: 410, Code: "deleted", Diagnostics: e.Error()}
 	case ConflictError:
 		return &BundleError{HTTPStatus: 412, Code: "conflict", Diagnostics: e.Error()}
+	case WriteLimitError:
+		return &BundleError{HTTPStatus: 413, Code: "too-costly", Diagnostics: e.Error()}
 	default:
 		return &BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: err.Error()}
 	}
