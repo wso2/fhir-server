@@ -310,11 +310,10 @@ func applyNode(n node, input any) ([]any, error) {
 func traverseField(input any, field string) []any {
 	switch v := input.(type) {
 	case map[string]any:
-		val, ok := v[field]
-		if !ok {
-			return nil
+		if val, ok := v[field]; ok {
+			return flatten(val)
 		}
-		return flatten(val)
+		return traverseChoiceField(v, field)
 	case []any:
 		var results []any
 		for _, item := range v {
@@ -323,6 +322,30 @@ func traverseField(input any, field string) []any {
 		return results
 	}
 	return nil
+}
+
+// FHIR R4 choice fields replace [x] with the title-cased concrete datatype, such as effectiveDateTime.
+// https://hl7.org/fhir/R4/datatypes.html
+var fhirChoiceTypeSuffixes = [...]string{
+	"Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime",
+	"Decimal", "Id", "Instant", "Integer", "Markdown", "Oid",
+	"PositiveInt", "String", "Time", "UnsignedInt", "Uri", "Url", "Uuid",
+	"Address", "Age", "Annotation", "Attachment", "CodeableConcept", "Coding",
+	"ContactPoint", "Count", "Distance", "Duration", "HumanName", "Identifier",
+	"Money", "Period", "Quantity", "Range", "Ratio", "Reference",
+	"SampledData", "Signature", "Timing", "ContactDetail", "Contributor",
+	"DataRequirement", "Expression", "ParameterDefinition", "RelatedArtifact",
+	"TriggerDefinition", "UsageContext", "Dosage", "Meta",
+}
+
+func traverseChoiceField(resource map[string]any, field string) []any {
+	var results []any
+	for _, suffix := range fhirChoiceTypeSuffixes {
+		if val, ok := resource[field+suffix]; ok {
+			results = append(results, flatten(val)...)
+		}
+	}
+	return results
 }
 
 // flatten unwraps a top-level array into individual elements.

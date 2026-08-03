@@ -44,7 +44,8 @@ pat-update|Patient|identifier|http://example.org/mrn|MRN-Updated||<TS>
 pat-update|Patient|phone|phone|555-0100||<TS>
 pat-update|Patient|telecom|phone|555-0100||<TS>
 
-=== sp_date (2 rows) ===
+=== sp_date (3 rows) ===
+obs-new|Observation|date|2015-02-07 18:28:17+00|2015-02-07 18:28:17+00|SECOND|<TS>
 pat-new|Patient|birthdate|1991-06-15 00:00:00+00|1991-06-15 23:59:59+00|SECOND|<TS>
 pat-update|Patient|birthdate|1980-01-02 00:00:00+00|1980-01-02 23:59:59+00|SECOND|<TS>
 

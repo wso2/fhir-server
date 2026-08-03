@@ -1570,6 +1570,66 @@ func TestSearch_HalfBoundedQuantity_Straddle(t *testing.T) {
 	}
 }
 
+func TestSearch_ObservationDateChoice(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	dateTimeObservation, err := s.Create(ctx, "Observation", map[string]any{
+		"resourceType":      "Observation",
+		"status":            "final",
+		"code":              map[string]any{"text": "dateTime observation"},
+		"effectiveDateTime": "2026-06-30T06:45:00Z",
+	})
+	if err != nil {
+		t.Fatalf("Create dateTime Observation: %v", err)
+	}
+	periodObservation, err := s.Create(ctx, "Observation", map[string]any{
+		"resourceType": "Observation",
+		"status":       "final",
+		"code":         map[string]any{"text": "period observation"},
+		"effectivePeriod": map[string]any{
+			"start": "2026-07-10T00:00:00Z",
+			"end":   "2026-07-12T00:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create Period Observation: %v", err)
+	}
+
+	exact, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{"date": {"2026-06-30"}},
+	})
+	if err != nil {
+		t.Fatalf("Search exact Observation date: %v", err)
+	}
+	if exact.Total != 1 || exact.Entries[0]["id"] != dateTimeObservation["id"] {
+		t.Fatalf("exact date: got entries %v, want only %v", exact.Entries, dateTimeObservation["id"])
+	}
+
+	period, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{"date": {"2026-07-11"}},
+	})
+	if err != nil {
+		t.Fatalf("Search Observation period date: %v", err)
+	}
+	if period.Total != 1 || period.Entries[0]["id"] != periodObservation["id"] {
+		t.Fatalf("period date: got entries %v, want only %v", period.Entries, periodObservation["id"])
+	}
+
+	since, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{"date": {"ge2026-07-01"}},
+	})
+	if err != nil {
+		t.Fatalf("Search prefixed Observation date: %v", err)
+	}
+	if since.Total != 1 || since.Entries[0]["id"] != periodObservation["id"] {
+		t.Fatalf("prefixed date: got entries %v, want only %v", since.Entries, periodObservation["id"])
+	}
+}
+
 func TestSearch_MissingModifier(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
