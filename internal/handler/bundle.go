@@ -57,7 +57,15 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := h.store.ExecuteBundle(r.Context(), bundleType, h.tenantBaseURL(r.Context()), entries)
+	// x-bundle-processing-logic (Microsoft-compatible): a recognised value is
+	// carried to the store, which resolves it against the configured default and
+	// concurrency; anything else is ignored. Only transaction Bundles consult it.
+	ctx := r.Context()
+	if mode := parseBundleProcessingLogic(r.Header.Get("x-bundle-processing-logic")); mode != "" {
+		ctx = store.WithBundleProcessing(ctx, mode)
+	}
+
+	results, err := h.store.ExecuteBundle(ctx, bundleType, h.tenantBaseURL(ctx), entries)
 	if err != nil {
 		var be *store.BundleError
 		if errors.As(err, &be) {
@@ -195,6 +203,20 @@ func parseBundleEntries(bundle map[string]any) ([]store.BundleEntryRequest, stri
 func stringField(m map[string]any, key string) string {
 	if v, ok := m[key].(string); ok {
 		return v
+	}
+	return ""
+}
+
+// parseBundleProcessingLogic normalises an x-bundle-processing-logic header
+// value. Recognised values (case-insensitive) are "parallel" and "sequential";
+// anything else — including an absent header — returns "" and the server's
+// configured default applies.
+func parseBundleProcessingLogic(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case store.BundleProcessingParallel:
+		return store.BundleProcessingParallel
+	case store.BundleProcessingSequential:
+		return store.BundleProcessingSequential
 	}
 	return ""
 }

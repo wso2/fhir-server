@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -143,14 +142,21 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 		}
 	}
 
-	// Process in FHIR verb order, preserving original order within each verb.
-	order := make([]int, len(ops))
-	for i := range order {
-		order[i] = i
+	// Parallel execution (x-bundle-processing-logic: parallel, or the configured
+	// default) shards the write ops across K concurrent transactions. It requires
+	// unique write targets — overlap falls back to this serial body, which stays
+	// the default and the reference behavior.
+	if s.parallelTransactionRequested(ctx) {
+		if key := overlappingWriteTarget(ops); key != "" {
+			slog.Info("parallel bundle fell back to serial",
+				"reason", "overlapping resource ids", "key", key, "entries", len(entries))
+		} else if countWriteOps(ops) >= 2 {
+			return s.executeTransactionParallel(ctx, ops)
+		}
 	}
-	sort.SliceStable(order, func(a, b int) bool {
-		return methodOrder(ops[order[a]].method) < methodOrder(ops[order[b]].method)
-	})
+
+	// Process in FHIR verb order, preserving original order within each verb.
+	order := verbOrder(ops)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
