@@ -361,3 +361,63 @@ func TestLoad_Timeouts_NegativeRejected(t *testing.T) {
 		t.Fatal("expected error for negative SERVER_READ_TIMEOUT, got nil")
 	}
 }
+
+// ─── Bundle transaction tunables ─────────────────────────────────────────────
+
+func TestLoad_BundleTransaction_Defaults(t *testing.T) {
+	clearIGEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BundleTransactionConcurrency != 1 {
+		t.Errorf("default BundleTransactionConcurrency: got %d, want 1 (off)", cfg.BundleTransactionConcurrency)
+	}
+	if cfg.BundleTransactionProcessingDefault != "sequential" {
+		t.Errorf("default BundleTransactionProcessingDefault: got %q, want sequential", cfg.BundleTransactionProcessingDefault)
+	}
+}
+
+func TestLoad_BundleTransaction_EnvOverride(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("BUNDLE_TRANSACTION_CONCURRENCY", "8")
+	t.Setenv("BUNDLE_TRANSACTION_PROCESSING_DEFAULT", "parallel")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BundleTransactionConcurrency != 8 {
+		t.Errorf("BundleTransactionConcurrency: got %d, want 8", cfg.BundleTransactionConcurrency)
+	}
+	if cfg.BundleTransactionProcessingDefault != "parallel" {
+		t.Errorf("BundleTransactionProcessingDefault: got %q, want parallel", cfg.BundleTransactionProcessingDefault)
+	}
+}
+
+func TestLoad_BundleTransactionConcurrency_OutOfRange(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("BUNDLE_TRANSACTION_CONCURRENCY", "0") // below the 1 floor
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for out-of-range BUNDLE_TRANSACTION_CONCURRENCY, got nil")
+	}
+	if !strings.Contains(err.Error(), "BUNDLE_TRANSACTION_CONCURRENCY") {
+		t.Errorf("error should name the offending key, got: %v", err)
+	}
+}
+
+func TestLoad_BundleTransactionProcessingDefault_Invalid(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("BUNDLE_TRANSACTION_PROCESSING_DEFAULT", "concurrent")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid BUNDLE_TRANSACTION_PROCESSING_DEFAULT, got nil")
+	}
+	if !strings.Contains(err.Error(), "BUNDLE_TRANSACTION_PROCESSING_DEFAULT") {
+		t.Errorf("error should name the offending key, got: %v", err)
+	}
+}

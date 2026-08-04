@@ -422,3 +422,35 @@ server:
 		t.Errorf("error should not blame the unset env var, got: %v", err)
 	}
 }
+
+func TestLoadFromPath_BundleTransaction_FromFile(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, `
+bundle:
+  transactionConcurrency: 4
+  transactionProcessingDefault: parallel
+`)
+	cfg, err := config.LoadFromPath(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BundleTransactionConcurrency != 4 {
+		t.Errorf("BundleTransactionConcurrency: got %d, want 4", cfg.BundleTransactionConcurrency)
+	}
+	if cfg.BundleTransactionProcessingDefault != "parallel" {
+		t.Errorf("BundleTransactionProcessingDefault: got %q, want parallel", cfg.BundleTransactionProcessingDefault)
+	}
+}
+
+func TestLoadFromPath_BundleTransactionConcurrency_InvalidFileValue_NamesConfigKey(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, "bundle:\n  transactionConcurrency: 65\n") // above the 64 ceiling
+
+	_, err := config.LoadFromPath(path)
+	if err == nil {
+		t.Fatal("expected error for out-of-range bundle.transactionConcurrency, got nil")
+	}
+	if !strings.Contains(err.Error(), "bundle.transactionConcurrency") {
+		t.Errorf("error should name the config key (bundle.transactionConcurrency), got: %v", err)
+	}
+}
