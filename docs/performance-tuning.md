@@ -25,6 +25,8 @@ line to confirm an override took effect.
 | `database.planCacheMode` | `DATABASE_PLAN_CACHE_MODE` | `force_custom_plan` | `force_custom_plan` \| `auto` \| `force_generic_plan` | Per-connection `plan_cache_mode`. **Load-bearing** — see the warning below. |
 | `write.maxRowsPerStatement` | `WRITE_MAX_ROWS_PER_STATEMENT` | `1000` | 100–20,000 | Rows per multi-row `INSERT` in the bundle writer. Also clamped by Postgres's 65,535-parameter protocol limit at write time. Smaller → smaller per-statement parse tree (less backend memory). |
 | `write.maxRowsPerBundle` | `WRITE_MAX_ROWS_PER_BUNDLE` | `100000` | 1,000–100,000,000 | Max index rows a single write transaction may buffer. A write that would exceed it is rejected with **HTTP 413** and rolled back — the safety valve that stops a pathological bundle from OOM-ing the database. Raise for trusted bulk-import windows. |
+| `bundle.transactionConcurrency` | `BUNDLE_TRANSACTION_CONCURRENCY` | `1` | 1–64 | Shard count for parallel transaction bundles. `1` = capability off; every transaction runs the serial path. See §5's parallel-bundles section for the semantics contract before enabling. |
+| `bundle.transactionProcessingDefault` | `BUNDLE_TRANSACTION_PROCESSING_DEFAULT` | `sequential` | `sequential` \| `parallel` | Mode applied when a request has no `x-bundle-processing-logic` header. `parallel` opts whole workloads in without per-request headers (e.g. import harnesses that don't send the header). |
 
 ### Sizing `probeCap`: the √ rule
 
@@ -150,6 +152,54 @@ The writer buffers a transaction's index rows and emits them as multi-row
   A realistic large bundle is ~30–50k index rows, so the default leaves headroom;
   raise it for trusted bulk-import environments where you accept the larger
   transaction, and pair the raise with adequate database memory.
+
+### Parallel transaction bundles (`x-bundle-processing-logic: parallel`)
+
+With `bundle.transactionConcurrency` > 1, a transaction bundle can execute its
+write entries across K concurrent database transactions (mirroring Microsoft
+FHIR server's `x-bundle-processing-logic` header): planning (id assignment,
+conditional resolution, `urn:uuid` reference rewriting) still runs once
+globally, then the DELETE entries execute across K shards, then the
+POST/PUT/PATCH entries, each shard with its own transaction and batched writer;
+after all shards flush successfully the shards are committed in a fast serial
+loop, and GET entries read the committed data. The mode is resolved per
+request: the header wins; an absent header uses
+`bundle.transactionProcessingDefault`; `parallel` is silently ignored while
+`transactionConcurrency` is 1.
+
+**The client's side of the contract** (this is Microsoft's contract too):
+
+- **No two write entries (DELETE/POST/PUT/PATCH) may target the same resource
+  id.** The server verifies this; an overlapping bundle falls back to the
+  serial path — correct result, no speedup — and logs
+  `parallel bundle fell back to serial` at Info.
+- **Atomicity holds up to the commit barrier.** Validation errors, constraint
+  failures, 4xx entry errors, and the 413 row cap all roll back every shard —
+  still all-or-nothing. The only non-atomic window is an infrastructure
+  failure *during* the commit loop itself (milliseconds); the resulting 500
+  names how many shards had already committed. A failing GET entry surfaces
+  after the writes committed (GETs read post-commit).
+- **`meta.lastUpdated` ordering across entries within one parallel bundle is
+  not meaningful** — shards stamp timestamps independently.
+- The `write.maxRowsPerBundle` cap stays a **per-bundle** contract: shard
+  totals are summed at the barrier, and a bundle over the cap is rejected with
+  413 before anything is flushed.
+
+**Pool sizing rule:** every in-flight parallel bundle holds
+`transactionConcurrency` pooled connections simultaneously, so
+`expected_concurrent_bundles × transactionConcurrency ≤ pool max_conns`,
+with headroom for reads. The server warns at startup when a typical 20-VU
+import load would exceed the pool. Watch `pgxpool.Stat()` acquire waits under
+load; sustained waits mean K or the pool is mis-sized.
+
+**Choosing K:** WAL insert-lock contention is the expected ceiling — total WAL
+bytes per bundle are constant in K, only the writer count changes — so gains
+should appear at K=2–4 and flatten (or invert) by K=8. Run a K sweep
+(sequential vs 2, 4, 8) with your own import shape, sampling
+`pg_stat_activity` wait events (`WALInsert`/`WALWrite` growth is the signal),
+and keep the knee. Set `logging.level: debug` to get per-phase spans
+(`parallel bundle phase`: delete/execute/flush/commit durations) from the
+executor while measuring.
 
 ### `SERVER_WRITE_TIMEOUT` must exceed the worst-case bundle import
 
