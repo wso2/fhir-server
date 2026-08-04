@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -28,6 +29,20 @@ import (
 
 	"github.com/jackc/pgx/v5"
 )
+
+// shardAcquireTimeout bounds how long a parallel bundle may wait to open its K
+// shard transactions. A bundle holds its already-opened shards while waiting
+// for the rest, so an unbounded wait can deadlock: against itself when K
+// exceeds the pool (every connection held by this bundle, the next Begin waits
+// forever), or against other bundles each holding a partial allocation. Past
+// the timeout the bundle releases everything and runs serially instead —
+// parallelism is an optimization, never worth blocking a request on.
+const shardAcquireTimeout = 2 * time.Second
+
+// errParallelUnavailable signals executeTransaction to run the serial body:
+// the parallel executor could not acquire its shard connections in time.
+// Never surfaced to clients.
+var errParallelUnavailable = errors.New("parallel shard connections unavailable")
 
 // ─── Tuning & request-mode plumbing ───────────────────────────────────────────
 
@@ -163,6 +178,13 @@ func (s *Store) executeTransactionParallel(ctx context.Context, ops []bundleOp) 
 	if n := len(deletes) + len(writes); k > n {
 		k = n
 	}
+	// A bundle can never use more shards than the pool has connections — asking
+	// for more self-deadlocks (this bundle would hold every connection while
+	// waiting for one more). Clamp, don't fail: fewer shards is just less overlap.
+	if mc := int(s.pool.Config().MaxConns); k > mc {
+		slog.Debug("parallel bundle shard count clamped to pool size", "requested", k, "poolMaxConns", mc)
+		k = mc
+	}
 
 	// Same deferred-resources read-set as serial: a POSTed row buffered for the
 	// batched insert must not be one a later entry reads back inside the shard
@@ -181,8 +203,12 @@ func (s *Store) executeTransactionParallel(ctx context.Context, ops []bundleOp) 
 		}
 	}
 
-	// One transaction + writer per shard, opened up front so a Begin failure
+	// One transaction + writer per shard, opened up front so acquisition failure
 	// aborts before any work starts. Rollback of a committed tx is a no-op error.
+	// Acquisition is time-bounded: this bundle holds its opened shards while
+	// waiting for the rest, so under pool contention (other bundles doing the
+	// same) an unbounded wait can deadlock. On timeout every opened shard is
+	// released (the deferred rollbacks) and the caller runs the serial body.
 	type shard struct {
 		tx pgx.Tx
 		w  *bundleWriter
@@ -193,14 +219,26 @@ func (s *Store) executeTransactionParallel(ctx context.Context, ops []bundleOp) 
 			_ = sh.tx.Rollback(ctx)
 		}
 	}()
+	beginCtx, beginCancel := context.WithTimeout(ctx, shardAcquireTimeout)
+	defer beginCancel()
 	for i := 0; i < k; i++ {
-		tx, err := s.pool.Begin(ctx)
+		// beginCtx only bounds connection acquisition + BEGIN; the returned tx is
+		// not tied to it — every later statement runs on pctx/ctx.
+		tx, err := s.pool.Begin(beginCtx)
 		if err != nil {
-			return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+			if ctx.Err() != nil {
+				// The request itself died (client disconnect / server timeout) —
+				// surface that; a serial retry would fail the same way.
+				return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+			}
+			return nil, errParallelUnavailable
 		}
 		shards = append(shards, &shard{tx: tx, w: s.newBundleWriter(ctx)})
-		if err := setTenantTx(ctx, tx); err != nil {
-			return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+		if err := setTenantTx(beginCtx, tx); err != nil {
+			if ctx.Err() != nil {
+				return nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: -1, Diagnostics: err.Error()}
+			}
+			return nil, errParallelUnavailable
 		}
 	}
 

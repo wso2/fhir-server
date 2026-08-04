@@ -189,8 +189,13 @@ request: the header wins; an absent header uses
 `transactionConcurrency` pooled connections simultaneously, so
 `expected_concurrent_bundles × transactionConcurrency ≤ pool max_conns`,
 with headroom for reads. The server warns at startup when a typical 20-VU
-import load would exceed the pool. Watch `pgxpool.Stat()` acquire waits under
-load; sustained waits mean K or the pool is mis-sized.
+import load would exceed the pool. Two safeguards make mis-sizing degrade
+instead of deadlock: the shard count is clamped to the pool's `max_conns`
+(a bundle can never wait on connections it already holds), and a bundle that
+cannot acquire its shard connections within a short timeout releases them and
+runs serially (logged at Info as `shard connections unavailable`). Frequent
+fallback logs — or sustained `pgxpool.Stat()` acquire waits — mean K or the
+pool is mis-sized.
 
 **Choosing K:** WAL insert-lock contention is the expected ceiling — total WAL
 bytes per bundle are constant in K, only the writer count changes — so gains

@@ -406,7 +406,64 @@ func TestParallelBundle_RowCapRejected(t *testing.T) {
 	}
 }
 
-// ─── 6. Tenant stamping ───────────────────────────────────────────────────────
+// ─── 6. Pool smaller than K: clamp + contention fallback ─────────────────────
+
+// TestParallelBundle_PoolSmallerThanK reproduces the CI deadlock: K=8 against
+// a pool of MaxConns=2. The shard count must clamp to the pool size (never
+// self-deadlock waiting for connections this bundle already holds), and when
+// the pool is actively contended the bundle must fall back to the serial path
+// after the acquisition timeout instead of blocking forever.
+func TestParallelBundle_PoolSmallerThanK(t *testing.T) {
+	logs := captureLogs(t)
+	admin := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, admin)
+
+	cfg := admin.Config()
+	cfg.MaxConns = 2
+	small, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("small pool: %v", err)
+	}
+	t.Cleanup(small.Close)
+
+	s := store.New(small, reg, store.WithBundleTuning(store.BundleTuning{TransactionConcurrency: 8}))
+
+	// Uncontended: K clamps from 8 to the pool's 2 and the bundle still runs
+	// on the parallel executor. Pre-fix this call never returned.
+	if _, err := s.ExecuteBundle(parallelCtx(), "transaction", "", syntheaEntries("cl", 2)); err != nil {
+		t.Fatalf("clamped parallel ExecuteBundle: %v", err)
+	}
+	if !ranParallel(logs.String()) {
+		t.Error("clamped bundle should still run on the parallel executor")
+	}
+	if !strings.Contains(logs.String(), `"shards":2`) {
+		t.Error("expected the shard count clamped to the pool size (shards=2)")
+	}
+
+	// Contended: hold one of the two connections for the duration. Shard
+	// acquisition times out, every held shard is released, and the bundle
+	// completes on the serial path.
+	conn, err := small.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire blocker conn: %v", err)
+	}
+	defer conn.Release()
+
+	results, err := s.ExecuteBundle(parallelCtx(), "transaction", "", syntheaEntries("ct", 2))
+	if err != nil {
+		t.Fatalf("contended ExecuteBundle should fall back to serial and succeed: %v", err)
+	}
+	for i, r := range results {
+		if !strings.HasPrefix(r.Status, "20") {
+			t.Errorf("entry %d status = %q, want 2xx", i, r.Status)
+		}
+	}
+	if !strings.Contains(logs.String(), "shard connections unavailable") {
+		t.Error("expected the Info fallback log for shard-connection contention")
+	}
+}
+
+// ─── 7. Tenant stamping ───────────────────────────────────────────────────────
 
 // TestParallelBundle_TenantStamping runs a K=8 bundle under an explicit tenant
 // and verifies every row every shard wrote carries that tenant.

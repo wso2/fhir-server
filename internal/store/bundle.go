@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -145,13 +146,19 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	// Parallel execution (x-bundle-processing-logic: parallel, or the configured
 	// default) shards the write ops across K concurrent transactions. It requires
 	// unique write targets — overlap falls back to this serial body, which stays
-	// the default and the reference behavior.
+	// the default and the reference behavior — as does a pool too contended to
+	// yield the shard connections within the acquisition timeout.
 	if s.parallelTransactionRequested(ctx) {
 		if key := overlappingWriteTarget(ops); key != "" {
 			slog.Info("parallel bundle fell back to serial",
 				"reason", "overlapping resource ids", "key", key, "entries", len(entries))
 		} else if countWriteOps(ops) >= 2 {
-			return s.executeTransactionParallel(ctx, ops)
+			results, perr := s.executeTransactionParallel(ctx, ops)
+			if !errors.Is(perr, errParallelUnavailable) {
+				return results, perr
+			}
+			slog.Info("parallel bundle fell back to serial",
+				"reason", "shard connections unavailable", "entries", len(entries))
 		}
 	}
 
