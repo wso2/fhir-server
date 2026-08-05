@@ -10,7 +10,7 @@ the user-facing developer guide. This document owns the *rationale*.
 
 - **FHIR version:** R4 (4.0.1)
 - **Language:** Go 1.25
-- **Database:** PostgreSQL 13+ (PostGIS optional, only for `Location.near`)
+- **Database:** PostgreSQL 14+ (tested through 18; PostGIS optional, only for `Location.near`)
 
 ---
 

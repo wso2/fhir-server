@@ -60,11 +60,27 @@ type UnsupportedParamError struct{ Msg string }
 
 func (e *UnsupportedParamError) Error() string { return e.Msg }
 
+// newQueryBuilder constructs a query builder carrying the store's configured
+// search tunables, so every search built here honors search.probeCap /
+// search.maxChainDepth (see SearchTuning).
+func (s *Store) newQueryBuilder(ctx context.Context, rt string) *queryBuilder {
+	return &queryBuilder{
+		rt: rt, reg: s.registry, terminology: s.terminology, ctx: ctx,
+		probeCap:      s.tuning.ProbeCap,
+		maxChainDepth: s.tuning.MaxChainDepth,
+	}
+}
+
 // Search executes a FHIR search against the resources + sp_* tables,
 // and resolves _include / _revinclude parameters.
 func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, error) {
 	if sp.PageSize <= 0 {
-		sp.PageSize = 20
+		sp.PageSize = s.tuning.DefaultPageSize
+	}
+	// Clamp a client-supplied _count to the configured maximum. MaxPageSize 0 is
+	// unlimited (legacy behavior), so the clamp is a no-op at the default.
+	if s.tuning.MaxPageSize > 0 && sp.PageSize > s.tuning.MaxPageSize {
+		sp.PageSize = s.tuning.MaxPageSize
 	}
 	if sp.Page <= 0 {
 		sp.Page = 1
@@ -92,7 +108,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		sp.Params = params
 	}
 
-	b := &queryBuilder{rt: sp.ResourceType, reg: s.registry, terminology: s.terminology, ctx: ctx}
+	b := s.newQueryBuilder(ctx, sp.ResourceType)
 	b.writeBase()
 
 	for rawKey, values := range sp.Params {
@@ -116,6 +132,18 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		return SearchResult{}, err
 	}
 	defer c.Release()
+
+	// Density probe: for a lone half-bounded quantity/date comparator the planner's
+	// per-column estimate is unreliable in both directions, so measure the match
+	// density directly and pin the fetch plan (design-addendum §3.2). No-op for
+	// every other search shape, and skipped for _summary=count (no rows fetched, so
+	// the fetch plan the probe would pin is never built).
+	if !sp.CountOnly {
+		if err := b.decidePlan(ctx, c); err != nil {
+			slog.Error("search density probe failed", "resourceType", sp.ResourceType, "err", err)
+			return SearchResult{}, err
+		}
+	}
 
 	// _summary=count: only the total is needed, no rows to fetch.
 	if sp.CountOnly {
@@ -300,7 +328,59 @@ type queryBuilder struct {
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
 	err error
+	// probe describes a lone half-bounded comparator (ge/gt/eb/le/lt/sa) on
+	// sp_quantity or sp_date whose selectivity the per-column histogram estimates
+	// unreliably in both directions (see design-addendum §1, findings 1–2). When
+	// set, Search runs a capped existence count (decidePlan) before the fetch and
+	// pins the plan via planDense, instead of trusting the planner's estimate.
+	probe *densityProbe
+	// planDense records the density-probe verdict: planUnknown keeps the current
+	// planner-chooses shape; planSparse pins the sp-first value-index seek with a
+	// MATERIALIZED CTE; planDenseWalk keeps the recency walk. Read by directDriveSQL.
+	planDense planVerdict
+	// probeCap and maxChainDepth are the performance tunables carried from the
+	// store's config (see SearchTuning). A zero value means "unset" — the builder
+	// falls back to the package default (defaultProbeCap / defaultMaxChainDepth),
+	// so a directly-constructed builder in tests behaves as before.
+	probeCap      int
+	maxChainDepth int
 }
+
+// densityProbe is a self-contained capped existence count for one half-bounded
+// comparator. It carries its own args and a $1..$3 predicate so it can run
+// independently of the main query's placeholder numbering.
+type densityProbe struct {
+	table    string // sp_quantity or sp_date
+	boundCol string // value_high or value_low
+	op       string // >= > < <=
+	rt       string // resource_type
+	param    string // param_name
+	bound    any    // the comparator bound value (quantized float64 / time.Time)
+}
+
+type planVerdict int8
+
+const (
+	planUnknown planVerdict = iota
+	planSparse
+	planDenseWalk
+)
+
+// defaultProbeCap is the built-in density-probe cap, used when the store carries
+// no configured value (SearchTuning.ProbeCap == 0). The probe's capped count stops
+// at this many matches: below it the sp-first seek's worst case is a top-N sort
+// over <cap narrow index-only rows; at it, the recency walk fills a page within a
+// few thousand covered entries. 5000 keeps both branches comfortably under 10ms.
+// Configurable via search.probeCap (see docs/performance-tuning.md).
+const defaultProbeCap = 5000
+
+// defaultSearchPageSize is the page size used when a request omits _count.
+// Configurable via search.defaultPageSize.
+const defaultSearchPageSize = 20
+
+// defaultMaxPageSize is the built-in clamp on client-supplied _count; 0 means
+// unlimited (legacy behavior). Configurable via search.maxPageSize.
+const defaultMaxPageSize = 0
 
 // sortKey is one component of a _sort directive: the search param name and
 // whether the order is descending (the param was prefixed with '-').
@@ -520,6 +600,23 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 		return "", false
 	}
 
+	// Token+quantity composites route to the dedicated single table
+	// sp_composite_token_quantity, where the code equality and value range live in
+	// one index scan (see buildCompositeTokenQuantityExists). The materialised rows
+	// pair the two components per element, so this is also the spec-correct path:
+	// the legacy fall-through below correlates the components only on resource_id,
+	// which false-matches multi-component resources. Other component-type pairs keep
+	// the legacy path.
+	type1 := b.resolvedParamType(comp1Name)
+	type2 := b.resolvedParamType(comp2Name)
+	if isTokenQuantityPair(type1, type2) {
+		tokVal, qtyVal := val1, val2
+		if type1 == "quantity" { // components in (quantity, token) order
+			tokVal, qtyVal = val2, val1
+		}
+		return b.buildCompositeTokenQuantityExists(param, tokVal, qtyVal)
+	}
+
 	// Build the two component SELECT bodies. Each is a fully-formed
 	// "SELECT 1 FROM sp_<type> s WHERE s.resource_id = r.fhir_id AND …"
 	// correlated to the outer resource row. suppressDirectDrive stops a numeric
@@ -549,6 +646,130 @@ func (b *queryBuilder) buildCompositeExists(def searchparam.Definition, param, v
 	// semi-joins driven by the more selective component's sp_* index, rather
 	// than a correlated subplan run once per candidate resource row.
 	return cond1 + " AND EXISTS (" + cond2 + ")", true
+}
+
+// isTokenQuantityPair reports whether two component types are exactly one token
+// and one quantity (in either order) — the pair materialised into
+// sp_composite_token_quantity.
+func isTokenQuantityPair(t1, t2 string) bool {
+	return (t1 == "token" && t2 == "quantity") || (t1 == "quantity" && t2 == "token")
+}
+
+// buildCompositeTokenQuantityExists builds the correlated EXISTS body for a
+// token+quantity composite against the single sp_composite_token_quantity table,
+// where each row is a per-element token+quantity pairing. tokVal is the token
+// component value ("system|code" or bare code); qtyVal is the quantity component
+// value ("[prefix]number|system|unit"). Placeholders are appended to b.args in
+// left-to-right order so the same body serves both the WHERE/count form and the
+// direct-drive candidate scan (captured below), exactly as buildQuantityExists
+// does for sp_quantity.
+func (b *queryBuilder) buildCompositeTokenQuantityExists(param, tokVal, qtyVal string) (string, bool) {
+	rtP := b.next(b.rt)
+	pP := b.next(param)
+
+	// Token component: system|code, bare system|, |code, or bare code. code is
+	// NOT NULL in the table, so a bare code always resolves to an equality.
+	var tokCond string
+	if parts := strings.SplitN(tokVal, "|", 2); len(parts) == 2 {
+		sys, code := parts[0], parts[1]
+		switch {
+		case sys != "" && code != "":
+			sP := b.next(sys)
+			cP := b.next(code)
+			tokCond = fmt.Sprintf("s.system = %s AND s.code = %s", sP, cP)
+		case sys != "":
+			tokCond = fmt.Sprintf("s.system = %s", b.next(sys))
+		default:
+			tokCond = fmt.Sprintf("s.code = %s", b.next(code))
+		}
+	} else {
+		tokCond = fmt.Sprintf("s.code = %s", b.next(tokVal))
+	}
+
+	qtyCond := b.compositeQtyCond(qtyVal)
+	if b.err != nil {
+		return "", false
+	}
+
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s AND %s", rtP, pP, tokCond, qtyCond)
+
+	// Capture the correlation-free body so fetchSQL can drive the id-first
+	// candidate scan straight off sp_composite_token_quantity (planner picks the
+	// value-driven code_value index or the recency walk). Skipped inside a nested
+	// context (chained / _has), whose full predicate is more than this one body.
+	if !b.suppressDirectDrive {
+		b.numericTable = "sp_composite_token_quantity"
+		b.numericBodies = append(b.numericBodies, body)
+	}
+	return "SELECT 1 FROM sp_composite_token_quantity s WHERE s.resource_id = r.fhir_id AND " + body, true
+}
+
+// compositeQtyCond builds the quantity-component predicate on the
+// sp_composite_token_quantity value columns. It mirrors buildQuantityExists
+// byte-for-byte: doubly bounded eq/ne/ap emit the numrange overlap so the stored
+// "numrange(s.value_low, s.value_high, '[]')" matches idx_sp_comp_tokqty_range_gist
+// exactly, while the half-bounded prefixes collapse to a scalar on one bound column
+// (ge/gt/eb on value_high → idx_sp_comp_tokqty_code_high; le/lt/sa on value_low →
+// idx_sp_comp_tokqty_code_value). Keep the two functions in lockstep or bounded
+// composite searches would disagree with plain quantity searches at the edges. A
+// unit-scoped search ("…|system|unit") adds qty_system / qty_code equality,
+// resolved from the index INCLUDE columns without a heap fetch.
+func (b *queryBuilder) compositeQtyCond(value string) string {
+	numPart := value
+	var qsys, qcode string
+	if parts := strings.SplitN(value, "|", 3); len(parts) > 1 {
+		numPart = parts[0]
+		qsys = parts[1]
+		if len(parts) == 3 {
+			qcode = parts[2]
+		}
+	}
+	prefix, numStr := extractComparatorPrefix(numPart)
+	// Fail closed on a non-numeric or non-finite value rather than centring the
+	// range on zero (which would silently match value≈0 rows). Validate before
+	// binding any placeholder so nothing is left orphaned.
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("composite quantity component %q must be a finite number", value)}
+		return ""
+	}
+	eps := math.Abs(f) * 1e-7
+	if eps == 0 {
+		eps = 1e-7
+	}
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
+
+	const stored = "numrange(s.value_low, s.value_high, '[]')"
+	var cond string
+	switch prefix {
+	case "ge":
+		cond = fmt.Sprintf("s.value_high >= %s", b.next(low))
+	case "gt":
+		cond = fmt.Sprintf("s.value_high > %s", b.next(high))
+	case "eb":
+		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
+	case "le":
+		cond = fmt.Sprintf("s.value_low <= %s", b.next(high))
+	case "lt":
+		cond = fmt.Sprintf("s.value_low < %s", b.next(low))
+	case "sa":
+		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
+	case "ne":
+		lP := b.next(low)
+		hP := b.next(high)
+		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
+	default: // eq, ap — doubly bounded overlap, byte-identical to the GiST index expr
+		lP := b.next(low)
+		hP := b.next(high)
+		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
+	}
+	if qsys != "" {
+		cond += fmt.Sprintf(" AND s.qty_system = %s", b.next(qsys))
+	}
+	if qcode != "" {
+		cond += fmt.Sprintf(" AND s.qty_code = %s", b.next(qcode))
+	}
+	return cond
 }
 
 // compositeDrive holds a composite search decomposed into a candidate driver
@@ -724,15 +945,22 @@ func (b *queryBuilder) applyChained(ref, targetType, targetParam, targetModifier
 	}
 }
 
-const maxChainDepth = 5 // prevent pathological queries
+// defaultMaxChainDepth is the built-in chained-parameter recursion bound, used
+// when the store carries no configured value (SearchTuning.MaxChainDepth == 0).
+// Configurable via search.maxChainDepth (see docs/performance-tuning.md).
+const defaultMaxChainDepth = 5 // prevent pathological queries
 
 // buildChainedCondition builds the EXISTS…IN SQL fragment for one hop of a
 // chained search, recursing for multi-hop chains.
 // sourceType is the type of the resource at the current hop (the one we're
 // filtering by the sp_reference table).
 func (b *queryBuilder) buildChainedCondition(sourceType, ref, targetType, targetParam, targetModifier, value string, depth int) string {
-	if depth > maxChainDepth {
-		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("chained search exceeds maximum depth %d", maxChainDepth)}
+	maxDepth := b.maxChainDepth
+	if maxDepth <= 0 {
+		maxDepth = defaultMaxChainDepth
+	}
+	if depth > maxDepth {
+		b.err = &UnsupportedParamError{Msg: fmt.Sprintf("chained search exceeds maximum depth %d", maxDepth)}
 		return ""
 	}
 
@@ -1019,6 +1247,14 @@ func idFirstType(paramType string) bool {
 	// which then has to materialize and sort the entire match set.
 	case "quantity", "number", "composite":
 		return true
+	case "date", "dateTime", "instant", "Period":
+		// sp_date joined the id-first family once it gained a last_updated recency
+		// column (design-addendum Phase 2/3.1). Half-bounded date ranges are
+		// mis-estimated exactly like quantity — the planner underestimated the
+		// Encounter?date=ge… match set and chose an sp-first materialize that did
+		// 17k per-row resources lookups (finding 2). Direct-drive plus the density
+		// probe give it the recency-walk / value-seek pair instead.
+		return true
 	default:
 		return false
 	}
@@ -1083,32 +1319,61 @@ func (b *queryBuilder) buildStringExists(param, modifier, value string) string {
 	}
 }
 
+// captureEqualityDrive records a token/reference equality body so a lone such
+// predicate drives the sp-first ordered walk (§3.2/§3.3 of the plan-selection
+// standard) instead of a resources-first EXISTS: the predicate columns sit before
+// last_updated in the recency index, so a single scan seeks the value and walks
+// newest-first within only the matching entries — one plan, always optimal, no
+// probe. Guarded so nested predicates (composite / chained / _has, via
+// suppressDirectDrive) and the type-unknown heuristic path (resolvedParamType
+// returns "") never capture — a stray capture there would make directDrive emit
+// only this body and drop the surrounding structure. usesSP selects the id-first
+// fetch strategy; equality density is irrelevant so no density probe is set.
+func (b *queryBuilder) captureEqualityDrive(table, param, body string) {
+	if b.suppressDirectDrive {
+		return
+	}
+	pt := b.resolvedParamType(param)
+	if (table == "sp_token" && pt != "token") || (table == "sp_reference" && pt != "reference") {
+		return
+	}
+	b.numericTable = table
+	b.numericBodies = append(b.numericBodies, body)
+	b.usesSP = true
+}
+
 func (b *queryBuilder) buildTokenExists(param, modifier, value string) string {
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 	// :text matches the human-readable display/text of the token (case-insensitive
-	// substring), not its code.
+	// substring), not its code — a LIKE range scan, so it stays on the correlated
+	// path and is never captured for the equality walk.
 	if modifier == "text" {
 		vP := b.next("%" + strings.ToLower(value) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND LOWER(s.display) LIKE %s", rtP, pP, vP)
 	}
-	parts := strings.SplitN(value, "|", 2)
-	if len(parts) == 2 {
+	var cond string
+	if parts := strings.SplitN(value, "|", 2); len(parts) == 2 {
 		sys, code := parts[0], parts[1]
-		if sys == "" {
-			cP := b.next(code)
-			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, cP)
-		}
-		if code == "" {
+		switch {
+		case sys == "":
+			cond = fmt.Sprintf("s.code = %s", b.next(code))
+		case code == "":
+			cond = fmt.Sprintf("s.system = %s", b.next(sys))
+		default:
 			sP := b.next(sys)
-			return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s", rtP, pP, sP)
+			cP := b.next(code)
+			cond = fmt.Sprintf("s.system = %s AND s.code = %s", sP, cP)
 		}
-		sP := b.next(sys)
-		cP := b.next(code)
-		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.system = %s AND s.code = %s", rtP, pP, sP, cP)
+	} else {
+		cond = fmt.Sprintf("s.code = %s", b.next(value))
 	}
-	vP := b.next(value)
-	return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.code = %s", rtP, pP, vP)
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone token equality search drives the
+	// sp-first walk off idx_sp_tok_recent. The explicit s.tenant_id below (also on
+	// the captured side, added by directDriveSQL) satisfies §3.5.
+	b.captureEqualityDrive("sp_token", param, body)
+	return "SELECT 1 FROM sp_token s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildTokenInExists expands a ValueSet URL and builds an IN/NOT IN subquery
@@ -1226,34 +1491,81 @@ func (b *queryBuilder) buildTokenHierarchyExists(param, modifier, value string) 
 	return b.tokenCodeSetExists(param, codes), true
 }
 
+// halfBoundedColOp maps a half-bounded comparator to its collapsed scalar
+// predicate: the bound column, the SQL operator, and whether it reads the search
+// band's high edge (else the low edge). ok is false for eq/ne/ap, which are
+// doubly bounded and not probe-eligible. Shared by the date and quantity paths so
+// the comparator-to-column mapping has one source of truth (parent doc §1):
+//
+//	value_high family: ge (>= low), gt (> high), eb (< low)
+//	value_low  family: le (<= high), lt (< low), sa (> high)
+func halfBoundedColOp(prefix string) (col, op string, useHigh, ok bool) {
+	switch prefix {
+	case "ge":
+		return "value_high", ">=", false, true
+	case "gt":
+		return "value_high", ">", true, true
+	case "eb":
+		return "value_high", "<", false, true
+	case "le":
+		return "value_low", "<=", true, true
+	case "lt":
+		return "value_low", "<", false, true
+	case "sa":
+		return "value_low", ">", true, true
+	default:
+		return "", "", false, false
+	}
+}
+
+// buildDateExists emits the sp_date predicate for a date/period search. The
+// comparator-to-bound-column mapping matches the quantity path (parent doc §1):
+// the half-bounded prefixes collapse to a scalar on the correct column so a
+// straddling stored period is matched correctly — an Encounter [2021-01-01,
+// 2021-06-01] satisfies gt2021-02-16 (value_high) and lt2021-02-16 (value_low).
+// Before the fix gt read value_low (sa semantics) and lt read value_high (eb),
+// which wrongly excluded straddling periods (design-addendum §1, finding 4).
 func (b *queryBuilder) buildDateExists(param, value string) string {
 	prefix, dateStr := extractComparatorPrefix(value)
 	low, high := expandDateRange(dateStr)
 	rtP := b.next(b.rt)
 	pP := b.next(param)
-	// Only bind the args actually referenced by each operator to avoid PG arg-count mismatch.
-	switch prefix {
-	case "gt":
-		highP := b.next(high)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_low > %s", rtP, pP, highP)
-	case "lt":
-		lowP := b.next(low)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_high < %s", rtP, pP, lowP)
-	case "ge":
-		lowP := b.next(low)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_high >= %s", rtP, pP, lowP)
-	case "le":
-		highP := b.next(high)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_low <= %s", rtP, pP, highP)
-	case "ne":
+
+	var cond string
+	if col, op, useHigh, ok := halfBoundedColOp(prefix); ok {
+		bound := low
+		if useHigh {
+			bound = high
+		}
+		cond = fmt.Sprintf("s.%s %s %s", col, op, b.next(bound))
+		if !b.suppressDirectDrive {
+			b.probe = &densityProbe{table: "sp_date", boundCol: col, op: op, rt: b.rt, param: param, bound: bound}
+		}
+	} else if prefix == "ne" {
 		highP := b.next(high)
 		lowP := b.next(low)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND NOT (s.value_low <= %s AND s.value_high >= %s)", rtP, pP, highP, lowP)
-	default: // eq
+		cond = fmt.Sprintf("NOT (s.value_low <= %s AND s.value_high >= %s)", highP, lowP)
+	} else { // eq, ap — doubly bounded interval overlap
 		highP := b.next(high)
 		lowP := b.next(low)
-		return fmt.Sprintf("SELECT 1 FROM sp_date s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_low <= %s AND s.value_high >= %s", rtP, pP, highP, lowP)
+		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
 	}
+
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone date predicate can drive the
+	// id-first fetch straight off sp_date (see directDriveSQL). sp_date now carries
+	// a last_updated recency column (schema §sp_date), so it supports the same
+	// dual-plan shapes as sp_quantity. Skipped in nested contexts (composite /
+	// chained / _has), whose full predicate is more than this one body.
+	if !b.suppressDirectDrive {
+		b.numericTable = "sp_date"
+		b.numericBodies = append(b.numericBodies, body)
+	}
+	// Explicit tenant scope on the EXISTS side (design-addendum §2, Phase 1): makes
+	// the tenant predicate visible to the planner rather than relying on RLS
+	// injection alone. The captured body omits it because directDriveSQL adds the
+	// same tenant predicate itself.
+	return "SELECT 1 FROM sp_date s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 func (b *queryBuilder) buildNumberExists(param, value string) string {
@@ -1263,18 +1575,30 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 	if eps == 0 {
 		eps = 1e-7
 	}
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 	var cond string
-	switch prefix {
-	case "gt":
-		cond = fmt.Sprintf("s.value_high > %s", b.next(f))
-	case "lt":
-		cond = fmt.Sprintf("s.value_low < %s", b.next(f))
-	default: // eq
-		highP := b.next(f + eps)
-		lowP := b.next(f - eps)
-		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
+	if col, op, useHigh, ok := halfBoundedColOp(prefix); ok {
+		// Half-bounded: collapse to the scalar on the correct bound column and set
+		// the density probe, exactly like sp_quantity (§3.1/§3.4). Previously ge/le/
+		// sa/eb fell through to the eq overlap — a latent correctness gap.
+		bound := low
+		if useHigh {
+			bound = high
+		}
+		cond = fmt.Sprintf("s.%s %s %s", col, op, b.next(bound))
+		if !b.suppressDirectDrive {
+			b.probe = &densityProbe{table: "sp_number", boundCol: col, op: op, rt: b.rt, param: param, bound: bound}
+		}
+	} else if prefix == "ne" {
+		hP := b.next(high)
+		lP := b.next(low)
+		cond = fmt.Sprintf("NOT (s.value_low <= %s AND s.value_high >= %s)", hP, lP)
+	} else { // eq, ap — doubly bounded interval overlap
+		hP := b.next(high)
+		lP := b.next(low)
+		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", hP, lP)
 	}
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
 	// Capture the correlation-free body so a lone number predicate can drive the
@@ -1284,7 +1608,7 @@ func (b *queryBuilder) buildNumberExists(param, value string) string {
 		b.numericTable = "sp_number"
 		b.numericBodies = append(b.numericBodies, body)
 	}
-	return "SELECT 1 FROM sp_number s WHERE s.resource_id = r.fhir_id AND " + body
+	return "SELECT 1 FROM sp_number s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildReferenceExists matches a reference param against sp_reference. It accepts
@@ -1314,13 +1638,21 @@ func (b *queryBuilder) buildReferenceExists(param, modifier, value string) strin
 		// e.g. subject:Patient=123 — the modifier names the target type.
 		typ = modifier
 	}
+	var cond string
 	if typ != "" {
 		tP := b.next(typ)
 		iP := b.next(id)
-		return fmt.Sprintf("SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.target_type = %s AND s.target_id = %s", rtP, pP, tP, iP)
+		cond = fmt.Sprintf("s.target_type = %s AND s.target_id = %s", tP, iP)
+	} else {
+		cond = fmt.Sprintf("s.target_id = %s", b.next(id))
 	}
-	iP := b.next(id)
-	return fmt.Sprintf("SELECT 1 FROM sp_reference s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.target_id = %s", rtP, pP, iP)
+	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
+	// Capture the correlation-free body so a lone reference search drives the
+	// sp-first walk off idx_sp_ref_recent (typed form seeks target_type/target_id
+	// then walks last_updated). :identifier above stays on the correlated path —
+	// it matches identifier_system/value on a different index.
+	b.captureEqualityDrive("sp_reference", param, body)
+	return "SELECT 1 FROM sp_reference s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND s.resource_id = r.fhir_id AND " + body
 }
 
 // buildQuantityExists matches a quantity param against sp_quantity. The value is
@@ -1342,7 +1674,7 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	if eps == 0 {
 		eps = 1e-7
 	}
-	low, high := f-eps, f+eps
+	low, high := quantizeBand(f-eps), quantizeBand(f+eps)
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 
@@ -1350,38 +1682,66 @@ func (b *queryBuilder) buildQuantityExists(param, value string) string {
 	// buildDateExists) so boundary values are not matched incorrectly — e.g. an
 	// indexed 5 must not satisfy gt5.
 	//
-	// eq/ne/ge/le are interval overlap: the stored [value_low, value_high] band
-	// and the search band match iff value_low <= searchHigh AND value_high >=
-	// searchLow. Emitting that as a numrange && numrange (overlaps) lets the
-	// planner reach idx_sp_qty_range_gist (schema v12) instead of only the btree
-	// value indexes — the scalar two-bound form cannot touch the GiST expression
-	// index. The stored numrange bracket must match the index expression exactly
-	// (numrange(value_low, value_high, '[]')) or the planner won't recognise it.
-	// A NULL numrange bound is unbounded, giving the one-sided ge/le prefixes the
-	// half-open search band they need. gt/lt are strict — the stored band lies
-	// entirely above/below the search point, which is not overlap — so they stay
-	// as scalar bound comparisons (still served by idx_sp_qty_raw / _recent).
+	// eq/ne/ap are doubly bounded: the stored [value_low, value_high] band and the
+	// search band match iff value_low <= searchHigh AND value_high >= searchLow.
+	// Emitting that as a numrange && numrange (overlaps) lets the planner reach
+	// idx_sp_qty_range_gist instead of only the btree value indexes — the scalar
+	// two-bound form cannot touch the GiST expression index. The stored numrange
+	// bracket must match the index expression exactly (numrange(value_low,
+	// value_high, '[]')) or the planner won't recognise it. This emission stays
+	// untouched so windowed queries keep riding the GiST path.
+	//
+	// The half-bounded prefixes each have one infinite search bound, so the overlap
+	// collapses to a single scalar comparison on one bound column (design "Fast
+	// Half-Bounded Quantity Searches", §2.1). Two families:
+	//   value_high-driven: ge (value_high >= searchLow), gt (value_high > searchHigh),
+	//                      eb (value_high < searchLow)          — served by idx_sp_qty_high
+	//   value_low-driven:  le (value_low <= searchHigh), lt (value_low < searchLow),
+	//                      sa (value_low > searchHigh)          — served by idx_sp_qty_raw
+	// Both seek the bound directly after the (tenant, type, param) equality prefix
+	// instead of scanning the whole partition and post-filtering (the old ge/le
+	// numrange && half-open probe overlapped nearly every GiST leaf; the old gt/lt
+	// scalar rode the wrong bound column). The comparator is the ONLY branch point,
+	// and the collapsed forms are algebraically the overlap forms with one infinite
+	// bound, so emitting the scalar on the *correct* column preserves straddling
+	// correctness: [50, 100050] matches ge99999 via value_high and lt100 via
+	// value_low. gt/lt stay against the search band edge (searchHigh / searchLow),
+	// not the bare value, so they remain exclusive against a stored value's own
+	// precision band — an indexed 5 still fails gt5 and lt5.
 	const stored = "numrange(s.value_low, s.value_high, '[]')"
 	var cond string
 	switch prefix {
-	case "gt":
-		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
-	case "lt":
-		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "ge":
-		// [searchLow, ∞) — overlap iff value_high >= searchLow.
-		cond = fmt.Sprintf("%s && numrange(%s, NULL, '[]')", stored, b.next(low))
+		cond = fmt.Sprintf("s.value_high >= %s", b.next(low))
+	case "gt":
+		cond = fmt.Sprintf("s.value_high > %s", b.next(high))
+	case "eb":
+		cond = fmt.Sprintf("s.value_high < %s", b.next(low))
 	case "le":
-		// (-∞, searchHigh] — overlap iff value_low <= searchHigh.
-		cond = fmt.Sprintf("%s && numrange(NULL, %s, '[]')", stored, b.next(high))
+		cond = fmt.Sprintf("s.value_low <= %s", b.next(high))
+	case "lt":
+		cond = fmt.Sprintf("s.value_low < %s", b.next(low))
+	case "sa":
+		cond = fmt.Sprintf("s.value_low > %s", b.next(high))
 	case "ne":
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("NOT (%s && numrange(%s, %s, '[]'))", stored, lP, hP)
-	default: // eq
+	default: // eq, ap — doubly bounded overlap, byte-identical to the GiST index expr
 		lP := b.next(low)
 		hP := b.next(high)
 		cond = fmt.Sprintf("%s && numrange(%s, %s, '[]')", stored, lP, hP)
+	}
+
+	// Density probe for a lone half-bounded bound (design-addendum §3.2). Only
+	// when unit-unscoped, so the capped count matches the emitted predicate — the
+	// probe filters on the bound alone, not system/code.
+	if col, op, useHigh, ok := halfBoundedColOp(prefix); ok && !b.suppressDirectDrive && system == "" && code == "" {
+		bound := low
+		if useHigh {
+			bound = high
+		}
+		b.probe = &densityProbe{table: "sp_quantity", boundCol: col, op: op, rt: b.rt, param: param, bound: bound}
 	}
 
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
@@ -1600,6 +1960,49 @@ func (b *queryBuilder) count(ctx context.Context, pool querier) (int, error) {
 	return n, err
 }
 
+// decidePlan runs the density probe for a lone half-bounded quantity/date
+// comparator and pins the fetch plan from the measured match count, because the
+// per-column histogram mis-estimates these predicates in both directions
+// (design-addendum §1, findings 1–2). It is a no-op for every other search:
+// b.probe is set only by a half-bounded quantity/date predicate, and only when it
+// is the sole predicate (numericBodies length 1) does the fetch drive off the sp
+// table where the pin applies. The probe is a capped existence count — it stops
+// at probeCap matches, so its cost is bounded regardless of the true match size —
+// and it carries its own $1..$3 args, independent of the main query's numbering.
+func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
+	if b.probe == nil || b.predicateCount != 1 || len(b.numericBodies) != 1 {
+		return nil
+	}
+	p := b.probe
+	cap := b.probeCap
+	if cap <= 0 {
+		cap = defaultProbeCap
+	}
+	q := fmt.Sprintf(`SELECT count(*) FROM (
+		SELECT 1 FROM %s s
+		WHERE s.tenant_id = current_setting('app.current_tenant', true)
+		  AND s.resource_type = $1 AND s.param_name = $2 AND s.%s %s $3
+		LIMIT %d
+	) t`, p.table, p.boundCol, p.op, cap)
+	var n int
+	if err := pool.QueryRow(ctx, q, p.rt, p.param, p.bound).Scan(&n); err != nil {
+		return err
+	}
+	// Two branches, keyed strictly on whether the probe hit the cap. The cap gives
+	// a lower bound only, never an upper one: a predicate matching most of the
+	// partition (e.g. value-quantity=le99999) hits it just the same as one matching
+	// exactly cap rows. So at the cap the recency walk is the only safe choice —
+	// materializing there would pull the whole match set (measured ~870ms / 41k
+	// buffers vs. ~1.6ms for the walk). Below the cap the true count is known and
+	// small, so the sp-first seek is pinned.
+	if n < cap {
+		b.planDense = planSparse // sparse: pin the sp-first value-index seek
+	} else {
+		b.planDense = planDenseWalk // dense: recency walk, unconditionally
+	}
+	return nil
+}
+
 // LastN implements the Observation $lastn operation correctly at the store
 // layer: it returns the most recent maxN observations per code group, using a
 // window function so per-code recency does not depend on overall volume (a
@@ -1612,7 +2015,7 @@ func (s *Store) LastN(ctx context.Context, params map[string][]string, maxN int)
 	if maxN <= 0 {
 		maxN = 1
 	}
-	b := &queryBuilder{rt: "Observation", reg: s.registry, terminology: s.terminology, ctx: ctx}
+	b := s.newQueryBuilder(ctx, "Observation")
 	b.writeBase()
 	for k, vals := range params {
 		if k == "_sort" || k == "max" || k == "_count" || k == "_page" {
@@ -1891,19 +2294,61 @@ func (b *queryBuilder) compositeDriveSQL(terms []orderTerm, limit, offset int) s
 // building; only limit/offset/rt are appended here.
 func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) string {
 	selectList := []string{"s.resource_id AS fhir_id"}
+	colAliases := []string{"fhir_id"}
 	var innerOrder, outerOrder []string
 	for i, t := range terms {
 		alias := fmt.Sprintf("sort%d", i)
 		selectList = append(selectList, directDriveSortExpr(t.expr)+" AS "+alias)
+		colAliases = append(colAliases, alias)
 		innerOrder = append(innerOrder, alias+" "+t.dir)
 		outerOrder = append(outerOrder, "c."+alias+" "+t.dir)
 	}
+
+	// Multi-value equality search (token/reference comma list): per-value ordered
+	// walks UNION ALL'd, deduped, re-limited (§3.3). Never OR-of-bodies — Postgres
+	// cannot semi-join that and scans every matching sp row upfront. Each branch
+	// seeks one value on idx_sp_tok_recent / idx_sp_ref_recent and walks
+	// newest-first, so it touches ~page-size index-only entries.
+	if len(b.numericBodies) > 1 && isEqualityDriveTable(b.numericTable) {
+		return b.equalityUnionSQL(selectList, colAliases, innerOrder, outerOrder, limit, offset)
+	}
+
 	match := b.numericBodies[0]
 	if len(b.numericBodies) > 1 {
 		match = "(" + strings.Join(b.numericBodies, " OR ") + ")"
 	}
 	limitP := b.next(limit)
 	offsetP := b.next(offset)
+
+	// Sparse verdict from the density probe: pin the sp-first value-index seek so
+	// the planner cannot revert to the recency walk it mis-prefers on a sparse
+	// bound (design-addendum §3.2 + finding 1). The MATERIALIZED CTE resolves the
+	// full match set through the bound-column index (idx_sp_qty_high / idx_sp_date_high
+	// or the value_low index) — the probe proved it is < probeCap rows — then the
+	// outer top-N sort + LIMIT runs over that materialised set. With no ORDER BY /
+	// LIMIT inside the fence, the recency walk is not an eligible plan for the CTE.
+	// The pin is deliberate; do not "simplify" it back into the subquery below.
+	if b.planDense == planSparse {
+		return fmt.Sprintf(`
+			WITH cand AS MATERIALIZED (
+				SELECT DISTINCT %s
+				FROM %s s
+				WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s
+			)
+			SELECT r.resource_json, r.version_id, r.last_updated
+			FROM (SELECT * FROM cand ORDER BY %s LIMIT %s OFFSET %s) c
+			JOIN resources r ON r.fhir_id = c.fhir_id
+				AND r.resource_type = %s
+				AND r.tenant_id = current_setting('app.current_tenant', true)
+				AND r.is_deleted = FALSE
+			ORDER BY %s`,
+			strings.Join(selectList, ", "),
+			b.numericTable, match,
+			strings.Join(innerOrder, ", "), limitP, offsetP,
+			b.rtParam,
+			strings.Join(outerOrder, ", "),
+		)
+	}
 
 	// Early-exit id-first fetch. DISTINCT + ORDER BY + LIMIT are pushed into the
 	// candidate subquery (no MATERIALIZED barrier) so the planner drives it
@@ -1937,6 +2382,57 @@ func (b *queryBuilder) directDriveSQL(terms []orderTerm, limit, offset int) stri
 		ORDER BY %s`,
 		strings.Join(selectList, ", "),
 		b.numericTable, match,
+		strings.Join(innerOrder, ", "), limitP, offsetP,
+		b.rtParam,
+		strings.Join(outerOrder, ", "),
+	)
+}
+
+// isEqualityDriveTable reports whether a captured sp table is equality-shaped
+// (token/reference). These get the multi-value UNION ALL walk (§3.3); the range
+// tables (quantity/number/date) keep the OR-of-bodies form, which the density
+// probe never routes through anyway.
+func isEqualityDriveTable(table string) bool {
+	return table == "sp_token" || table == "sp_reference"
+}
+
+// equalityUnionSQL emits the §3.3 multi-value equality shape: one ordered,
+// per-value index walk per comma value, UNION ALL'd, deduped by fhir_id, then
+// re-sorted and paginated before the resources join. Each branch fetches up to
+// limit+offset rows (enough to satisfy the page after dedup); the DISTINCT ON
+// picks one row per resource (sort keys are equal across branches for the same
+// resource, so the arbitrary pick is deterministic in value), and the outer
+// sort+limit yields the page. The numericBodies reuse the $N args already bound;
+// only the per-branch limit, page limit, and offset are appended here. b.rtParam
+// is reused in the join so writeBase's $1 is not orphaned.
+func (b *queryBuilder) equalityUnionSQL(selectList, colAliases, innerOrder, outerOrder []string, limit, offset int) string {
+	perBranchP := b.next(limit + offset)
+	branches := make([]string, len(b.numericBodies))
+	for i, body := range b.numericBodies {
+		branches[i] = fmt.Sprintf(
+			"(SELECT %s FROM %s s WHERE s.tenant_id = current_setting('app.current_tenant', true) AND %s ORDER BY %s LIMIT %s)",
+			strings.Join(selectList, ", "), b.numericTable, body, strings.Join(innerOrder, ", "), perBranchP)
+	}
+	limitP := b.next(limit)
+	offsetP := b.next(offset)
+	return fmt.Sprintf(`
+		SELECT r.resource_json, r.version_id, r.last_updated
+		FROM (
+			SELECT %s FROM (
+				SELECT DISTINCT ON (fhir_id) %s
+				FROM ( %s ) u
+				ORDER BY fhir_id
+			) d
+			ORDER BY %s LIMIT %s OFFSET %s
+		) c
+		JOIN resources r ON r.fhir_id = c.fhir_id
+			AND r.resource_type = %s
+			AND r.tenant_id = current_setting('app.current_tenant', true)
+			AND r.is_deleted = FALSE
+		ORDER BY %s`,
+		strings.Join(colAliases, ", "),
+		strings.Join(colAliases, ", "),
+		strings.Join(branches, " UNION ALL "),
 		strings.Join(innerOrder, ", "), limitP, offsetP,
 		b.rtParam,
 		strings.Join(outerOrder, ", "),
@@ -2018,6 +2514,16 @@ func extractComparatorPrefix(s string) (prefix, rest string) {
 	}
 	return "eq", s
 }
+
+// quantizeBand rounds a search precision bound to the sp_* value column scale
+// (DECIMAL(20,6)). Stored value_low/value_high are rounded to 6 dp on write, so
+// the search band must live in the same 6-dp domain or the strict half-bounded
+// comparators leak a boundary value in: a stored 65 has value_high 65.000007
+// after rounding, and gt65's unrounded upper edge 65.0000065 would wrongly admit
+// it. Rounding both sides into the same domain keeps gt/lt boundary-exact while
+// leaving the inclusive (ge/le) and doubly bounded (eq/ne) forms unaffected —
+// their boundaries carry a full 2·eps gap that rounding cannot flip.
+func quantizeBand(x float64) float64 { return math.Round(x*1e6) / 1e6 }
 
 func expandDateRange(s string) (low, high time.Time) {
 	low, high, _ = expandDateStringForSearch(s)

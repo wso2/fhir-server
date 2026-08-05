@@ -216,6 +216,65 @@ ig:
 	}
 }
 
+func TestLoadFromPath_SearchTuning_FromFile(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, `
+search:
+  probeCap: 8000
+  defaultPageSize: 50
+  maxPageSize: 200
+  maxChainDepth: 3
+database:
+  planCacheMode: auto
+`)
+	cfg, err := config.LoadFromPath(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SearchProbeCap != 8000 {
+		t.Errorf("SearchProbeCap: got %d, want 8000", cfg.SearchProbeCap)
+	}
+	if cfg.SearchDefaultPageSize != 50 {
+		t.Errorf("SearchDefaultPageSize: got %d, want 50", cfg.SearchDefaultPageSize)
+	}
+	if cfg.SearchMaxPageSize != 200 {
+		t.Errorf("SearchMaxPageSize: got %d, want 200", cfg.SearchMaxPageSize)
+	}
+	if cfg.SearchMaxChainDepth != 3 {
+		t.Errorf("SearchMaxChainDepth: got %d, want 3", cfg.SearchMaxChainDepth)
+	}
+	if cfg.PlanCacheMode != "auto" {
+		t.Errorf("PlanCacheMode: got %q, want auto", cfg.PlanCacheMode)
+	}
+}
+
+func TestLoadFromPath_SearchProbeCap_EnvWinsOverFile(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, "search:\n  probeCap: 8000\n")
+	t.Setenv("SEARCH_PROBE_CAP", "1234")
+
+	cfg, err := config.LoadFromPath(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SearchProbeCap != 1234 {
+		t.Errorf("SearchProbeCap: env should win over file, got %d, want 1234", cfg.SearchProbeCap)
+	}
+}
+
+func TestLoadFromPath_InvalidProbeCap_NamesConfigKey(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, "search:\n  probeCap: 0\n") // 0 is below the 100 floor
+
+	_, err := config.LoadFromPath(path)
+	if err == nil {
+		t.Fatal("expected error for out-of-range search.probeCap, got nil")
+	}
+	if !strings.Contains(err.Error(), "search.probeCap") {
+		t.Errorf("error should name the config key (search.probeCap), got: %v", err)
+	}
+}
+
 func TestLoadFromPath_FileMissing(t *testing.T) {
 	clearIGEnv(t)
 
@@ -361,5 +420,37 @@ server:
 	}
 	if strings.Contains(err.Error(), "SERVER_WRITE_TIMEOUT") {
 		t.Errorf("error should not blame the unset env var, got: %v", err)
+	}
+}
+
+func TestLoadFromPath_BundleTransaction_FromFile(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, `
+bundle:
+  transactionConcurrency: 4
+  transactionProcessingDefault: parallel
+`)
+	cfg, err := config.LoadFromPath(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BundleTransactionConcurrency != 4 {
+		t.Errorf("BundleTransactionConcurrency: got %d, want 4", cfg.BundleTransactionConcurrency)
+	}
+	if cfg.BundleTransactionProcessingDefault != "parallel" {
+		t.Errorf("BundleTransactionProcessingDefault: got %q, want parallel", cfg.BundleTransactionProcessingDefault)
+	}
+}
+
+func TestLoadFromPath_BundleTransactionConcurrency_InvalidFileValue_NamesConfigKey(t *testing.T) {
+	clearIGEnv(t)
+	path := writeConfig(t, "bundle:\n  transactionConcurrency: 65\n") // above the 64 ceiling
+
+	_, err := config.LoadFromPath(path)
+	if err == nil {
+		t.Fatal("expected error for out-of-range bundle.transactionConcurrency, got nil")
+	}
+	if !strings.Contains(err.Error(), "bundle.transactionConcurrency") {
+		t.Errorf("error should name the config key (bundle.transactionConcurrency), got: %v", err)
 	}
 }

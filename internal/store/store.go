@@ -34,23 +34,104 @@ import (
 	"github.com/wso2/fhir-server/internal/terminology"
 )
 
+// SearchTuning carries the search performance knobs the store reads at query
+// time. They are configurable (see internal/config and docs/performance-tuning.md);
+// New fills any zero field with its built-in default, so callers that don't pass
+// WithSearchTuning keep the historical hardcoded behavior.
+type SearchTuning struct {
+	ProbeCap        int // density-probe cap (defaultProbeCap when 0)
+	DefaultPageSize int // page size when _count omitted (defaultSearchPageSize when 0)
+	MaxPageSize     int // clamp on client _count; 0 = unlimited
+	MaxChainDepth   int // chained-parameter recursion bound (defaultMaxChainDepth when 0)
+}
+
+// defaultSearchTuning returns the built-in tunable values, identical to the
+// store's historical hardcoded constants.
+func defaultSearchTuning() SearchTuning {
+	return SearchTuning{
+		ProbeCap:        defaultProbeCap,
+		DefaultPageSize: defaultSearchPageSize,
+		MaxPageSize:     defaultMaxPageSize,
+		MaxChainDepth:   defaultMaxChainDepth,
+	}
+}
+
+// WriteTuning bounds the bundle writer's batched inserts so a single transaction
+// cannot drive the database out of memory. MaxRowsPerStatement caps one multi-row
+// INSERT; MaxRowsPerBundle caps the total index rows one transaction may buffer
+// before it is rejected with a bounded 413. Both are configurable — see
+// internal/config and docs/performance-tuning.md.
+type WriteTuning struct {
+	MaxRowsPerStatement int // rows per multi-row INSERT (defaultWriteMaxRowsPerStatement when 0)
+	MaxRowsPerBundle    int // total index rows per transaction; 0 = unlimited (unsafe)
+}
+
+const (
+	defaultWriteMaxRowsPerStatement = 1000
+	defaultWriteMaxRowsPerBundle    = 100_000
+)
+
+// defaultWriteTuning returns the built-in write-path limits.
+func defaultWriteTuning() WriteTuning {
+	return WriteTuning{
+		MaxRowsPerStatement: defaultWriteMaxRowsPerStatement,
+		MaxRowsPerBundle:    defaultWriteMaxRowsPerBundle,
+	}
+}
+
 type Store struct {
-	pool        *pgxpool.Pool
-	extractor   *index.Extractor
-	registry    *searchparam.Registry
-	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	pool         *pgxpool.Pool
+	extractor    *index.Extractor
+	registry     *searchparam.Registry
+	terminology  *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning       SearchTuning
+	writeTuning  WriteTuning
+	bundleTuning BundleTuning
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
 	s := &Store{
-		pool:      pool,
-		extractor: index.New(registry),
-		registry:  registry,
+		pool:         pool,
+		extractor:    index.New(registry),
+		registry:     registry,
+		tuning:       defaultSearchTuning(),
+		writeTuning:  defaultWriteTuning(),
+		bundleTuning: BundleTuning{TransactionConcurrency: 1},
 	}
 	for _, o := range opts {
 		o(s)
 	}
 	return s
+}
+
+// WithWriteTuning sets the write-path batching limits (resolved from config).
+// Any non-positive MaxRowsPerStatement falls back to its default; MaxRowsPerBundle
+// is preserved as given (0 means unlimited — unsafe, use only for trusted paths).
+func WithWriteTuning(t WriteTuning) func(*Store) {
+	return func(s *Store) {
+		if t.MaxRowsPerStatement <= 0 {
+			t.MaxRowsPerStatement = defaultWriteMaxRowsPerStatement
+		}
+		s.writeTuning = t
+	}
+}
+
+// WithSearchTuning sets the search performance tunables (resolved from config).
+// Any non-positive field falls back to its built-in default, so a partially
+// populated struct is safe; MaxPageSize 0 is preserved (it means "unlimited").
+func WithSearchTuning(t SearchTuning) func(*Store) {
+	return func(s *Store) {
+		if t.ProbeCap <= 0 {
+			t.ProbeCap = defaultProbeCap
+		}
+		if t.DefaultPageSize <= 0 {
+			t.DefaultPageSize = defaultSearchPageSize
+		}
+		if t.MaxChainDepth <= 0 {
+			t.MaxChainDepth = defaultMaxChainDepth
+		}
+		s.tuning = t
+	}
 }
 
 // WithTerminology configures the store to call tc for :in/:not-in expansion.
@@ -104,6 +185,105 @@ type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// ─── Batched write buffer ──────────────────────────────────────────────────────
+//
+// A whole transaction's index and history writes are accumulated in a
+// bundleWriter and flushed as a handful of multi-row INSERT statements (plus one
+// batched re-index DELETE per sp_* table) instead of one INSERT per row. A single
+// bundleWriter is shared across every entry of a transaction Bundle; the
+// single-resource CRUD paths use one with a batch of one, so there is exactly
+// one write implementation. (Multi-row INSERT rather than binary COPY because the
+// tables run under FORCE ROW LEVEL SECURITY, which PostgreSQL forbids COPY FROM
+// against for the ordinary application role — see index.InsertBatched.)
+
+// resourcesCols / historyCols are the INSERT column lists for the batched
+// resources and resource_history writes. Both lead with tenant_id, supplied
+// explicitly and validated by the RLS WITH CHECK policy. Columns omitted here
+// take their table defaults, exactly as the former per-row INSERTs relied on:
+// resources.search_text stays NULL and resource_history.id is the BIGSERIAL key.
+var (
+	resourcesCols = []string{"tenant_id", "fhir_id", "resource_type", "version_id", "last_updated", "is_deleted", "resource_json"}
+	historyCols   = []string{"tenant_id", "fhir_id", "resource_type", "version_id", "operation", "resource_json", "recorded_at"}
+)
+
+// bundleWriter buffers the batched writes for one transaction: the index rows
+// (index.RowSet), any deferred resources creates, and every resource_history row.
+//
+// resources rows are buffered for the batched INSERT only when nothing later in
+// the same transaction reads them back; version bumps, instance reads, and
+// updates run as immediate statements against the open transaction, so the buffer
+// never hides a row a later entry must observe.
+type bundleWriter struct {
+	rs        *index.RowSet
+	tenant    string
+	resources [][]any // deferred resources creates
+	history   [][]any // every create/update/patch/delete history row
+
+	maxRowsPerStmt   int
+	maxRowsPerBundle int
+}
+
+func (s *Store) newBundleWriter(ctx context.Context) *bundleWriter {
+	t := tenant.From(ctx)
+	wt := s.writeTuning
+	return &bundleWriter{
+		rs:               index.NewRowSet(t, wt.MaxRowsPerBundle),
+		tenant:           t,
+		maxRowsPerStmt:   wt.MaxRowsPerStatement,
+		maxRowsPerBundle: wt.MaxRowsPerBundle,
+	}
+}
+
+// totalRows is the total number of rows this transaction would write across the
+// index, resources, and history tables.
+func (w *bundleWriter) totalRows() int {
+	return w.rs.Count() + len(w.resources) + len(w.history)
+}
+
+// flush writes the buffer to tx in FK-safe order: parent resources first (sp_*
+// rows carry a FK to resources), then the index rows (batched re-index DELETEs +
+// INSERTs), then resource_history. Called once, after all entries are processed
+// and before COMMIT.
+//
+// Before writing anything it enforces the per-transaction row cap: if extraction
+// stopped at the limit, or the buffered total exceeds MaxRowsPerBundle, it aborts
+// with a WriteLimitError (mapped to HTTP 413) so a pathological bundle fails
+// cleanly instead of driving the database out of memory. Nothing is sent to the
+// database in that case; the caller's deferred Rollback unwinds any immediate
+// writes (version bumps, non-deferred resource inserts) the entries already made.
+func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
+	if w.maxRowsPerBundle > 0 && (w.rs.LimitHit || w.totalRows() > w.maxRowsPerBundle) {
+		// Log the per-table breakdown so an operator can tell a genuinely large
+		// bundle (counts spread proportionally) from an extraction explosion (one
+		// table, typically sp_composite_token_quantity, dominating). resources is
+		// the number of write ops in this transaction, so index-rows / resources
+		// is the rows-per-resource ratio — a normal resource is ~10–40; hundreds+
+		// signals over-extraction.
+		tc := w.rs.TableCounts()
+		slog.Warn("write exceeded per-transaction row limit",
+			"limit", w.maxRowsPerBundle,
+			"indexRows", w.rs.Count(),
+			"resources", len(w.history),
+			"sp_composite_token_quantity", tc["sp_composite_token_quantity"],
+			"sp_token", tc["sp_token"],
+			"sp_string", tc["sp_string"],
+			"sp_reference", tc["sp_reference"],
+			"sp_quantity", tc["sp_quantity"],
+			"sp_date", tc["sp_date"],
+			"sp_number", tc["sp_number"],
+			"sp_uri", tc["sp_uri"],
+		)
+		return WriteLimitError{Rows: w.totalRows(), Limit: w.maxRowsPerBundle}
+	}
+	if err := index.InsertBatched(ctx, tx, "resources", resourcesCols, w.resources, w.maxRowsPerStmt); err != nil {
+		return err
+	}
+	if err := w.rs.Flush(ctx, tx, w.maxRowsPerStmt); err != nil {
+		return err
+	}
+	return index.InsertBatched(ctx, tx, "resource_history", historyCols, w.history, w.maxRowsPerStmt)
+}
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error) {
@@ -117,8 +297,15 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 		return nil, err
 	}
 
-	result, err := s.createInTx(ctx, tx, resourceType, body)
+	w := s.newBundleWriter(ctx)
+	// A single create writes its resources row immediately (deferResource=false),
+	// keeping duplicate-id and other errors surfacing exactly as before; its index
+	// and history rows still flush through the shared batched writer.
+	result, err := s.createInTx(ctx, tx, resourceType, body, w, false)
 	if err != nil {
+		return nil, err
+	}
+	if err := w.flush(ctx, tx); err != nil {
 		return nil, err
 	}
 
@@ -127,14 +314,24 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 	}
 
 	id, _ := result["id"].(string)
-	slog.Info("created resource", "type", resourceType, "id", id)
+	// Per-resource success is Debug, not Info: at import throughput (thousands of
+	// writes/sec) an Info line per write serializes every request on the log
+	// handler's write mutex and adds a marshal + syscall to the hot path. Bundle
+	// processing still logs one Info summary per transaction (see ExecuteBundle).
+	slog.Debug("created resource", "type", resourceType, "id", id)
 	return result, nil
 }
 
 // createInTx performs a create within an existing transaction. It is the shared
 // implementation behind the public Create and behind transaction/batch Bundle
 // processing, where many writes must commit or roll back together.
-func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, body map[string]any) (map[string]any, error) {
+//
+// The resources row is buffered for a batched COPY when deferResource is true
+// (safe only when nothing later in the transaction reads it back) or inserted
+// immediately otherwise. Either way it lands before the index COPY, satisfying
+// the sp_* foreign key. Index and history rows always join the shared batched
+// buffer, which the caller flushes once per transaction.
+func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, body map[string]any, w *bundleWriter, deferResource bool) (map[string]any, error) {
 	resourceID, _ := body["id"].(string)
 	if resourceID == "" {
 		resourceID = uuid.NewString()
@@ -150,42 +347,19 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 		return nil, fmt.Errorf("marshal resource: %w", err)
 	}
 
-	// Build one batch: resources INSERT + sp_* INSERTs + history INSERT.
-	// Three separate round-trips collapsed into one SendBatch call.
-	batch := &pgx.Batch{}
-	batch.Queue(
+	slog.Debug("creating resource", "type", resourceType, "id", resourceID)
+	if deferResource {
+		w.resources = append(w.resources, []any{w.tenant, resourceID, resourceType, 1, now, false, raw})
+	} else if _, err := tx.Exec(ctx,
 		`INSERT INTO resources (fhir_id, resource_type, version_id, last_updated, is_deleted, resource_json)
 		 VALUES ($1, $2, 1, $3, FALSE, $4)`,
 		resourceID, resourceType, now, raw,
-	)
-	slog.Debug("creating resource", "type", resourceType, "id", resourceID)
-	s.extractor.Queue(batch, resourceType, resourceID, body, now)
-	spCount := batch.Len() - 1 // number of sp_* statements queued
-	queueHistory(batch, resourceType, resourceID, 1, "POST", raw, now)
-
-	br := tx.SendBatch(ctx, batch)
-	if _, err := br.Exec(); err != nil { // resources INSERT
-		_ = br.Close()
+	); err != nil {
 		return nil, fmt.Errorf("insert resource: %w", err)
 	}
-	for i := 0; i < spCount; i++ { // sp_* INSERTs
-		if _, err := br.Exec(); err != nil {
-			// Index inserts share this transaction with the resource and history
-			// writes, so a failure here must abort the whole create — otherwise the
-			// transaction is left poisoned (the history insert below would fail with
-			// a misleading error) and a resource could be persisted with an
-			// incomplete search index.
-			_ = br.Close()
-			return nil, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
-		}
-	}
-	if _, err := br.Exec(); err != nil { // history INSERT
-		_ = br.Close()
-		return nil, fmt.Errorf("insert history: %w", err)
-	}
-	if err := br.Close(); err != nil {
-		return nil, err
-	}
+
+	s.extractor.Extract(w.rs, resourceType, resourceID, body, now)
+	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, 1, "POST", raw, now})
 
 	return body, nil
 }
@@ -239,8 +413,12 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 		return nil, err
 	}
 
-	result, err := s.updateInTx(ctx, tx, resourceType, resourceID, body, ifMatchVersion)
+	w := s.newBundleWriter(ctx)
+	result, err := s.updateInTx(ctx, tx, resourceType, resourceID, body, ifMatchVersion, w)
 	if err != nil {
+		return nil, err
+	}
+	if err := w.flush(ctx, tx); err != nil {
 		return nil, err
 	}
 
@@ -248,13 +426,13 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 		return nil, err
 	}
 
-	slog.Info("updated resource", "type", resourceType, "id", resourceID, "version", metaVersionID(result))
+	slog.Debug("updated resource", "type", resourceType, "id", resourceID, "version", metaVersionID(result))
 	return result, nil
 }
 
 // updateInTx performs an update within an existing transaction. Shared by the
 // public Update and by transaction/batch Bundle processing.
-func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, body map[string]any, ifMatchVersion int) (map[string]any, error) {
+func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, body map[string]any, ifMatchVersion int, w *bundleWriter) (map[string]any, error) {
 	body["id"] = resourceID
 	body["resourceType"] = resourceType
 
@@ -272,46 +450,21 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 		return nil, err
 	}
 
-	// Build one batch: UPDATE resources + nDeletes sp_* DELETEs + sp_* INSERTs + history INSERT.
-	batch := &pgx.Batch{}
-	batch.Queue(
+	// Update the resources row immediately so a later entry (or a subsequent
+	// version bump for the same id within this bundle) observes the new version.
+	// The stale index rows are cleared and the fresh ones inserted by the batched
+	// flush: AddDelete registers the re-index DELETE and drops any rows already
+	// buffered for this resource, then Extract buffers the new rows.
+	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
 		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
 		newVersion, lastUpdated, raw, resourceID, resourceType,
-	)
-	nDeletes := index.QueueDelete(batch, resourceType, resourceID) // nDeletes DELETEs at positions 1-nDeletes
-	s.extractor.Queue(batch, resourceType, resourceID, body, lastUpdated)
-	spInsertEnd := batch.Len() // position just before history INSERT
-	queueHistory(batch, resourceType, resourceID, newVersion, "PUT", raw, lastUpdated)
-
-	br := tx.SendBatch(ctx, batch)
-	if _, err := br.Exec(); err != nil { // UPDATE resources
-		_ = br.Close()
+	); err != nil {
 		return nil, err
 	}
-	for i := 0; i < nDeletes; i++ { // nDeletes sp_* DELETEs
-		if _, err := br.Exec(); err != nil {
-			_ = br.Close()
-			return nil, fmt.Errorf("delete index entry %d: %w", i, err)
-		}
-	}
-	spInsertCount := spInsertEnd - 1 - nDeletes // 1 UPDATE + nDeletes DELETEs precede the sp_* INSERTs
-	for i := 0; i < spInsertCount; i++ {        // sp_* INSERTs
-		if _, err := br.Exec(); err != nil {
-			// Fatal for the same reason as in createInTx: a failed index insert
-			// poisons this transaction, so the update must roll back atomically
-			// rather than persist a resource with a stale/incomplete index.
-			_ = br.Close()
-			return nil, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
-		}
-	}
-	if _, err := br.Exec(); err != nil { // history INSERT
-		_ = br.Close()
-		return nil, fmt.Errorf("insert history: %w", err)
-	}
-	if err := br.Close(); err != nil {
-		return nil, err
-	}
+	w.rs.AddDelete(resourceType, resourceID)
+	s.extractor.Extract(w.rs, resourceType, resourceID, body, lastUpdated)
+	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PUT", raw, lastUpdated})
 
 	return body, nil
 }
@@ -332,8 +485,12 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 		return nil, err
 	}
 
-	merged, newVersion, err := s.patchInTx(ctx, tx, resourceType, resourceID, patch)
+	w := s.newBundleWriter(ctx)
+	merged, newVersion, err := s.patchInTx(ctx, tx, resourceType, resourceID, patch, w)
 	if err != nil {
+		return nil, err
+	}
+	if err := w.flush(ctx, tx); err != nil {
 		return nil, err
 	}
 
@@ -341,13 +498,13 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 		return nil, err
 	}
 
-	slog.Info("patched resource", "type", resourceType, "id", resourceID, "version", newVersion)
+	slog.Debug("patched resource", "type", resourceType, "id", resourceID, "version", newVersion)
 	return merged, nil
 }
 
 // patchInTx applies a JSON Merge Patch within an existing transaction, taking a
 // FOR UPDATE lock on the row. Shared by the public Patch and by Bundle processing.
-func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, patch map[string]any) (map[string]any, int, error) {
+func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, patch map[string]any, w *bundleWriter) (map[string]any, int, error) {
 	var raw []byte
 	var versionID int
 	var lastUpdated time.Time
@@ -382,46 +539,18 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 		return nil, 0, err
 	}
 
-	// Build one batch: UPDATE resources + nDeletes sp_* DELETEs + sp_* INSERTs + history INSERT.
-	batch := &pgx.Batch{}
-	batch.Queue(
+	// Update immediately, then buffer the re-index (DELETE + fresh rows) and the
+	// history row for the batched flush — the same shape as updateInTx.
+	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
 		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
 		newVersion, now, mergedRaw, resourceID, resourceType,
-	)
-	nDeletes := index.QueueDelete(batch, resourceType, resourceID)
-	s.extractor.Queue(batch, resourceType, resourceID, merged, now)
-	spInsertEnd := batch.Len()
-	queueHistory(batch, resourceType, resourceID, newVersion, "PATCH", mergedRaw, now)
-
-	br := tx.SendBatch(ctx, batch)
-	if _, err := br.Exec(); err != nil { // UPDATE resources
-		_ = br.Close()
+	); err != nil {
 		return nil, 0, err
 	}
-	for i := 0; i < nDeletes; i++ { // nDeletes sp_* DELETEs
-		if _, err := br.Exec(); err != nil {
-			_ = br.Close()
-			return nil, 0, fmt.Errorf("delete index entry %d: %w", i, err)
-		}
-	}
-	spInsertCount := spInsertEnd - 1 - nDeletes
-	for i := 0; i < spInsertCount; i++ { // sp_* INSERTs
-		if _, err := br.Exec(); err != nil {
-			// Fatal for the same reason as in createInTx: a failed index insert
-			// poisons this transaction, so the patch must roll back atomically
-			// rather than persist a resource with a stale/incomplete index.
-			_ = br.Close()
-			return nil, 0, fmt.Errorf("insert index entry %d (%s/%s): %w", i, resourceType, resourceID, err)
-		}
-	}
-	if _, err := br.Exec(); err != nil { // history INSERT
-		_ = br.Close()
-		return nil, 0, fmt.Errorf("insert history: %w", err)
-	}
-	if err := br.Close(); err != nil {
-		return nil, 0, err
-	}
+	w.rs.AddDelete(resourceType, resourceID)
+	s.extractor.Extract(w.rs, resourceType, resourceID, merged, now)
+	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PATCH", mergedRaw, now})
 
 	return merged, newVersion, nil
 }
@@ -461,7 +590,11 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 		return err
 	}
 
-	if err := s.deleteInTx(ctx, tx, resourceType, resourceID); err != nil {
+	w := s.newBundleWriter(ctx)
+	if err := s.deleteInTx(ctx, tx, resourceType, resourceID, w); err != nil {
+		return err
+	}
+	if err := w.flush(ctx, tx); err != nil {
 		return err
 	}
 
@@ -469,14 +602,14 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 		return err
 	}
 
-	slog.Info("deleted resource", "type", resourceType, "id", resourceID)
+	slog.Debug("deleted resource", "type", resourceType, "id", resourceID)
 	return nil
 }
 
 // deleteInTx soft-deletes a resource within an existing transaction. Shared by
 // the public Delete and by Bundle processing. Idempotent: deleting an already
 // deleted or non-existent resource returns nil.
-func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) error {
+func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, w *bundleWriter) error {
 	// Lock the row first to prevent a concurrent Update from bumping the version
 	// between our read and our soft-delete write, which would produce a UNIQUE
 	// constraint violation on resource_history(fhir_id, resource_type, version_id).
@@ -502,32 +635,20 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	deleteVersion := versionID + 1
 	now := time.Now().UTC()
 
-	// Build one batch: history INSERT + nDeletes sp_* DELETEs + UPDATE resources.
-	batch := &pgx.Batch{}
-	queueHistory(batch, resourceType, resourceID, deleteVersion, "DELETE", raw, now)
-	nDeletes := index.QueueDelete(batch, resourceType, resourceID) // nDeletes DELETEs
-	batch.Queue(
+	// Buffer the delete-history row and the re-index DELETE, then soft-delete the
+	// resources row immediately. The batched flush clears this resource's sp_*
+	// rows (AddDelete) and writes the history row; there are no fresh index rows
+	// for a delete.
+	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, deleteVersion, "DELETE", raw, now})
+	w.rs.AddDelete(resourceType, resourceID)
+	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET is_deleted = TRUE, version_id = $1, last_updated = $2
 		 WHERE fhir_id = $3 AND resource_type = $4 AND tenant_id = current_setting('app.current_tenant', true)`,
 		deleteVersion, now, resourceID, resourceType,
-	)
-
-	br := tx.SendBatch(ctx, batch)
-	if _, err := br.Exec(); err != nil { // history INSERT
-		_ = br.Close()
-		return fmt.Errorf("insert delete history: %w", err)
-	}
-	for i := 0; i < nDeletes; i++ { // nDeletes sp_* DELETEs
-		if _, err := br.Exec(); err != nil {
-			_ = br.Close()
-			return fmt.Errorf("delete index entry %d: %w", i, err)
-		}
-	}
-	if _, err := br.Exec(); err != nil { // UPDATE resources
-		_ = br.Close()
+	); err != nil {
 		return err
 	}
-	return br.Close()
+	return nil
 }
 
 // ─── History ──────────────────────────────────────────────────────────────────
@@ -668,17 +789,6 @@ func (s *Store) GetVersion(ctx context.Context, resourceType, resourceID string,
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
-
-// queueHistory adds a resource_history INSERT to an existing batch.
-// All four write paths (create/update/patch/delete) call this instead of
-// issuing their own Exec so the history write shares the same round-trip.
-func queueHistory(batch *pgx.Batch, resourceType, resourceID string, versionID int, op string, raw []byte, ts time.Time) {
-	batch.Queue(
-		`INSERT INTO resource_history (fhir_id, resource_type, version_id, operation, resource_json, recorded_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		resourceID, resourceType, versionID, op, raw, ts,
-	)
-}
 
 // metaVersionID returns the meta.versionId string of a resource, or "" if absent.
 func metaVersionID(body map[string]any) string {
@@ -980,4 +1090,18 @@ type ConflictError struct {
 
 func (e ConflictError) Error() string {
 	return e.Message
+}
+
+// WriteLimitError is returned when a single write transaction would buffer more
+// index rows than the configured per-bundle cap (WriteTuning.MaxRowsPerBundle).
+// It maps to HTTP 413 (Payload Too Large): the write is rejected and rolled back
+// so one pathological bundle cannot exhaust database memory. Raise the cap
+// (WRITE_MAX_ROWS_PER_BUNDLE) for trusted bulk-import environments.
+type WriteLimitError struct {
+	Rows  int // rows the transaction attempted (at least the cap; may undercount once extraction stops)
+	Limit int // the configured MaxRowsPerBundle
+}
+
+func (e WriteLimitError) Error() string {
+	return fmt.Sprintf("write exceeds the per-transaction index-row limit of %d (raise write.maxRowsPerBundle to allow larger bundles)", e.Limit)
 }

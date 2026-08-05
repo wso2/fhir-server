@@ -85,7 +85,7 @@ func run() error {
 	defer cancel()
 
 	// Database
-	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.PlanCacheMode)
 	if err != nil {
 		return fmt.Errorf("connect db: %w", err)
 	}
@@ -130,12 +130,60 @@ func run() error {
 	}
 
 	// Store + HTTP (server starts immediately; IGs load in background)
-	storeOpts := []func(*store.Store){}
+	searchTuning := store.SearchTuning{
+		ProbeCap:        cfg.SearchProbeCap,
+		DefaultPageSize: cfg.SearchDefaultPageSize,
+		MaxPageSize:     cfg.SearchMaxPageSize,
+		MaxChainDepth:   cfg.SearchMaxChainDepth,
+	}
+	writeTuning := store.WriteTuning{
+		MaxRowsPerStatement: cfg.WriteMaxRowsPerStatement,
+		MaxRowsPerBundle:    cfg.WriteMaxRowsPerBundle,
+	}
+	bundleTuning := store.BundleTuning{
+		TransactionConcurrency:     cfg.BundleTransactionConcurrency,
+		TransactionParallelDefault: cfg.BundleTransactionProcessingDefault == "parallel",
+	}
+	storeOpts := []func(*store.Store){store.WithSearchTuning(searchTuning), store.WithWriteTuning(writeTuning), store.WithBundleTuning(bundleTuning)}
 	if tc := terminology.New(cfg.TerminologyURL); tc != nil {
 		storeOpts = append(storeOpts, store.WithTerminology(tc))
 		slog.Info("terminology server configured", "url", cfg.TerminologyURL)
 	}
 	s := store.New(pool, registry, storeOpts...)
+	// Log the effective search + write tunables so an operator can confirm overrides
+	// took effect (docs/performance-tuning.md).
+	slog.Info("search tuning",
+		"probeCap", cfg.SearchProbeCap,
+		"defaultPageSize", cfg.SearchDefaultPageSize,
+		"maxPageSize", cfg.SearchMaxPageSize,
+		"maxChainDepth", cfg.SearchMaxChainDepth,
+		"planCacheMode", cfg.PlanCacheMode,
+	)
+	slog.Info("write tuning",
+		"maxRowsPerStatement", cfg.WriteMaxRowsPerStatement,
+		"maxRowsPerBundle", cfg.WriteMaxRowsPerBundle,
+	)
+	if cfg.BundleTransactionConcurrency > 1 {
+		slog.Info("bundle tuning",
+			"transactionConcurrency", cfg.BundleTransactionConcurrency,
+			"transactionProcessingDefault", cfg.BundleTransactionProcessingDefault,
+		)
+		// Every parallel transaction bundle holds transactionConcurrency pool
+		// connections at once, so the pool must be sized for the expected number
+		// of concurrent bundles: expected_concurrent_bundles * transactionConcurrency
+		// <= pool MaxConns (docs/performance-tuning.md). Warn against a typical
+		// 20-VU import load so an operator sees the risk at startup, not as
+		// acquire-wait latency under load.
+		const typicalConcurrentBundles = 20
+		if maxConns := int(pool.Config().MaxConns); typicalConcurrentBundles*cfg.BundleTransactionConcurrency > maxConns {
+			slog.Warn("parallel transaction bundles may exhaust the connection pool",
+				"transactionConcurrency", cfg.BundleTransactionConcurrency,
+				"poolMaxConns", maxConns,
+				"assumedConcurrentBundles", typicalConcurrentBundles,
+				"rule", "expected_concurrent_bundles * transactionConcurrency <= pool max_conns",
+			)
+		}
+	}
 
 	// igReady is set to 1 once all IGs finish loading.
 	var igReady atomic.Int32

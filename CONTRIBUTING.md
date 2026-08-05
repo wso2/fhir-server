@@ -5,7 +5,7 @@ your environment, the conventions we follow, and how to submit changes.
 
 ## Getting started
 
-**Prerequisites:** Go 1.25+, PostgreSQL 13+ (or Docker for the integration tests).
+**Prerequisites:** Go 1.25+, PostgreSQL 14+ (or Docker for the integration tests).
 
 ```bash
 git clone https://github.com/wso2/fhir-server.git

@@ -22,6 +22,7 @@ package testutil
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -33,14 +34,25 @@ import (
 	"github.com/wso2/fhir-server/internal/seed"
 )
 
-// MustDB starts a PostgreSQL 16 container, creates the schema tables, and
-// returns a ready pool. The container is terminated when t completes.
+// PostgresImage is the container image integration and conformance tests run
+// against. It defaults to the newest supported major (PostgreSQL 18) and can be
+// overridden via FHIR_TEST_POSTGRES_IMAGE to exercise the whole supported range
+// (14 through 18) — e.g. FHIR_TEST_POSTGRES_IMAGE=postgres:14-alpine go test ...
+func PostgresImage() string {
+	if img := os.Getenv("FHIR_TEST_POSTGRES_IMAGE"); img != "" {
+		return img
+	}
+	return "postgres:18-alpine"
+}
+
+// MustDB starts a PostgreSQL container (PostgresImage), creates the schema
+// tables, and returns a ready pool. The container is terminated when t completes.
 func MustDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
 	pgc, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
+		PostgresImage(),
 		tcpostgres.WithDatabase("testdb"),
 		tcpostgres.WithUsername("test"),
 		tcpostgres.WithPassword("test"),

@@ -1,15 +1,18 @@
 -- FHIR Server PostgreSQL Schema
 -- One resources table holds all FHIR resource types. Separate sp_* tables
 -- store extracted search parameter values so searches never touch resource_json.
--- Requires PostgreSQL 14+ (resource_json uses COMPRESSION lz4). For Location
--- near-search, install PostGIS. The btree_gist extension is created by this
--- script for the quantity range GiST index (see sp_quantity).
+-- Requires PostgreSQL 14+ (resource_json uses COMPRESSION lz4); tested through
+-- PostgreSQL 18. For Location near-search, install PostGIS. The btree_gist
+-- extension is created by this script for the quantity range GiST index (see
+-- sp_quantity); pg_stat_statements is created best-effort for query profiling
+-- (section 1).
 --
 -- Layout:
---   1. Schema version table
+--   1. Schema version + query profiling
 --   2. Core resource storage      (resources, resource_history)
 --   3. Search parameter indexes   (sp_string, sp_token, sp_date, sp_number,
---                                  sp_quantity, sp_uri, sp_reference, sp_coords)
+--                                  sp_quantity, sp_composite_token_quantity,
+--                                  sp_uri, sp_reference, sp_coords)
 --   4. Registry & reference data  (search_param_definitions, ig_*,
 --                                  base_definitions, closure tables)
 --   5. Planner statistics
@@ -17,9 +20,11 @@
 --   7. Row-Level Security
 --   8. LEAKPROOF operators
 --
--- Each table is defined together with all of its own indexes. Every statement is
--- idempotent (CREATE ... IF NOT EXISTS), so the schema can be (re)applied to a
--- fresh database and re-running is a no-op.
+-- Each table is defined together with all of its own indexes. The script is
+-- written for a fresh database and every statement is idempotent — creates are
+-- guarded with IF NOT EXISTS and columns with ADD COLUMN IF NOT EXISTS — so it
+-- can be (re)applied to a fresh or already-provisioned database and re-running is
+-- a no-op. It is purely additive: it never drops or rewrites existing objects.
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -33,6 +38,22 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Query profiling (plan-selection standard §2): create the pg_stat_statements
+-- view so top-statement analysis works on any environment built from this schema.
+-- It only collects data when the library is preloaded (shared_preload_libraries,
+-- set in docker-compose.yml / the server config). Wrapped so a non-superuser role
+-- or an image without the extension files degrades to a NOTICE, not a failure.
+DO $pgss$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE NOTICE 'skipping CREATE EXTENSION pg_stat_statements (requires superuser); query profiling unavailable';
+    WHEN OTHERS THEN
+        RAISE NOTICE 'skipping pg_stat_statements: %', SQLERRM;
+END
+$pgss$;
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -190,10 +211,27 @@ CREATE TABLE IF NOT EXISTS sp_date (
     value_low       TIMESTAMPTZ  NOT NULL,
     value_high      TIMESTAMPTZ  NOT NULL,
     value_precision VARCHAR(10)  NOT NULL DEFAULT 'SECOND',
+    -- last_updated mirrors resources.last_updated so the id-first date fetch can
+    -- sort candidates from the sp_date recency index without a resources lookup,
+    -- exactly like sp_quantity (design-addendum §2, Phase 2).
+    last_updated    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
+-- Existing installs created before the recency column gain it here (CREATE TABLE
+-- IF NOT EXISTS above is a no-op on them). DEFAULT now() backfills existing rows
+-- with a reasonable ordering key; a migration wanting exact resources.last_updated
+-- runs the backfill UPDATE from the addendum as superuser.
+ALTER TABLE sp_date ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT now();
 
-CREATE INDEX IF NOT EXISTS idx_sp_date_range  ON sp_date (tenant_id, resource_type, param_name, value_low, value_high);
+-- value_low family (le / lt / sa) — covering so the value_low seek resolves
+-- index-only. (This replaces an earlier non-covering idx_sp_date_range; installs
+-- provisioned before that change can drop the old index — see
+-- docs/performance-tuning.md. A fresh database never creates it.)
+CREATE INDEX IF NOT EXISTS idx_sp_date_low    ON sp_date (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
+-- value_high family (ge / gt / eb) — the sp_date mirror of idx_sp_qty_high.
+CREATE INDEX IF NOT EXISTS idx_sp_date_high   ON sp_date (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated);
+-- Recency walk for dense half-bounded date searches (the density probe picks it).
+CREATE INDEX IF NOT EXISTS idx_sp_date_recent ON sp_date (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
 CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 
 -- ─── sp_number ───────────────────────────────────────────────────────────────
@@ -222,6 +260,10 @@ CREATE TABLE IF NOT EXISTS sp_number (
 CREATE INDEX IF NOT EXISTS idx_sp_num_range  ON sp_number (tenant_id, resource_type, param_name, value_low, value_high) INCLUDE (resource_id, last_updated);
 CREATE INDEX IF NOT EXISTS idx_sp_num_source ON sp_number (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
 CREATE INDEX IF NOT EXISTS idx_sp_num_recent ON sp_number (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
+-- value_high family (ge / gt / eb) — the sp_number mirror of idx_sp_qty_high, so
+-- half-bounded high-side number searches seek instead of scanning the partition
+-- (plan-selection standard §4.3). value_low family already rides idx_sp_num_range.
+CREATE INDEX IF NOT EXISTS idx_sp_num_high   ON sp_number (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated);
 
 -- ─── sp_quantity ─────────────────────────────────────────────────────────────
 -- FHIR quantity search parameters.
@@ -258,21 +300,98 @@ CREATE INDEX IF NOT EXISTS idx_sp_qty_source    ON sp_quantity (tenant_id, resou
 CREATE INDEX IF NOT EXISTS idx_sp_qty_canonical ON sp_quantity (tenant_id, resource_type, param_name, canonical_value, canonical_units) WHERE canonical_value IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sp_qty_recent    ON sp_quantity (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id, system, code);
 
--- Range-overlap GiST index for bounded quantity searches (eq / ne / ge / le),
--- reachable only through the numrange && operator. Those prefixes are interval
--- overlap — value_low <= searchHigh AND value_high >= searchLow — which as two
--- independent numeric bounds can only ride the btree value indexes above; a dense
--- bounded window (e.g. value-quantity=ge10&le140) still had to scan-and-filter a
--- whole (tenant, type, param) partition. buildQuantityExists emits the predicate
--- as numrange(s.value_low, s.value_high, '[]') && numrange(searchLow, searchHigh,
--- '[]'); the index expression below must stay byte-for-byte identical to that
--- stored numrange, or the planner will not match it. gt/lt stay scalar (strict,
--- not overlap) and keep using the btree value indexes.
+-- Half-bounded high-side search (ge / gt / eb). These collapse to a scalar bound
+-- on value_high (buildQuantityExists), which idx_sp_qty_raw cannot serve — its key
+-- leads with value_low, so an unconstrained value_low forces a full scan of the
+-- (tenant, type, param) partition with a value_high post-filter. Putting value_high
+-- last after the equality prefix makes it directly seekable. The INCLUDE columns
+-- keep the id-first candidate resolve, the optional unit filter, and the recency
+-- sort key index-only; value_low is included so a residual window condition (mixed
+-- comparators) can also be evaluated without a heap fetch. The value_low family
+-- (le / lt / sa) needs no new index — idx_sp_qty_raw already leads with value_low.
+-- Deploy CONCURRENTLY on live environments; the IF NOT EXISTS form here is for
+-- fresh installs.
+CREATE INDEX IF NOT EXISTS idx_sp_qty_high       ON sp_quantity (tenant_id, resource_type, param_name, value_high) INCLUDE (value_low, resource_id, last_updated, system, code);
+
+-- Range-overlap GiST index for doubly bounded quantity searches (eq / ne / ap and
+-- explicit windows such as value-quantity=ge10&value-quantity=le140), reachable
+-- only through the numrange && operator. Those probe ranges are narrow, so the
+-- time-ordered-insert clustering weakness does not bite. buildQuantityExists emits
+-- the predicate as numrange(s.value_low, s.value_high, '[]') && numrange(searchLow,
+-- searchHigh, '[]'); the index expression below must stay byte-for-byte identical
+-- to that stored numrange, or the planner will not match it. The half-bounded
+-- prefixes (ge/gt/eb, le/lt/sa) no longer come here — a half-open probe overlaps
+-- nearly every leaf — they ride idx_sp_qty_high / idx_sp_qty_raw scalar instead.
 -- The leading (tenant_id, resource_type, param_name) equality columns are varchar,
 -- which have no default gist opclass, so the multicolumn GiST needs btree_gist.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE INDEX IF NOT EXISTS idx_sp_qty_range_gist ON sp_quantity
     USING gist (tenant_id, resource_type, param_name, numrange(value_low, value_high, '[]'));
+
+-- ─── sp_composite_token_quantity ─────────────────────────────────────────────
+-- Materialized token+quantity composite search parameter pairs
+-- (code-value-quantity, component-code-value-quantity, ...).
+-- One row per composite param per element pairing where both components
+-- co-occur in the SAME element, per FHIR composite semantics. Written by the
+-- indexer alongside (not instead of) the component sp_token / sp_quantity rows.
+-- value_low / value_high carry the implicit-precision range of the quantity
+-- component, identical to sp_quantity. last_updated is the denormalised copy
+-- of resources.last_updated (see sp_token) for the recency early-exit.
+
+CREATE TABLE IF NOT EXISTS sp_composite_token_quantity (
+    id            BIGSERIAL     PRIMARY KEY,
+    tenant_id     TEXT          NOT NULL DEFAULT current_setting('app.current_tenant', true),
+    resource_id   VARCHAR(64)   NOT NULL,
+    resource_type VARCHAR(100)  NOT NULL,
+    param_name    VARCHAR(191)  NOT NULL,
+    system        VARCHAR(512),
+    code          VARCHAR(191)  NOT NULL,
+    value         DECIMAL(20,6) NOT NULL,
+    value_low     DECIMAL(20,6) NOT NULL,
+    value_high    DECIMAL(20,6) NOT NULL,
+    qty_system    VARCHAR(255),
+    qty_code      VARCHAR(64),
+    last_updated  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (tenant_id, resource_id, resource_type)
+        REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
+);
+
+-- Sparse-intersection drive: equality on code, range on value, one scan.
+-- Equality columns first, range columns last. INCLUDE keeps candidate resolve
+-- and the sort key index-only.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_code_value ON sp_composite_token_quantity
+    (tenant_id, resource_type, param_name, code, value_low, value_high)
+    INCLUDE (resource_id, system, qty_system, qty_code, last_updated);
+
+-- Dense-intersection drive: recency walk scoped to the code; early-exit for
+-- combinations where most rows match the value predicate.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_recent ON sp_composite_token_quantity
+    (tenant_id, resource_type, param_name, code, last_updated DESC)
+    INCLUDE (value_low, value_high, resource_id, system, qty_system, qty_code);
+
+-- Half-bounded high-side drive (ge / gt / eb): scalar on value_high after the code
+-- equality. The mirror of idx_sp_qty_high one level down — idx_sp_comp_tokqty_code_value
+-- leads its range portion with value_low and cannot seek value_high, so a dense code
+-- degrades to a scan-and-filter of the whole code partition. code first, then the
+-- value_high seek. The value_low family (le / lt / sa) rides idx_sp_comp_tokqty_code_value.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_code_high ON sp_composite_token_quantity
+    (tenant_id, resource_type, param_name, code, value_high)
+    INCLUDE (value_low, resource_id, last_updated, system, qty_system, qty_code);
+
+-- Range-overlap GiST for doubly bounded comparators (eq / ne / ap and explicit
+-- windows), identical pattern to idx_sp_qty_range_gist. The half-bounded prefixes
+-- (ge/gt/eb, le/lt/sa) ride the scalar btree indexes above, not this GiST. The
+-- expression must stay byte-for-byte identical to the predicate emitted by the
+-- store (numrange(value_low, value_high, '[]')) or the planner will not match it.
+-- btree_gist (needed because the leading equality columns are varchar) is already
+-- created above for idx_sp_qty_range_gist.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_range_gist ON sp_composite_token_quantity
+    USING gist (tenant_id, resource_type, param_name, code,
+                numrange(value_low, value_high, '[]'));
+
+-- Per-resource source probe + reindex DELETE / FK cascade support.
+CREATE INDEX IF NOT EXISTS idx_sp_comp_tokqty_source ON sp_composite_token_quantity
+    (tenant_id, resource_id, resource_type, param_name, code, value_low, value_high);
 
 -- ─── sp_uri ──────────────────────────────────────────────────────────────────
 -- FHIR uri search parameters (url, profile, etc.).
@@ -313,8 +432,17 @@ CREATE TABLE IF NOT EXISTS sp_reference (
     identifier_system VARCHAR(512),
     identifier_value  VARCHAR(255),
     display           VARCHAR(255),
+    -- last_updated mirrors resources.last_updated so a single-value reference
+    -- search drives the sp-first ordered walk off idx_sp_ref_recent without a
+    -- resources lookup (plan-selection standard §2, §4.2).
+    last_updated      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     FOREIGN KEY (tenant_id, resource_id, resource_type) REFERENCES resources (tenant_id, fhir_id, resource_type) ON DELETE CASCADE
 );
+-- Existing installs created before the recency column gain it here (CREATE TABLE
+-- IF NOT EXISTS above is a no-op on them). DEFAULT now() gives existing rows a
+-- reasonable ordering key; a migration wanting exact resources.last_updated runs
+-- the backfill UPDATE from the standard §4.2 as superuser.
+ALTER TABLE sp_reference ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, resource_id, resource_type, param_name, target_id);
 -- Search by target (e.g. ?patient=123): leading on target_id serves bare-id
@@ -322,6 +450,13 @@ CREATE INDEX IF NOT EXISTS idx_sp_ref_source      ON sp_reference (tenant_id, re
 CREATE INDEX IF NOT EXISTS idx_sp_ref_target_full ON sp_reference (tenant_id, target_id, target_type, param_name, resource_type, resource_id);
 -- The :identifier modifier (find references by Identifier value).
 CREATE INDEX IF NOT EXISTS idx_sp_ref_ident       ON sp_reference (tenant_id, target_type, identifier_system, identifier_value) WHERE identifier_value IS NOT NULL;
+-- Recency access path for the sp-first equality walk (§3.2): predicate columns
+-- (target_type, target_id) before last_updated so a scan seeks the reference and
+-- walks newest-first within only the matching entries, index-only. Partial on
+-- target_id IS NOT NULL to exclude external-URL rows, mirroring idx_sp_tok_recent.
+-- idx_sp_ref_target_full is kept — it leads with target_id for the different
+-- _include/_revinclude/$everything reverse-traversal access pattern.
+CREATE INDEX IF NOT EXISTS idx_sp_ref_recent      ON sp_reference (tenant_id, resource_type, param_name, target_type, target_id, last_updated DESC) INCLUDE (resource_id) WHERE target_id IS NOT NULL;
 
 -- ─── sp_coords ───────────────────────────────────────────────────────────────
 -- lat/lng for the Location.near search parameter.
@@ -458,6 +593,24 @@ ALTER TABLE sp_token     ALTER COLUMN param_name    SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN target_id     SET STATISTICS 1000;
 ALTER TABLE sp_reference ALTER COLUMN param_name    SET STATISTICS 1000;
 
+-- Date bound columns: statistics parity with sp_quantity so the half-bounded date
+-- plan choice has an honest per-column histogram to work from (design-addendum
+-- §2.5). The density probe is the backstop where the histogram still mis-estimates.
+ALTER TABLE sp_date      ALTER COLUMN value_low     SET STATISTICS 1000;
+ALTER TABLE sp_date      ALTER COLUMN value_high    SET STATISTICS 1000;
+
+-- Quantity bound columns: the half-bounded plan choice (seek idx_sp_qty_high /
+-- idx_sp_qty_raw for a sparse bound vs. the recency walk for a dense one) hinges
+-- entirely on the selectivity estimate of value_high >= X / value_low <= X, which
+-- comes from the per-column histogram. Quantity values span several orders of
+-- magnitude across parameters (pain scores to platelet counts), so the default
+-- 100-bucket histogram is too coarse at the extreme tails — exactly where a bound
+-- like ge99999 lives. The scalar predicates (section on search.go) are also what
+-- make the histogram usable: selectivity estimation for numrange && $1 is far
+-- cruder than a scalar histogram lookup. Run ANALYZE after applying.
+ALTER TABLE sp_quantity  ALTER COLUMN value_low     SET STATISTICS 1000;
+ALTER TABLE sp_quantity  ALTER COLUMN value_high    SET STATISTICS 1000;
+
 -- Multivariate statistics: the per-column targets above still let the planner
 -- assume resource_type / param_name / code are independent, so it badly
 -- under-estimates a common (resource_type, param_name, code) combination — e.g.
@@ -480,6 +633,22 @@ CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_code (dependencies, ndisti
 -- (~0.7ms). Adding system to the multivariate stat corrects the estimate.
 CREATE STATISTICS IF NOT EXISTS stx_sp_token_rt_param_sys_code (dependencies, ndistinct, mcv)
     ON resource_type, param_name, system, code FROM sp_token;
+
+-- Composite token+quantity searches drive off (resource_type, param_name, code)
+-- in sp_composite_token_quantity. As with sp_token, the planner must not assume
+-- these columns are independent or it under-estimates a dense code and picks a
+-- materialise-and-sort over the abort-early ordered scan; the multivariate stat
+-- gives it the single-table estimate it needs to choose between the value-driven
+-- and recency-driven plan shapes.
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN code          SET STATISTICS 1000;
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN param_name    SET STATISTICS 1000;
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN resource_type SET STATISTICS 1000;
+-- Same half-bounded histogram rationale as sp_quantity above, one level down.
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN value_low     SET STATISTICS 1000;
+ALTER TABLE sp_composite_token_quantity ALTER COLUMN value_high    SET STATISTICS 1000;
+
+CREATE STATISTICS IF NOT EXISTS stx_sp_comp_tokqty_rt_param_code (dependencies, ndistinct, mcv)
+    ON resource_type, param_name, code FROM sp_composite_token_quantity;
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -511,6 +680,7 @@ ALTER TABLE sp_quantity  SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_
 ALTER TABLE sp_uri       SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 ALTER TABLE sp_reference SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 ALTER TABLE sp_coords    SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
+ALTER TABLE sp_composite_token_quantity SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01);
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -537,7 +707,7 @@ DECLARE
     t             text;
     tenant_tables text[] := ARRAY['resources','resource_history','sp_string','sp_token',
                                   'sp_date','sp_number','sp_quantity','sp_uri',
-                                  'sp_reference','sp_coords'];
+                                  'sp_reference','sp_coords','sp_composite_token_quantity'];
 BEGIN
     FOREACH t IN ARRAY tenant_tables LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);

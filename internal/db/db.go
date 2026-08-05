@@ -28,7 +28,11 @@ import (
 //go:embed schema.sql
 var schemaFS embed.FS
 
-func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+// Connect opens the pooled connection. planCacheMode sets the per-connection
+// plan_cache_mode RuntimeParam; an empty string uses the default
+// "force_custom_plan". Callers pass the configured value (config.PlanCacheMode),
+// which is validated to the allowed enum before it reaches here.
+func Connect(ctx context.Context, dsn, planCacheMode string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
@@ -43,10 +47,16 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	// with a custom plan the planner sees the value's MCV stats and takes the
 	// ordered scan (~6ms). Planning cost per query is negligible next to search
 	// execution. Set as a startup RuntimeParam so every pooled connection uses it.
+	// Configurable via database.planCacheMode (see docs/performance-tuning.md);
+	// force_custom_plan is load-bearing — auto/generic re-expose the misestimate
+	// pathologies the search probe architecture exists to avoid.
+	if planCacheMode == "" {
+		planCacheMode = "force_custom_plan"
+	}
 	if cfg.ConnConfig.RuntimeParams == nil {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
-	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_custom_plan"
+	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = planCacheMode
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

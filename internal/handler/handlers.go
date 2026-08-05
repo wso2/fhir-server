@@ -1727,6 +1727,11 @@ func handleError(w http.ResponseWriter, err error) {
 		operationOutcome(w, http.StatusPreconditionFailed, "error", "conflict", err.Error())
 		return
 	}
+	var writeLimit store.WriteLimitError
+	if errors.As(err, &writeLimit) {
+		operationOutcome(w, http.StatusRequestEntityTooLarge, "error", "too-costly", err.Error())
+		return
+	}
 	operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
 }
 

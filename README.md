@@ -4,7 +4,7 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 
 **FHIR version:** R4 (4.0.1)  
 **Language:** Go 1.25  
-**Database:** PostgreSQL 13+
+**Database:** PostgreSQL 14+ (tested through 18)
 
 ---
 
@@ -95,7 +95,7 @@ docker build -t fhir-server:latest .
 
 Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)); the steps below invoke `./fhir-server`.
 
-**Prerequisites:** PostgreSQL 13+ running locally, and a built `fhir-server` binary
+**Prerequisites:** PostgreSQL 14+ running locally, and a built `fhir-server` binary
 
 ### Create the database and role
 
@@ -185,6 +185,11 @@ env var   >   config file   >   built-in default
 ```
 
 This lets you keep non-secret defaults in a checked-in `config.yaml` and inject secrets (like `DB_PASSWORD`) via environment variables at deploy time.
+
+> **Search performance tunables** (density-probe cap, page-size limits, chain
+> depth, `plan_cache_mode`) and the deploy-time DDL knobs are documented, with
+> sizing rules and regression gates, in
+> [docs/performance-tuning.md](docs/performance-tuning.md).
 
 ### Specifying the config file
 
