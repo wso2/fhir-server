@@ -328,11 +328,12 @@ type queryBuilder struct {
 	// param of unsupported type like composite/special). Search() returns it
 	// as an UnsupportedParamError rather than silently widening the result set.
 	err error
-	// probe describes a lone half-bounded comparator (ge/gt/eb/le/lt/sa) on
-	// sp_quantity or sp_date whose selectivity the per-column histogram estimates
-	// unreliably in both directions (see design-addendum §1, findings 1–2). When
-	// set, Search runs a capped existence count (decidePlan) before the fetch and
-	// pins the plan via planDense, instead of trusting the planner's estimate.
+	// probe describes a lone comparator on sp_quantity or sp_date — half-bounded
+	// (ge/gt/eb/le/lt/sa), or a doubly bounded date eq/ap — whose selectivity the
+	// per-column histogram estimates unreliably in both directions (see
+	// design-addendum §1, findings 1–2). When set, Search runs a capped existence
+	// count (decidePlan) before the fetch and pins the plan via planDense, instead
+	// of trusting the planner's estimate.
 	probe *densityProbe
 	// planDense records the density-probe verdict: planUnknown keeps the current
 	// planner-chooses shape; planSparse pins the sp-first value-index seek with a
@@ -346,9 +347,9 @@ type queryBuilder struct {
 	maxChainDepth int
 }
 
-// densityProbe is a self-contained capped existence count for one half-bounded
-// comparator. It carries its own args and a $1..$3 predicate so it can run
-// independently of the main query's placeholder numbering.
+// densityProbe is a self-contained capped existence count for one comparator.
+// It carries its own args and a $1..$4 predicate so it can run independently of
+// the main query's placeholder numbering.
 type densityProbe struct {
 	table    string // sp_quantity or sp_date
 	boundCol string // value_high or value_low
@@ -356,6 +357,15 @@ type densityProbe struct {
 	rt       string // resource_type
 	param    string // param_name
 	bound    any    // the comparator bound value (quantized float64 / time.Time)
+	// boundCol2/op2/bound2 carry the second half of a doubly bounded predicate
+	// (eq/ap interval overlap); an empty boundCol2 means the probe is half-bounded
+	// and only bound applies. Doubly bounded probes exist because eq is the most
+	// selective date comparator there is, yet halfBoundedColOp cannot map it to a
+	// single column — so without this it gets no verdict at all and falls through
+	// to the dense recency walk (see buildDateExists).
+	boundCol2 string
+	op2       string
+	bound2    any
 }
 
 type planVerdict int8
@@ -373,6 +383,29 @@ const (
 // few thousand covered entries. 5000 keeps both branches comfortably under 10ms.
 // Configurable via search.probeCap (see docs/performance-tuning.md).
 const defaultProbeCap = 5000
+
+// defaultOverlapProbeCap is the density cap for a doubly bounded (eq/ap) probe.
+// It sits far below defaultProbeCap because the two plans trade off differently
+// than they do for a half-bounded bound: an interval-overlap predicate can use
+// only one of its two bounds as a btree index condition, so the sp-first seek
+// never gets as cheap here as it does for a collapsed scalar, while the recency
+// walk needs roughly (partition / matches) x pageSize entries to fill a page and
+// so stays fast until the match set approaches the page size. Measured on a
+// 689k-row Observation date partition: 0 matches -> walk 88ms vs seek 22ms;
+// ~4k matches -> walk 2ms vs seek 32ms. The crossover is in the low hundreds.
+const defaultOverlapProbeCap = 256
+
+// maxOverlapProbeBand bounds which eq/ap bands are worth probing at all. The
+// overlap probe is not cheap: value_low <= high skip-scans from the start of the
+// partition, measured at 6.2k buffers / 16-33ms just to reach the cap. So it only
+// pays where the alternative is catastrophic. A narrow band — day precision or
+// finer, which is what an instant-valued Observation date search produces —
+// matches too few rows for the recency walk to fill a page, so the walk degrades
+// to a full partition scan (88ms over 689k rows) and the probe earns its cost
+// several times over. A wider band (eq2018-06, eq2014) matches thousands, the
+// walk fills a page in ~2ms, and probing would add 16-33ms to every such query
+// for nothing. Bands wider than this keep the planner-chooses shape untouched.
+const maxOverlapProbeBand = 24 * time.Hour
 
 // defaultSearchPageSize is the page size used when a request omits _count.
 // Configurable via search.defaultPageSize.
@@ -1549,6 +1582,23 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 		highP := b.next(high)
 		lowP := b.next(low)
 		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
+		// eq/ap are doubly bounded, so halfBoundedColOp cannot collapse them to one
+		// column — but a narrow band still needs a verdict. Without one the fetch
+		// falls through to the recency walk, and idx_sp_date_recent carries
+		// value_low/value_high as INCLUDE payload, which cannot be seeked: the date
+		// bounds degrade to a filter over the entire (tenant, type, param) partition.
+		// Measured against 689k Observation date rows that is 88ms / 15.9k buffers to
+		// return a page of 20, whether the predicate matches 21 rows or none.
+		// Restricted to narrow bands (see maxOverlapProbeBand) because the probe is
+		// itself expensive here; a wide low-precision band is dense enough that the
+		// walk already wins and must be left alone.
+		if !b.suppressDirectDrive && high.Sub(low) <= maxOverlapProbeBand {
+			b.probe = &densityProbe{
+				table: "sp_date", rt: b.rt, param: param,
+				boundCol: "value_low", op: "<=", bound: high,
+				boundCol2: "value_high", op2: ">=", bound2: low,
+			}
+		}
 	}
 
 	body := fmt.Sprintf("s.resource_type = %s AND s.param_name = %s AND %s", rtP, pP, cond)
@@ -1960,15 +2010,16 @@ func (b *queryBuilder) count(ctx context.Context, pool querier) (int, error) {
 	return n, err
 }
 
-// decidePlan runs the density probe for a lone half-bounded quantity/date
-// comparator and pins the fetch plan from the measured match count, because the
-// per-column histogram mis-estimates these predicates in both directions
-// (design-addendum §1, findings 1–2). It is a no-op for every other search:
-// b.probe is set only by a half-bounded quantity/date predicate, and only when it
-// is the sole predicate (numericBodies length 1) does the fetch drive off the sp
-// table where the pin applies. The probe is a capped existence count — it stops
-// at probeCap matches, so its cost is bounded regardless of the true match size —
-// and it carries its own $1..$3 args, independent of the main query's numbering.
+// decidePlan runs the density probe for a lone quantity/date comparator — either
+// half-bounded (ge/gt/eb/le/lt/sa) or a doubly bounded date eq/ap — and pins the
+// fetch plan from the measured match count, because the per-column histogram
+// mis-estimates these predicates in both directions (design-addendum §1,
+// findings 1–2). It is a no-op for every other search: b.probe is set only by
+// those predicates, and only when it is the sole predicate (numericBodies length
+// 1) does the fetch drive off the sp table where the pin applies. The probe is a
+// capped existence count — it stops at the cap, so its cost is bounded regardless
+// of the true match size — and it carries its own $1..$4 args, independent of the
+// main query's numbering.
 func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	if b.probe == nil || b.predicateCount != 1 || len(b.numericBodies) != 1 {
 		return nil
@@ -1978,14 +2029,31 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	if cap <= 0 {
 		cap = defaultProbeCap
 	}
+	// A doubly bounded overlap decides at a much lower count (see
+	// defaultOverlapProbeCap). Clamp rather than replace so an operator who has
+	// deliberately lowered search.probeCap still gets the smaller of the two.
+	if p.boundCol2 != "" && cap > defaultOverlapProbeCap {
+		cap = defaultOverlapProbeCap
+	}
+	// The probe predicate mirrors the emitted one: a single scalar for a
+	// half-bounded comparator, both bounds for a doubly bounded eq/ap overlap.
+	// Counting the same rows the fetch will match is what makes the verdict
+	// meaningful — a one-sided approximation would call a sparse eq dense
+	// whenever its looser bound alone reaches the cap.
+	pred := fmt.Sprintf("s.%s %s $3", p.boundCol, p.op)
+	args := []any{p.rt, p.param, p.bound}
+	if p.boundCol2 != "" {
+		pred += fmt.Sprintf(" AND s.%s %s $4", p.boundCol2, p.op2)
+		args = append(args, p.bound2)
+	}
 	q := fmt.Sprintf(`SELECT count(*) FROM (
 		SELECT 1 FROM %s s
 		WHERE s.tenant_id = current_setting('app.current_tenant', true)
-		  AND s.resource_type = $1 AND s.param_name = $2 AND s.%s %s $3
+		  AND s.resource_type = $1 AND s.param_name = $2 AND %s
 		LIMIT %d
-	) t`, p.table, p.boundCol, p.op, cap)
+	) t`, p.table, pred, cap)
 	var n int
-	if err := pool.QueryRow(ctx, q, p.rt, p.param, p.bound).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
 		return err
 	}
 	// Two branches, keyed strictly on whether the probe hit the cap. The cap gives
