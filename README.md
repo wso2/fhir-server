@@ -23,6 +23,7 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 11. [Implementation Guides](#11-implementation-guides)
 12. [Testing](#12-testing)
 13. [Extending the Server](#13-extending-the-server)
+14. [Performance Tuning](#14-performance-tuning)
 
 ---
 
@@ -243,6 +244,9 @@ ig:
 |---|---|---|---|
 | `server.port` | `SERVER_PORT` | `9090` | HTTP listen port |
 | `server.baseUrl` | `BASE_URL` | `http://localhost:{port}/fhir/r4` | Canonical server base URL. Written into bundle `link` URLs and the CapabilityStatement. Must match the address clients use. For multi-tenant requests the `/t/{tenant}` prefix is inserted automatically (see [Multi-Tenancy](#6-multi-tenancy)), so set this to the bare base path. |
+| `server.readTimeout` | `SERVER_READ_TIMEOUT` | `30s` | Max time to read a request **including its body** — a large transaction bundle upload must fit inside it. `0` disables. |
+| `server.writeTimeout` | `SERVER_WRITE_TIMEOUT` | `60s` | In Go's `net/http` this bounds the **entire handler execution**, not just the response write, so it must exceed your slowest legitimate request. `0` disables. See the note below and [Bulk import & the write path](docs/performance-tuning.md#5-bulk-import--the-write-path). |
+| `server.idleTimeout` | `SERVER_IDLE_TIMEOUT` | `120s` | Keep-alive idle timeout. `0` disables. |
 | `logging.level` | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. Logs are JSON (structured). |
 | `database.url` | `DATABASE_URL` | *(derived)* | Full PostgreSQL DSN. When set, overrides every other `database.*` field. |
 | `database.host` | `DB_HOST` | `localhost` | PostgreSQL host (only used when `database.url` is empty) |
@@ -260,6 +264,21 @@ ig:
 | *(env only)* | `FHIR_BASE_VALIDATION` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing). On by default; set to `false` to disable. See [Validation rules](#validation-rules). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
+
+> ⚠️ **`SERVER_WRITE_TIMEOUT` does not fail the way you expect.** The deadline
+> starts when the request headers are read, and expiry does **not** abort the
+> handler — the handler runs to completion, then fails to write its response, so
+> the connection is dropped and the client sees a bare `EOF` rather than a timeout
+> status. Large transaction bundles failing with `EOF` while smaller ones succeed
+> is the signature. Set it above your slowest bundle *and* above the client's own
+> timeout, so the client decides when to give up.
+
+> **Performance tunables.** The search (`search.*`, `database.planCacheMode`),
+> write (`write.*`) and bundle (`bundle.*`) parameters are documented with their
+> ranges and sizing rules in the
+> **[search-layer tuning reference](docs/performance-tuning.md)**. For the hardware
+> and PostgreSQL settings underneath them, see
+> [Performance Tuning](#14-performance-tuning).
 
 ---
 
@@ -983,3 +1002,182 @@ Add a corresponding test case in `internal/handler/handler_test.go`.
 ### Updating the schema
 
 Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so table creation stays idempotent. Bump the version number in the final `INSERT INTO schema_version` statement.
+
+---
+
+## 14. Performance Tuning
+
+The server delegates all data access to PostgreSQL, so deployment performance is
+determined primarily by the database host. Address the following areas in order —
+storage, PostgreSQL configuration, server configuration, verification — because
+each constrains those that follow it. PostgreSQL settings cannot compensate for
+saturated storage, and the search tunables described in the
+[search-layer tuning reference](docs/performance-tuning.md) cannot compensate for
+either.
+
+### Storage
+
+Write amplification is substantial. A single resource produces approximately 20
+index rows across eight `sp_*` tables, each maintaining several B-tree indexes.
+Including WAL and checkpoint activity, plan for approximately 50 KB of physical
+writes per resource. Ingestion is therefore constrained by sustained write IOPS
+well before it is constrained by CPU.
+
+Requirements:
+
+- Use SSD or NVMe storage. Rotational disks are not suitable.
+- Avoid burst-credit volumes. Throughput degrades sharply once credits are
+  exhausted, and measurements are not reproducible between runs.
+- Where the primary volume cannot be changed, relocate `pg_wal` to the fastest
+  available device.
+
+Validate a candidate volume before deployment. Every commit incurs an `fsync`:
+
+```bash
+pg_test_fsync -s 3   # execute within the PGDATA filesystem
+```
+
+Suitable hardware sustains rates in the thousands per second. Results in the low
+hundreds indicate that storage will limit write throughput irrespective of other
+tuning.
+
+Measure saturation under representative load:
+
+```bash
+iostat -x 5
+```
+
+Sustained `%util` approaching 100 together with double-digit `w_await` indicates a
+storage-bound deployment, in which case PostgreSQL-level tuning provides no
+benefit.
+
+On cloud platforms, confirm that the device is locally attached. A device exposed
+through an NVMe interface may still be network-attached storage; on Azure, for
+example, `MSFT NVMe Accelerator` denotes a remote managed disk whereas
+`Microsoft NVMe Direct Disk` is physically attached. Locally attached NVMe offers
+substantially higher throughput but is typically ephemeral and does not survive a
+stop or deallocate operation, which makes it appropriate for replicated clusters
+and reproducible test environments rather than an unreplicated system of record.
+
+### PostgreSQL configuration
+
+The following is a starting point for write-heavy deployments. Adjust
+`shared_buffers` and the connection pool according to the memory budget below.
+
+```conf
+shared_buffers = 8GB                  # approximately 25% of memory available to PostgreSQL
+max_wal_size = 8GB                    # the 1GB default triggers checkpoints too frequently
+min_wal_size = 2GB                    # permits segment recycling rather than recreation
+wal_buffers = 256MB                   # the 16MB default is insufficient for concurrent bulk writes
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9    # distributes checkpoint I/O rather than issuing it in bursts
+track_io_timing = on                  # required for blk_read_time and blk_write_time
+```
+
+`max_wal_size` and `wal_buffers` have the greatest effect on import throughput.
+Frequent checkpoints require PostgreSQL to emit a full-page image for every page
+modified since the preceding checkpoint, which increases WAL volume
+significantly, so increasing `max_wal_size` is generally the most effective
+PostgreSQL-level change. Review the memory budget before doing so.
+
+#### Memory budget
+
+Under a container or cgroup memory limit, two of the largest consumers cannot be
+reclaimed when memory is exhausted:
+
+- `shared_buffers`, which is allocated as shared memory, with swap normally
+  disabled.
+- Per-backend private memory. Allow approximately 250 MB per connection under
+  bulk-bundle load; backends parsing large multi-row `INSERT` statements consume
+  considerably more than idle connections.
+
+The remainder is page cache, which is reclaimable once written back. Dirty pages
+awaiting writeback are not.
+
+```
+memory limit  >=  shared_buffers
+                + (pool_max_conns x 250MB)
+                + headroom for page cache
+```
+
+`max_wal_size` is intentionally excluded from this calculation: it bounds WAL disk
+consumption rather than resident memory. It does affect memory indirectly, since
+deferring checkpoints increases the volume of dirty pages awaiting writeback, but
+that quantity is governed by the `vm.dirty_*` parameters rather than by
+`max_wal_size` itself.
+
+Exceeding the budget does not produce a clean error. A backend is terminated by
+the OOM killer, after which the postmaster terminates the remaining backends and
+initiates crash recovery. PostgreSQL itself normally continues running and the
+container is not restarted, but all in-flight requests fail and the database is
+unavailable until recovery completes. The most common cause is a connection pool
+sized for target throughput rather than for available memory.
+
+Note that `vm.dirty_ratio` and `vm.dirty_background_ratio` are expressed as
+percentages of host memory, not of the container limit. On a large host running a
+small container, the kernel permits more dirty page cache than the cgroup can
+accommodate. Where this occurs, set `vm.dirty_background_bytes` and
+`vm.dirty_bytes` to explicit values.
+
+#### Settings with limited benefit for this workload
+
+- `wal_compression` compresses full-page images only. Once `max_wal_size` is
+  sufficiently large, few full-page images are produced and the setting yields
+  little benefit.
+- `synchronous_commit = off` benefits workloads with high commit rates.
+  Transaction bundles commit infrequently, as a single commit covers an entire
+  bundle, so commit `fsync` represents a small proportion of total write cost.
+  Measure before enabling, and do not enable it where an acknowledged write must
+  survive a crash. See the
+  [search-layer tuning reference](docs/performance-tuning.md#5-bulk-import--the-write-path).
+
+### Server configuration
+
+**Timeouts.** `SERVER_WRITE_TIMEOUT` bounds the entire handler invocation, so a
+transaction bundle must complete within it. Determine the import duration of the
+largest bundle the deployment will accept, then set the timeout above that value
+with margin and above the client timeout, so that the client governs when a
+request is abandoned. Bundles containing tens of thousands of entries may require
+several minutes under concurrent load. `SERVER_READ_TIMEOUT` must accommodate the
+upload of the same bundle.
+
+**Connection pool.** Set `pool_max_conns` in the `DATABASE_URL`, sized from the
+memory budget above. Additional connections do not increase write throughput once
+storage is saturated; they increase memory consumption and lock contention.
+
+**Bundle concurrency.** `BUNDLE_TRANSACTION_CONCURRENCY` distributes a transaction
+bundle across K database transactions. Enabling it requires a corresponding
+increase in pool size; otherwise each bundle waits for shard connections, fails to
+acquire them, and executes serially in any case, which is a net loss relative to
+leaving the feature disabled. Semantics, permitted values and the sizing rule are
+documented in
+[the search-layer tuning reference, §5](docs/performance-tuning.md#5-bulk-import--the-write-path).
+
+### Verification
+
+Run the following after any bulk load, before measuring performance or serving
+read traffic:
+
+```sql
+VACUUM (ANALYZE) resources;   -- repeat for each sp_* table
+```
+
+Bulk imports insert faster than autovacuum can process, which leaves a stale
+visibility map and outdated planner statistics. All read fast paths depend on
+index-only scans, which require both to be current. Measurements taken before
+this completes are not representative.
+
+To identify the prevailing constraint, sample wait events under load:
+
+```sql
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity
+WHERE state = 'active' AND datname = current_database()
+GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+| Predominant wait event | Interpretation |
+|---|---|
+| `LWLock/WALWrite`, `LWLock/WALInsert` | WAL-bound. Review storage first, then `wal_buffers` and `max_wal_size`. |
+| `LWLock/BufferContent` | Index-page contention. Reduce the number of concurrent writers; increasing concurrency makes it worse. |
+| Predominantly CPU | Storage and locking are not limiting. The [search-layer tunables](docs/performance-tuning.md) apply. |

@@ -1,5 +1,13 @@
 # Performance Tuning
 
+> **Scope.** This document covers the **search layer** — the density-probe
+> architecture and the knobs around it. For hardware sizing (storage IOPS, the
+> memory budget under a container limit), PostgreSQL server settings, and the
+> write/import path, see [Performance Tuning](../README.md#14-performance-tuning) in
+> the README.
+> Tune in that order — storage, then PostgreSQL, then these knobs. No search knob
+> rescues a saturated disk.
+
 This server's search layer is built around one architectural rule: every FHIR
 search reduces to *find resources matching a predicate on an sp table, ordered by
 recency, first page only*. Predicate order and recency order differ, and the right
@@ -210,13 +218,34 @@ executor while measuring.
 
 A transaction bundle is **one** DB transaction and **one** HTTP handler
 invocation, so `SERVER_WRITE_TIMEOUT` (`server.writeTimeout`, default **60s**)
-bounds the entire import. If a large bundle's import can exceed it, the server
-kills the handler mid-flight — the client sees a connection reset (EOF) and the
-transaction rolls back, wasting the whole attempt. Size the timeout above your
-largest expected bundle's import time with headroom; for dedicated import windows
-(multi-thousand-entry bundles, many concurrent loaders) `SERVER_WRITE_TIMEOUT=300s`
-is a reasonable starting point. This is a ceiling, not a target: normal small
-writes are unaffected.
+has to cover the entire import.
+
+The expiry semantics are worth stating precisely. `WriteTimeout` sets a deadline
+on the connection; Go does **not** cancel the handler or its request context. The
+handler continues to completion, and the failure surfaces only when it attempts to
+write a response to a connection whose deadline has already passed. The client
+receives a bare `EOF` rather than a `504` or any other timeout status, and the
+server typically logs nothing.
+
+The database outcome is independent of the HTTP outcome, and an `EOF` does not
+indicate which occurred. If the deadline expired after the transaction had
+committed, the bundle was applied and the client has no record of it. If the
+client abandoned the request first and that cancellation reached the server during
+the write, the transaction is rolled back instead. **Treat an `EOF` on a bundle
+import as an indeterminate outcome and reconcile before retrying**, since an
+unconditional retry may apply the bundle twice.
+
+A small number of `EOF`s confined to the largest bundles, while all other requests
+succeed, indicates this condition. It can be confirmed by comparing timings: if
+the slowest **successful** request falls just below the configured timeout and
+every failure falls just above it, the timeout is the cause.
+
+Derive the value from measurement rather than selecting a nominal figure. Time the
+import of the largest bundle the deployment will accept, then set the timeout
+above that with margin, and above the client timeout so that the client governs
+when a request is abandoned. Bundles containing tens of thousands of entries may
+run for several minutes under concurrent load, well beyond the default. The
+setting is a ceiling rather than a target; ordinary small writes are unaffected.
 
 ### Autovacuum interacts with bulk import — post-load `VACUUM (ANALYZE)` is mandatory
 
@@ -235,8 +264,15 @@ a transaction).
 
 For a throwaway or reloadable import environment, setting
 `synchronous_commit = off` lets commits return without waiting for WAL flush to
-disk, which materially speeds up a write-heavy import. **The tradeoff is a
-data-loss window:** on an OS/hardware crash the most recent committed transactions
+disk.
+
+**Measure before assuming it helps here.** The benefit scales with how *often* you
+commit, and transaction-bundle import commits rarely — one commit covers a whole
+bundle's worth of rows. Commit `fsync` is therefore a small slice of the total
+write cost, and removing it can simply push WAL into an already-saturated pipeline
+faster. Expect little or nothing on bundle-shaped workloads; it is worth testing on
+commit-heavy ones (many small writes rather than few large bundles).
+**The tradeoff is a data-loss window:** on an OS/hardware crash the most recent committed transactions
 can be lost (the database stays *consistent* — this is not corruption — but
 acknowledged writes may vanish). Never default it, and never enable it where an
 acknowledged write must survive a crash (i.e. any environment holding real
