@@ -156,6 +156,16 @@ CREATE TABLE IF NOT EXISTS sp_string (
 -- non-C collations (e.g. en_US.utf8); without it, prefix scans fall back to a
 -- sequential scan. The operator class also serves equality lookups.
 CREATE INDEX IF NOT EXISTS idx_sp_str_lower_pattern ON sp_string (tenant_id, resource_type, param_name, value_lower text_pattern_ops);
+-- :contains (and the case-insensitive default) emit value_lower LIKE '%needle%'.
+-- A leading wildcard cannot seek text_pattern_ops above, so the predicate degrades
+-- to a filter over the whole (tenant, type, param) partition -- measured 857
+-- buffers to return one Organization name. A trigram GIN index seeks it directly:
+-- same query, 54 buffers / 0.24ms vs 0.48ms. btree_gin supplies the opclasses for
+-- the leading equality columns so the whole predicate rides one index.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+CREATE INDEX IF NOT EXISTS idx_sp_str_lower_trgm ON sp_string
+    USING gin (tenant_id, resource_type, param_name, value_lower gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_sp_str_exact         ON sp_string (tenant_id, resource_type, param_name, value_exact);
 CREATE INDEX IF NOT EXISTS idx_sp_str_source        ON sp_string (tenant_id, resource_id, resource_type, param_name, value_lower);
 -- Uncomment for :contains support (requires pg_trgm extension):
@@ -233,6 +243,20 @@ CREATE INDEX IF NOT EXISTS idx_sp_date_high   ON sp_date (tenant_id, resource_ty
 -- Recency walk for dense half-bounded date searches (the density probe picks it).
 CREATE INDEX IF NOT EXISTS idx_sp_date_recent ON sp_date (tenant_id, resource_type, param_name, last_updated DESC) INCLUDE (value_low, value_high, resource_id);
 CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id, resource_type, param_name, value_low, value_high);
+-- Doubly bounded eq/ap interval overlap. A btree can seek only one of the two
+-- bounds: `value_low <= searchHigh AND value_high >= searchLow` leaves the second
+-- bound as a filter, so an exact-instant eq skip-scans a large slice of the
+-- partition -- measured 3.2k buffers / 19.7ms on the 689k-row Observation date
+-- partition just to prove zero matches, paid twice (density probe + fetch). The
+-- GiST range index seeks both bounds at once: same query, 37 buffers / 0.69ms.
+-- buildDateExists emits the predicate as tstzrange(s.value_low, s.value_high,
+-- '[]') && tstzrange(searchLow, searchHigh, '[]'); the index expression below must
+-- stay byte-for-byte identical to that stored tstzrange or the planner will not
+-- match it. Identical pattern to idx_sp_qty_range_gist. The leading equality
+-- columns are varchar, which have no default gist opclass, hence btree_gist.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE INDEX IF NOT EXISTS idx_sp_date_range_gist ON sp_date
+    USING gist (tenant_id, resource_type, param_name, tstzrange(value_low, value_high, '[]'));
 
 -- ─── sp_number ───────────────────────────────────────────────────────────────
 -- FHIR number search parameters.

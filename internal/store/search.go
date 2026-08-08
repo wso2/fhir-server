@@ -366,6 +366,13 @@ type densityProbe struct {
 	boundCol2 string
 	op2       string
 	bound2    any
+	// rangeCtor, when non-empty, names the range constructor (tstzrange) for a
+	// doubly bounded probe that should be emitted as a range-overlap predicate
+	// instead of two scalar bounds, so it seeks the GiST range index rather than
+	// skip-scanning a btree on one bound with the other left as a filter. bound
+	// and bound2 are the search band's low and high. Mutually exclusive with the
+	// boundCol/boundCol2 scalar form.
+	rangeCtor string
 }
 
 type planVerdict int8
@@ -1558,6 +1565,12 @@ func halfBoundedColOp(prefix string) (col, op string, useHigh, ok bool) {
 // 2021-06-01] satisfies gt2021-02-16 (value_high) and lt2021-02-16 (value_low).
 // Before the fix gt read value_low (sa semantics) and lt read value_high (eb),
 // which wrongly excluded straddling periods (design-addendum §1, finding 4).
+// storedDateRange is the stored date band as a range value. It must stay
+// byte-for-byte identical to the expression in idx_sp_date_range_gist or the
+// planner will not recognise the index (same contract as the numrange in
+// buildQuantityExists / idx_sp_qty_range_gist).
+const storedDateRange = "tstzrange(s.value_low, s.value_high, '[]')"
+
 func (b *queryBuilder) buildDateExists(param, value string) string {
 	prefix, dateStr := extractComparatorPrefix(value)
 	low, high := expandDateRange(dateStr)
@@ -1575,13 +1588,13 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 			b.probe = &densityProbe{table: "sp_date", boundCol: col, op: op, rt: b.rt, param: param, bound: bound}
 		}
 	} else if prefix == "ne" {
-		highP := b.next(high)
 		lowP := b.next(low)
-		cond = fmt.Sprintf("NOT (s.value_low <= %s AND s.value_high >= %s)", highP, lowP)
+		highP := b.next(high)
+		cond = fmt.Sprintf("NOT (%s && tstzrange(%s, %s, '[]'))", storedDateRange, lowP, highP)
 	} else { // eq, ap — doubly bounded interval overlap
-		highP := b.next(high)
 		lowP := b.next(low)
-		cond = fmt.Sprintf("s.value_low <= %s AND s.value_high >= %s", highP, lowP)
+		highP := b.next(high)
+		cond = fmt.Sprintf("%s && tstzrange(%s, %s, '[]')", storedDateRange, lowP, highP)
 		// eq/ap are doubly bounded, so halfBoundedColOp cannot collapse them to one
 		// column — but a narrow band still needs a verdict. Without one the fetch
 		// falls through to the recency walk, and idx_sp_date_recent carries
@@ -1589,14 +1602,15 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 		// bounds degrade to a filter over the entire (tenant, type, param) partition.
 		// Measured against 689k Observation date rows that is 88ms / 15.9k buffers to
 		// return a page of 20, whether the predicate matches 21 rows or none.
-		// Restricted to narrow bands (see maxOverlapProbeBand) because the probe is
-		// itself expensive here; a wide low-precision band is dense enough that the
-		// walk already wins and must be left alone.
+		// Restricted to narrow bands (see maxOverlapProbeBand): a wide low-precision
+		// band is dense enough that the walk already wins and must be left alone.
+		// rangeCtor makes the probe seek idx_sp_date_range_gist with the same
+		// overlap predicate the fetch uses, so proving a band sparse costs a GiST
+		// descent rather than a btree skip-scan over half the partition.
 		if !b.suppressDirectDrive && high.Sub(low) <= maxOverlapProbeBand {
 			b.probe = &densityProbe{
 				table: "sp_date", rt: b.rt, param: param,
-				boundCol: "value_low", op: "<=", bound: high,
-				boundCol2: "value_high", op2: ">=", bound2: low,
+				rangeCtor: "tstzrange", bound: low, bound2: high,
 			}
 		}
 	}
@@ -2032,7 +2046,7 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	// A doubly bounded overlap decides at a much lower count (see
 	// defaultOverlapProbeCap). Clamp rather than replace so an operator who has
 	// deliberately lowered search.probeCap still gets the smaller of the two.
-	if p.boundCol2 != "" && cap > defaultOverlapProbeCap {
+	if (p.boundCol2 != "" || p.rangeCtor != "") && cap > defaultOverlapProbeCap {
 		cap = defaultOverlapProbeCap
 	}
 	// The probe predicate mirrors the emitted one: a single scalar for a
@@ -2040,11 +2054,19 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	// Counting the same rows the fetch will match is what makes the verdict
 	// meaningful — a one-sided approximation would call a sparse eq dense
 	// whenever its looser bound alone reaches the cap.
-	pred := fmt.Sprintf("s.%s %s $3", p.boundCol, p.op)
+	var pred string
 	args := []any{p.rt, p.param, p.bound}
-	if p.boundCol2 != "" {
-		pred += fmt.Sprintf(" AND s.%s %s $4", p.boundCol2, p.op2)
+	if p.rangeCtor != "" {
+		// Range-overlap probe: byte-for-byte the fetch's predicate, so both ride
+		// the same GiST expression index (see storedDateRange / schema.sql).
+		pred = fmt.Sprintf("%s(s.value_low, s.value_high, '[]') && %s($3, $4, '[]')", p.rangeCtor, p.rangeCtor)
 		args = append(args, p.bound2)
+	} else {
+		pred = fmt.Sprintf("s.%s %s $3", p.boundCol, p.op)
+		if p.boundCol2 != "" {
+			pred += fmt.Sprintf(" AND s.%s %s $4", p.boundCol2, p.op2)
+			args = append(args, p.bound2)
+		}
 	}
 	q := fmt.Sprintf(`SELECT count(*) FROM (
 		SELECT 1 FROM %s s
