@@ -130,10 +130,6 @@ type FileConfig struct {
 		MaxRowsPerStatement *int `yaml:"maxRowsPerStatement"`
 		MaxRowsPerBundle    *int `yaml:"maxRowsPerBundle"`
 	} `yaml:"write"`
-
-	// Bundle execution tunables. transactionConcurrency is a pointer so an
-	// absent key falls through to the default (1 = off) while an explicit value
-	// is range-validated.
 }
 
 // Load reads configuration using the env-var-based discovery path. The
