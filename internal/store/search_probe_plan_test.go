@@ -139,6 +139,61 @@ func TestSearch_DensityProbe_Plan(t *testing.T) {
 		_ = explain(b, sql)
 	})
 
+	// Doubly bounded eq/ap must ride idx_sp_date_range_gist. A btree can seek only
+	// one of value_low <= high / value_high >= low and leaves the other as a filter,
+	// so on the perf dataset an exact-instant eq skip-scanned 3.2k buffers / 19.7ms
+	// just to prove zero matches -- and paid it twice, once in the probe and once in
+	// the fetch. Both must now emit the identical tstzrange && tstzrange predicate,
+	// byte-for-byte matching the index expression, or the planner silently falls
+	// back to that skip-scan.
+	// 2099 keeps the band sparse: the seeded rows all span 2020, and an eq inside
+	// that band overlaps every one of them, where a seq scan of the fixture's 99
+	// pages is legitimately cheapest and the index assertion would be meaningless.
+	t.Run("date eq overlap seeks the gist range index", func(t *testing.T) {
+		b, sql := build("Encounter", "date", "eq2099-06-15T12:00:00Z")
+		if !strings.Contains(sql, "tstzrange(s.value_low, s.value_high, '[]') &&") {
+			t.Errorf("eq date must emit the range-overlap predicate, got:\n%s", sql)
+		}
+		plan := explain(b, sql)
+		if strings.Contains(plan, "Seq Scan on sp_date") {
+			t.Errorf("date eq: unexpected seq scan:\n%s", plan)
+		}
+		if !strings.Contains(plan, "idx_sp_date_range_gist") {
+			t.Errorf("date eq: expected idx_sp_date_range_gist seek, got:\n%s", plan)
+		}
+	})
+
+	// The probe must use the same range-overlap predicate as the fetch, otherwise
+	// proving a band sparse costs the very btree skip-scan the gist index exists to
+	// avoid. Asserted on the probe SQL directly, since decidePlan builds its own.
+	t.Run("date eq probe uses the range-overlap predicate", func(t *testing.T) {
+		b := &queryBuilder{rt: "Encounter", reg: reg}
+		b.writeBase()
+		b.applyParam("date", "eq2020-06-15T12:00:00Z")
+		if b.err != nil {
+			t.Fatalf("build: %v", b.err)
+		}
+		if b.probe == nil {
+			t.Fatal("expected a density probe for a narrow eq band")
+		}
+		if b.probe.rangeCtor != "tstzrange" {
+			t.Errorf("expected rangeCtor tstzrange, got %q", b.probe.rangeCtor)
+		}
+		if b.probe.boundCol != "" || b.probe.boundCol2 != "" {
+			t.Errorf("range probe must not carry scalar bound columns, got %q/%q",
+				b.probe.boundCol, b.probe.boundCol2)
+		}
+	})
+
+	// ne is the complement of the same overlap and must stay consistent with eq:
+	// if the two drifted apart, eq and ne would no longer partition the match set.
+	t.Run("date ne emits the negated overlap", func(t *testing.T) {
+		_, sql := build("Encounter", "date", "ne2020-06-15T12:00:00Z")
+		if !strings.Contains(sql, "NOT (tstzrange(s.value_low, s.value_high, '[]') &&") {
+			t.Errorf("ne date must emit the negated range-overlap predicate, got:\n%s", sql)
+		}
+	})
+
 	t.Run("quantity sparse pins value_high seek", func(t *testing.T) {
 		b, sql := build("Observation", "value-quantity", "ge99999")
 		if b.planDense != planSparse {
