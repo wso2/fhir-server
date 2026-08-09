@@ -51,6 +51,22 @@ func (t *stmtTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.
 
 func (t *stmtTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
+// Batch statements travel through the batch tracer hooks, not TraceQueryStart,
+// so the pipelined flush's statements are recorded here.
+func (t *stmtTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceBatchStartData) context.Context {
+	return ctx
+}
+
+func (t *stmtTracer) TraceBatchQuery(_ context.Context, _ *pgx.Conn, data pgx.TraceBatchQueryData) {
+	t.mu.Lock()
+	if t.enabled {
+		t.sqls = append(t.sqls, data.SQL)
+	}
+	t.mu.Unlock()
+}
+
+func (t *stmtTracer) TraceBatchEnd(context.Context, *pgx.Conn, pgx.TraceBatchEndData) {}
+
 func (t *stmtTracer) start() {
 	t.mu.Lock()
 	t.enabled = true
