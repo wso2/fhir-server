@@ -80,23 +80,21 @@ func defaultWriteTuning() WriteTuning {
 }
 
 type Store struct {
-	pool         *pgxpool.Pool
-	extractor    *index.Extractor
-	registry     *searchparam.Registry
-	terminology  *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
-	tuning       SearchTuning
-	writeTuning  WriteTuning
-	bundleTuning BundleTuning
+	pool        *pgxpool.Pool
+	extractor   *index.Extractor
+	registry    *searchparam.Registry
+	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning      SearchTuning
+	writeTuning WriteTuning
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
 	s := &Store{
-		pool:         pool,
-		extractor:    index.New(registry),
-		registry:     registry,
-		tuning:       defaultSearchTuning(),
-		writeTuning:  defaultWriteTuning(),
-		bundleTuning: BundleTuning{TransactionConcurrency: 1},
+		pool:        pool,
+		extractor:   index.New(registry),
+		registry:    registry,
+		tuning:      defaultSearchTuning(),
+		writeTuning: defaultWriteTuning(),
 	}
 	for _, o := range opts {
 		o(s)

@@ -75,13 +75,6 @@ type Config struct {
 	// of driving the database out of memory. See docs/performance-tuning.md.
 	WriteMaxRowsPerStatement int // rows per multi-row INSERT; default 1000
 	WriteMaxRowsPerBundle    int // total index rows one transaction may buffer; default 100000
-
-	// Bundle execution tunables. BundleTransactionConcurrency is the shard count
-	// for parallel transaction bundles (1 = capability off, the default);
-	// BundleTransactionProcessingDefault is the mode used when a request carries
-	// no x-bundle-processing-logic header. See docs/performance-tuning.md.
-	BundleTransactionConcurrency       int    // shard count for parallel transaction bundles; 1 = capability off; default 1
-	BundleTransactionProcessingDefault string // "sequential" | "parallel" — mode when the request header is absent; default sequential
 }
 
 // FileConfig is the on-disk YAML schema. Each field is optional — anything
@@ -137,14 +130,6 @@ type FileConfig struct {
 		MaxRowsPerStatement *int `yaml:"maxRowsPerStatement"`
 		MaxRowsPerBundle    *int `yaml:"maxRowsPerBundle"`
 	} `yaml:"write"`
-
-	// Bundle execution tunables. transactionConcurrency is a pointer so an
-	// absent key falls through to the default (1 = off) while an explicit value
-	// is range-validated.
-	Bundle struct {
-		TransactionConcurrency       *int   `yaml:"transactionConcurrency"`
-		TransactionProcessingDefault string `yaml:"transactionProcessingDefault"`
-	} `yaml:"bundle"`
 }
 
 // Load reads configuration using the env-var-based discovery path. The
@@ -274,15 +259,6 @@ func resolve(fc *FileConfig) (*Config, error) {
 	// Parallel transaction bundle tunables. Concurrency 1 (the default) keeps the
 	// capability off entirely; the processing default exists so a deployment can
 	// opt whole workloads into parallel mode without per-request headers.
-	bundleTxConcurrency, err := resolveIntTunable("BUNDLE_TRANSACTION_CONCURRENCY", "bundle.transactionConcurrency", fc.Bundle.TransactionConcurrency, 1, 1, 64)
-	if err != nil {
-		return nil, err
-	}
-	bundleTxDefault, err := resolveEnumTunable("BUNDLE_TRANSACTION_PROCESSING_DEFAULT", "bundle.transactionProcessingDefault", fc.Bundle.TransactionProcessingDefault,
-		"sequential", []string{"sequential", "parallel"})
-	if err != nil {
-		return nil, err
-	}
 
 	return &Config{
 		DatabaseURL:     dbURL,
@@ -309,9 +285,6 @@ func resolve(fc *FileConfig) (*Config, error) {
 
 		WriteMaxRowsPerStatement: writeMaxRowsPerStatement,
 		WriteMaxRowsPerBundle:    writeMaxRowsPerBundle,
-
-		BundleTransactionConcurrency:       bundleTxConcurrency,
-		BundleTransactionProcessingDefault: bundleTxDefault,
 	}, nil
 }
 

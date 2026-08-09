@@ -80,22 +80,6 @@ write:
   # Env: WRITE_MAX_ROWS_PER_BUNDLE.
   # maxRowsPerBundle: 100000
 
-bundle:
-  # Shard count for parallel transaction bundle execution
-  # (x-bundle-processing-logic: parallel, Microsoft-compatible). 1 keeps the
-  # capability off; >1 lets a transaction bundle's writes run across that many
-  # concurrent database transactions. Requires the client contract documented in
-  # docs/performance-tuning.md §5 (no overlapping write targets; relaxed commit
-  # semantics). Size the pool: expected_concurrent_bundles * transactionConcurrency
-  # <= pool max_conns. Range 1–64. Env: BUNDLE_TRANSACTION_CONCURRENCY.
-  # transactionConcurrency: 1
-
-  # Mode when a request carries no x-bundle-processing-logic header:
-  # "sequential" (default) or "parallel". Set "parallel" to opt whole workloads
-  # in without per-request headers (e.g. import harnesses that don't send the
-  # header). Env: BUNDLE_TRANSACTION_PROCESSING_DEFAULT.
-  # transactionProcessingDefault: sequential
-
 ig:
   # Implementation guides to load at startup. None are loaded by default —
   # the server runs as a plain base FHIR R4 store until you opt in here.

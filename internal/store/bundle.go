@@ -18,10 +18,10 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -140,25 +140,6 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	for i := range ops {
 		if ops[i].body != nil {
 			rewriteReferences(ops[i].body, refMap)
-		}
-	}
-
-	// Parallel execution (x-bundle-processing-logic: parallel, or the configured
-	// default) shards the write ops across K concurrent transactions. It requires
-	// unique write targets — overlap falls back to this serial body, which stays
-	// the default and the reference behavior — as does a pool too contended to
-	// yield the shard connections within the acquisition timeout.
-	if s.parallelTransactionRequested(ctx) {
-		if key := overlappingWriteTarget(ops); key != "" {
-			slog.Info("parallel bundle fell back to serial",
-				"reason", "overlapping resource ids", "key", key, "entries", len(entries))
-		} else if countWriteOps(ops) >= 2 {
-			results, perr := s.executeTransactionParallel(ctx, ops)
-			if !errors.Is(perr, errParallelUnavailable) {
-				return results, perr
-			}
-			slog.Info("parallel bundle fell back to serial",
-				"reason", "shard connections unavailable", "entries", len(entries))
 		}
 	}
 
@@ -781,4 +762,17 @@ func httpReason(status int) string {
 	default:
 		return "Internal Server Error"
 	}
+}
+
+// verbOrder returns op indices sorted into FHIR transaction processing order
+// (DELETE, POST, PUT/PATCH, GET), stable within each verb.
+func verbOrder(ops []bundleOp) []int {
+	order := make([]int, len(ops))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return methodOrder(ops[order[a]].method) < methodOrder(ops[order[b]].method)
+	})
+	return order
 }
