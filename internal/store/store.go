@@ -273,13 +273,15 @@ func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
 		)
 		return WriteLimitError{Rows: w.totalRows(), Limit: w.maxRowsPerBundle}
 	}
-	if err := index.InsertBatched(ctx, tx, "resources", resourcesCols, w.resources, w.maxRowsPerStmt); err != nil {
-		return err
-	}
-	if err := w.rs.Flush(ctx, tx, w.maxRowsPerStmt); err != nil {
-		return err
-	}
-	return index.InsertBatched(ctx, tx, "resource_history", historyCols, w.history, w.maxRowsPerStmt)
+	// Queue everything into one pipelined batch so the whole flush costs a
+	// single round trip instead of one per statement. Queue order preserves the
+	// FK ordering the sequential writes relied on: parent resources rows first,
+	// then the index DELETEs + INSERTs, then resource_history.
+	qb := &index.Batch{}
+	index.QueueInsertBatched(qb, "resources", resourcesCols, w.resources, w.maxRowsPerStmt)
+	w.rs.QueueFlush(qb, w.maxRowsPerStmt)
+	index.QueueInsertBatched(qb, "resource_history", historyCols, w.history, w.maxRowsPerStmt)
+	return qb.Send(ctx, tx)
 }
 
 // ─── Create ───────────────────────────────────────────────────────────────────
@@ -434,13 +436,15 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	body["id"] = resourceID
 	body["resourceType"] = resourceType
 
-	newVersion, currentVersion, lastUpdated, err := bumpVersion(ctx, tx, resourceType, resourceID)
+	oldRaw, currentVersion, wasDeleted, err := lockForUpdate(ctx, tx, resourceType, resourceID)
 	if err != nil {
 		return nil, err
 	}
 	if ifMatchVersion >= 0 && currentVersion != ifMatchVersion {
 		return nil, ConflictError{fmt.Sprintf("version conflict: current=%d, if-match=%d", currentVersion, ifMatchVersion)}
 	}
+	newVersion := currentVersion + 1
+	lastUpdated := time.Now().UTC()
 
 	body = setMeta(body, newVersion, lastUpdated)
 	raw, err := json.Marshal(body)
@@ -451,8 +455,8 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	// Update the resources row immediately so a later entry (or a subsequent
 	// version bump for the same id within this bundle) observes the new version.
 	// The stale index rows are cleared and the fresh ones inserted by the batched
-	// flush: AddDelete registers the re-index DELETE and drops any rows already
-	// buffered for this resource, then Extract buffers the new rows.
+	// flush; mergeReindex diffs the stored version's rows against the incoming
+	// version's so untouched sp_* tables cost nothing (see RowSet.MergeReindex).
 	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
 		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
@@ -460,11 +464,42 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	); err != nil {
 		return nil, err
 	}
-	w.rs.AddDelete(resourceType, resourceID)
-	s.extractor.Extract(w.rs, resourceType, resourceID, body, lastUpdated)
+	// A soft-deleted resource has no sp_* rows left, so its stored body must not
+	// contribute "old" rows — every table the new version touches gets a full
+	// (re)insert, exactly as a fresh create would.
+	if wasDeleted {
+		oldRaw = nil
+	}
+	s.mergeReindex(w, resourceType, resourceID, oldRaw, body, lastUpdated)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PUT", raw, lastUpdated})
 
 	return body, nil
+}
+
+// mergeReindex buffers the re-index for one updated resource by diffing the
+// stored version's extracted rows (oldRaw; nil for none) against the incoming
+// body's. The old rows are extracted with the zero time: only tables without a
+// denormalised last_updated column are compared row-for-row, so the timestamp
+// never participates in the comparison, and mere table emptiness drives the
+// rest. If the stored JSON cannot be parsed it falls back to the full
+// clear-and-reinsert of every table.
+func (s *Store) mergeReindex(w *bundleWriter, resourceType, resourceID string, oldRaw []byte, body map[string]any, lastUpdated time.Time) {
+	// Unbounded (cap 0): the stored version already passed the row cap when it
+	// was written, and a LimitHit from re-extracting it must not abort this
+	// transaction — only the incoming version's rows count against the cap.
+	oldRS := index.NewRowSet(w.tenant, 0)
+	if len(oldRaw) > 0 {
+		var oldBody map[string]any
+		if err := json.Unmarshal(oldRaw, &oldBody); err != nil {
+			w.rs.AddDelete(resourceType, resourceID)
+			s.extractor.Extract(w.rs, resourceType, resourceID, body, lastUpdated)
+			return
+		}
+		s.extractor.Extract(oldRS, resourceType, resourceID, oldBody, time.Time{})
+	}
+	newRS := index.NewRowSet(w.tenant, w.maxRowsPerBundle)
+	s.extractor.Extract(newRS, resourceType, resourceID, body, lastUpdated)
+	w.rs.MergeReindex(oldRS, newRS, resourceType, resourceID)
 }
 
 // ─── Patch (JSON Merge Patch) ─────────────────────────────────────────────────
@@ -525,6 +560,11 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	if err != nil {
 		return nil, 0, err
 	}
+	// Extract the stored version's index rows before mergePatch/setMeta run:
+	// both alias nested maps of existing, and the diff below must see the
+	// pre-patch rows.
+	oldRS := index.NewRowSet(w.tenant, 0)
+	s.extractor.Extract(oldRS, resourceType, resourceID, existing, time.Time{})
 	merged := mergePatch(existing, patch)
 	merged["id"] = resourceID
 	merged["resourceType"] = resourceType
@@ -537,8 +577,8 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 		return nil, 0, err
 	}
 
-	// Update immediately, then buffer the re-index (DELETE + fresh rows) and the
-	// history row for the batched flush — the same shape as updateInTx.
+	// Update immediately, then buffer the diffed re-index and the history row
+	// for the batched flush — the same shape as updateInTx.
 	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET version_id = $1, last_updated = $2, resource_json = $3, is_deleted = FALSE
 		 WHERE fhir_id = $4 AND resource_type = $5 AND tenant_id = current_setting('app.current_tenant', true)`,
@@ -546,8 +586,9 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	); err != nil {
 		return nil, 0, err
 	}
-	w.rs.AddDelete(resourceType, resourceID)
-	s.extractor.Extract(w.rs, resourceType, resourceID, merged, now)
+	newRS := index.NewRowSet(w.tenant, w.maxRowsPerBundle)
+	s.extractor.Extract(newRS, resourceType, resourceID, merged, now)
+	w.rs.MergeReindex(oldRS, newRS, resourceType, resourceID)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PATCH", mergedRaw, now})
 
 	return merged, newVersion, nil
@@ -633,12 +674,21 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	deleteVersion := versionID + 1
 	now := time.Now().UTC()
 
-	// Buffer the delete-history row and the re-index DELETE, then soft-delete the
-	// resources row immediately. The batched flush clears this resource's sp_*
-	// rows (AddDelete) and writes the history row; there are no fresh index rows
-	// for a delete.
+	// Buffer the delete-history row and the re-index DELETEs, then soft-delete
+	// the resources row immediately. The batched flush clears this resource's
+	// sp_* rows and writes the history row; there are no fresh index rows for a
+	// delete, so the diff (empty new side) scopes the DELETEs to just the tables
+	// the stored version actually has rows in. An unparseable stored body falls
+	// back to clearing every table.
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, deleteVersion, "DELETE", raw, now})
-	w.rs.AddDelete(resourceType, resourceID)
+	var oldBody map[string]any
+	if err := json.Unmarshal(raw, &oldBody); err != nil {
+		w.rs.AddDelete(resourceType, resourceID)
+	} else {
+		oldRS := index.NewRowSet(w.tenant, 0)
+		s.extractor.Extract(oldRS, resourceType, resourceID, oldBody, time.Time{})
+		w.rs.MergeReindex(oldRS, index.NewRowSet(w.tenant, 0), resourceType, resourceID)
+	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE resources SET is_deleted = TRUE, version_id = $1, last_updated = $2
 		 WHERE fhir_id = $3 AND resource_type = $4 AND tenant_id = current_setting('app.current_tenant', true)`,
@@ -822,18 +872,20 @@ func (s *Store) readInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceI
 	return unmarshalWithMeta(raw, versionID, lastUpdated)
 }
 
-func bumpVersion(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) (newVersion, currentVersion int, lastUpdated time.Time, err error) {
+// lockForUpdate locks the resource row and returns its stored body, version and
+// deletion flag. Fetching resource_json here costs nothing extra — the row is
+// already read for the lock — and it feeds the diff-based re-index, which needs
+// the stored version's extracted rows to decide which sp_* tables to touch.
+func lockForUpdate(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) (raw []byte, currentVersion int, isDeleted bool, err error) {
 	if err = tx.QueryRow(ctx, `
-		SELECT version_id FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true) FOR UPDATE`,
+		SELECT resource_json, version_id, is_deleted FROM resources WHERE fhir_id = $1 AND resource_type = $2 AND tenant_id = current_setting('app.current_tenant', true) FOR UPDATE`,
 		resourceID, resourceType,
-	).Scan(&currentVersion); err != nil {
+	).Scan(&raw, &currentVersion, &isDeleted); err != nil {
 		if isNoRows(err) {
 			err = NotFoundError{resourceType, resourceID}
 		}
 		return
 	}
-	newVersion = currentVersion + 1
-	lastUpdated = time.Now().UTC()
 	return
 }
 
