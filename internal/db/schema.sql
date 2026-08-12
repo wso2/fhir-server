@@ -250,7 +250,7 @@ CREATE INDEX IF NOT EXISTS idx_sp_date_source ON sp_date (tenant_id, resource_id
 -- partition just to prove zero matches, paid twice (density probe + fetch). The
 -- GiST range index seeks both bounds at once: same query, 37 buffers / 0.69ms.
 -- buildDateExists emits the predicate as tstzrange(s.value_low, s.value_high,
--- '[]') <@ tstzrange(searchLow, searchHigh, '[]') for eq containment (&& for ap
+-- '[]') <@ tstzrange(searchLow, searchHigh, '[)') for eq containment (&& for ap
 -- overlap); the index expression below must stay byte-for-byte identical to that
 -- stored tstzrange or the planner will not match it. Identical pattern to
 -- idx_sp_qty_range_gist. The leading equality
