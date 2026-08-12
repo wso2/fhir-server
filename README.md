@@ -784,7 +784,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
 | `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#10-terminology). |
-| `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` | `eq` follows R4 containment semantics (the search range must fully contain the stored range); `ne` matches when the search range does not fully contain the stored range; `ap` matches on range overlap. Matching is per indexed value, so a resource with multiple values for one param can match both `eq` and `ne` |
+| `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` | `eq` follows R4 containment semantics (the search range must fully contain the stored range); `ne` matches when the search range does not fully contain the stored range; `ap` matches on range overlap; `sa` matches values that start after the search range and `eb` matches values that end before it. Matching is per indexed value, so a resource with multiple values for one param can match both `eq` and `ne` |
 | `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
 | `reference` | `subject=Patient/abc123` | — | |
 
