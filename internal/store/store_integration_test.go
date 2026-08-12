@@ -1377,6 +1377,145 @@ func TestSearch_DatePeriodStraddle(t *testing.T) {
 	}
 }
 
+// TestSearch_DateEqContainment verifies R4 eq/ne semantics (search.html#prefix):
+// eq matches only when the search range fully contains the stored range, never
+// on mere overlap. With birthDates 2000, 2000-03 and 2000-03-13, a search for
+// the day must return only the day-precision patient — the year- and
+// month-precision bands overlap the day but are not contained in it. ne matches
+// when the search range does not fully contain the stored value. Membership by
+// id keeps the assertions independent of other seeded rows and of the plan the
+// density probe picks.
+func TestSearch_DateEqContainment(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	ids := map[string]string{}
+	for _, bd := range []string{"2000", "2000-03", "2000-03-13"} {
+		pat, err := s.Create(ctx, "Patient", map[string]any{
+			"resourceType": "Patient",
+			"birthDate":    bd,
+		})
+		if err != nil {
+			t.Fatalf("create patient birthDate=%s: %v", bd, err)
+		}
+		ids[bd], _ = pat["id"].(string)
+	}
+
+	matches := func(value, birthDate string) bool {
+		res, err := s.Search(ctx, store.SearchParams{
+			ResourceType: "Patient",
+			Params:       map[string][]string{"birthdate": {value}},
+		})
+		if err != nil {
+			t.Fatalf("search birthdate=%s: %v", value, err)
+		}
+		for _, e := range res.Entries {
+			if eid, _ := e["id"].(string); eid == ids[birthDate] {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		value     string
+		birthDate string
+		want      bool
+	}{
+		// day-precision query contains only the day-precision band
+		{"2000-03-13", "2000", false},
+		{"2000-03-13", "2000-03", false},
+		{"2000-03-13", "2000-03-13", true},
+		// explicit eq is identical to the bare form
+		{"eq2000-03-13", "2000", false},
+		{"eq2000-03-13", "2000-03", false},
+		{"eq2000-03-13", "2000-03-13", true},
+		// month-precision query contains the month and the day, not the year
+		{"2000-03", "2000", false},
+		{"2000-03", "2000-03", true},
+		{"2000-03", "2000-03-13", true},
+		// year-precision query contains all three
+		{"2000", "2000", true},
+		{"2000", "2000-03", true},
+		{"2000", "2000-03-13", true},
+		// ne is the complement of eq's containment
+		{"ne2000-03-13", "2000", true},
+		{"ne2000-03-13", "2000-03", true},
+		{"ne2000-03-13", "2000-03-13", false},
+		{"ne2000", "2000", false},
+		{"ne2000", "2000-03-13", false},
+	} {
+		if got := matches(tc.value, tc.birthDate); got != tc.want {
+			t.Errorf("birthdate=%s vs stored %s: got match=%v, want %v",
+				tc.value, tc.birthDate, got, tc.want)
+		}
+	}
+}
+
+// TestSearch_DateEqPeriodContainment pins eq/ne containment for Period-valued
+// dates. The search band is half-open at the next precision boundary, so a
+// period ending in the day's final fractional second is still contained; a
+// period straddling the band is not; an open-ended period (indexed with a
+// sentinel high) is never contained in a bounded band.
+func TestSearch_DateEqPeriodContainment(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	create := func(period map[string]any) string {
+		enc, err := s.Create(ctx, "Encounter", map[string]any{
+			"resourceType": "Encounter", "status": "finished",
+			"class":  map[string]any{"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+			"period": period,
+		})
+		if err != nil {
+			t.Fatalf("create encounter %v: %v", period, err)
+		}
+		id, _ := enc["id"].(string)
+		return id
+	}
+	fracID := create(map[string]any{"start": "2020-06-15T08:00:00Z", "end": "2020-06-15T23:59:59.900Z"})
+	spanID := create(map[string]any{"start": "2026-07-10T00:00:00Z", "end": "2026-07-12T00:00:00Z"})
+	openID := create(map[string]any{"start": "2026-08-01T00:00:00Z"})
+
+	matches := func(value, id string) bool {
+		res, err := s.Search(ctx, store.SearchParams{
+			ResourceType: "Encounter",
+			Params:       map[string][]string{"date": {value}},
+		})
+		if err != nil {
+			t.Fatalf("search date=%s: %v", value, err)
+		}
+		for _, e := range res.Entries {
+			if eid, _ := e["id"].(string); eid == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		value string
+		id    string
+		want  bool
+	}{
+		// contained within the day, including its final fractional second
+		{"2020-06-15", fracID, true},
+		{"ne2020-06-15", fracID, false},
+		// a day inside the period overlaps but does not contain it
+		{"2026-07-11", spanID, false},
+		{"2026-07", spanID, true},
+		{"ne2026-07-11", spanID, true},
+		// open-ended period: sentinel high is never inside a bounded band
+		{"2026-08-01", openID, false},
+		{"2026", openID, false},
+		{"ne2026-08-01", openID, true},
+	} {
+		if got := matches(tc.value, tc.id); got != tc.want {
+			t.Errorf("date=%s vs %s: got match=%v, want %v", tc.value, tc.id, got, tc.want)
+		}
+	}
+}
+
 func TestSearch_ByReferenceParam(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -1607,15 +1746,28 @@ func TestSearch_ObservationDateChoice(t *testing.T) {
 		t.Fatalf("exact date: got entries %v, want only %v", exact.Entries, dateTimeObservation["id"])
 	}
 
-	period, err := s.Search(ctx, store.SearchParams{
+	// A day inside the period merely overlaps it: eq containment must not match.
+	inside, err := s.Search(ctx, store.SearchParams{
 		ResourceType: "Observation",
 		Params:       map[string][]string{"date": {"2026-07-11"}},
 	})
 	if err != nil {
 		t.Fatalf("Search Observation period date: %v", err)
 	}
+	if inside.Total != 0 {
+		t.Fatalf("day inside period: got entries %v, want none", inside.Entries)
+	}
+
+	// The month band fully contains the period, so eq matches it.
+	period, err := s.Search(ctx, store.SearchParams{
+		ResourceType: "Observation",
+		Params:       map[string][]string{"date": {"2026-07"}},
+	})
+	if err != nil {
+		t.Fatalf("Search Observation period month: %v", err)
+	}
 	if period.Total != 1 || period.Entries[0]["id"] != periodObservation["id"] {
-		t.Fatalf("period date: got entries %v, want only %v", period.Entries, periodObservation["id"])
+		t.Fatalf("period month: got entries %v, want only %v", period.Entries, periodObservation["id"])
 	}
 
 	since, err := s.Search(ctx, store.SearchParams{

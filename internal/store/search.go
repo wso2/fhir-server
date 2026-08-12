@@ -367,12 +367,15 @@ type densityProbe struct {
 	op2       string
 	bound2    any
 	// rangeCtor, when non-empty, names the range constructor (tstzrange) for a
-	// doubly bounded probe that should be emitted as a range-overlap predicate
-	// instead of two scalar bounds, so it seeks the GiST range index rather than
+	// doubly bounded probe that should be emitted as a range predicate instead of
+	// two scalar bounds, so it seeks the GiST range index rather than
 	// skip-scanning a btree on one bound with the other left as a filter. bound
-	// and bound2 are the search band's low and high. Mutually exclusive with the
-	// boundCol/boundCol2 scalar form.
+	// and bound2 are the search band's low and high, and rangeOp is the range
+	// operator the fetch uses ("<@" for eq containment, "&&" for ap overlap) —
+	// the probe must count the same rows the fetch will match. Mutually exclusive
+	// with the boundCol/boundCol2 scalar form.
 	rangeCtor string
+	rangeOp   string
 }
 
 type planVerdict int8
@@ -1589,12 +1592,21 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 		}
 	} else if prefix == "ne" {
 		lowP := b.next(low)
-		highP := b.next(high)
-		cond = fmt.Sprintf("NOT (%s && tstzrange(%s, %s, '[]'))", storedDateRange, lowP, highP)
-	} else { // eq, ap — doubly bounded interval overlap
+		highP := b.next(searchBandEnd(high))
+		// R4 ne: matches when the search range does not fully contain the stored range.
+		cond = fmt.Sprintf("NOT (%s <@ tstzrange(%s, %s, '[)'))", storedDateRange, lowP, highP)
+	} else { // eq, ap — doubly bounded range predicates
+		highX := searchBandEnd(high)
 		lowP := b.next(low)
-		highP := b.next(high)
-		cond = fmt.Sprintf("%s && tstzrange(%s, %s, '[]')", storedDateRange, lowP, highP)
+		highP := b.next(highX)
+		// R4 eq requires the search range to fully contain the stored range
+		// (search.html#prefix); ap matches on range overlap. The stored range sits
+		// on the left so both operators ride the idx_sp_date_range_gist expression.
+		rangeOp := "<@"
+		if prefix == "ap" {
+			rangeOp = "&&"
+		}
+		cond = fmt.Sprintf("%s %s tstzrange(%s, %s, '[)')", storedDateRange, rangeOp, lowP, highP)
 		// eq/ap are doubly bounded, so halfBoundedColOp cannot collapse them to one
 		// column — but a narrow band still needs a verdict. Without one the fetch
 		// falls through to the recency walk, and idx_sp_date_recent carries
@@ -1605,12 +1617,12 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 		// Restricted to narrow bands (see maxOverlapProbeBand): a wide low-precision
 		// band is dense enough that the walk already wins and must be left alone.
 		// rangeCtor makes the probe seek idx_sp_date_range_gist with the same
-		// overlap predicate the fetch uses, so proving a band sparse costs a GiST
+		// range predicate the fetch uses, so proving a band sparse costs a GiST
 		// descent rather than a btree skip-scan over half the partition.
-		if !b.suppressDirectDrive && high.Sub(low) <= maxOverlapProbeBand {
+		if !b.suppressDirectDrive && highX.Sub(low) <= maxOverlapProbeBand {
 			b.probe = &densityProbe{
 				table: "sp_date", rt: b.rt, param: param,
-				rangeCtor: "tstzrange", bound: low, bound2: high,
+				rangeCtor: "tstzrange", rangeOp: rangeOp, bound: low, bound2: highX,
 			}
 		}
 	}
@@ -2057,9 +2069,10 @@ func (b *queryBuilder) decidePlan(ctx context.Context, pool querier) error {
 	var pred string
 	args := []any{p.rt, p.param, p.bound}
 	if p.rangeCtor != "" {
-		// Range-overlap probe: byte-for-byte the fetch's predicate, so both ride
-		// the same GiST expression index (see storedDateRange / schema.sql).
-		pred = fmt.Sprintf("%s(s.value_low, s.value_high, '[]') && %s($3, $4, '[]')", p.rangeCtor, p.rangeCtor)
+		// Range probe: byte-for-byte the fetch's predicate (containment for eq,
+		// overlap for ap, half-open search band), so both ride the same GiST
+		// expression index (see storedDateRange / schema.sql).
+		pred = fmt.Sprintf("%s(s.value_low, s.value_high, '[]') %s %s($3, $4, '[)')", p.rangeCtor, p.rangeOp, p.rangeCtor)
 		args = append(args, p.bound2)
 	} else {
 		pred = fmt.Sprintf("s.%s %s $3", p.boundCol, p.op)
@@ -2614,6 +2627,19 @@ func extractComparatorPrefix(s string) (prefix, rest string) {
 // leaving the inclusive (ge/le) and doubly bounded (eq/ne) forms unaffected —
 // their boundaries carry a full 2·eps gap that rounding cannot flip.
 func quantizeBand(x float64) float64 { return math.Round(x*1e6) / 1e6 }
+
+// searchBandEnd converts the inclusive, second-truncated band high from
+// expandDateRange into the exclusive end of a half-open search band [low, end):
+// the next precision boundary for whole-second highs, so a stored value in the
+// band's final fractional second (e.g. 23:59:59.9 on a day query) stays inside
+// the band; a fractional-second instant advances one microsecond (timestamptz
+// resolution) so the point itself stays covered without widening the band.
+func searchBandEnd(high time.Time) time.Time {
+	if high.Nanosecond() == 0 {
+		return high.Add(time.Second)
+	}
+	return high.Add(time.Microsecond)
+}
 
 func expandDateRange(s string) (low, high time.Time) {
 	low, high, _ = expandDateStringForSearch(s)
