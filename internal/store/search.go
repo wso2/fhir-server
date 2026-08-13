@@ -1584,7 +1584,17 @@ func (b *queryBuilder) buildDateExists(param, value string) string {
 	if col, op, useHigh, ok := halfBoundedColOp(prefix); ok {
 		bound := low
 		if useHigh {
-			bound = high
+			// High-side comparators run against the half-open band end used by
+			// eq/ne/ap, so the same stored value cannot be both inside the band and
+			// above it: inclusive ops against the old inclusive high become strict
+			// against the exclusive end, and vice versa (gt/sa > -> >=, le <= -> <).
+			bound = searchBandEnd(high)
+			switch op {
+			case ">":
+				op = ">="
+			case "<=":
+				op = "<"
+			}
 		}
 		cond = fmt.Sprintf("s.%s %s %s", col, op, b.next(bound))
 		if !b.suppressDirectDrive {
@@ -2634,6 +2644,10 @@ func quantizeBand(x float64) float64 { return math.Round(x*1e6) / 1e6 }
 // band's final fractional second (e.g. 23:59:59.9 on a day query) stays inside
 // the band; a fractional-second instant advances one microsecond (timestamptz
 // resolution) so the point itself stays covered without widening the band.
+// Treating fractional-second search values as points rather than expanding
+// their stated precision (a .500 millisecond value does not get a [.500, .501)
+// band) is a deliberate simplification, symmetric with the write side, which
+// also indexes instants as points.
 func searchBandEnd(high time.Time) time.Time {
 	if high.Nanosecond() == 0 {
 		return high.Add(time.Second)

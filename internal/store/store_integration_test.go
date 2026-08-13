@@ -1501,6 +1501,13 @@ func TestSearch_DateEqPeriodContainment(t *testing.T) {
 		// contained within the day, including its final fractional second
 		{"2020-06-15", fracID, true},
 		{"ne2020-06-15", fracID, false},
+		// half-bounded comparators agree with the band: inside the day is
+		// below its exclusive end, not above it, and after the prior day
+		{"le2020-06-15", fracID, true},
+		{"gt2020-06-15", fracID, false},
+		{"sa2020-06-14", fracID, true},
+		// ap keeps overlap: a day inside the period matches ap but not eq
+		{"ap2026-07-11", spanID, true},
 		// a day inside the period overlaps but does not contain it
 		{"2026-07-11", spanID, false},
 		{"2026-07", spanID, true},
