@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS resource_history (
     fhir_id       VARCHAR(64)  NOT NULL,
     resource_type VARCHAR(100) NOT NULL,
     version_id    INT          NOT NULL,
-    operation     VARCHAR(10)  NOT NULL,   -- CREATE | UPDATE | DELETE
+    operation     VARCHAR(10)  NOT NULL,   -- POST (create) | PUT (update) | DELETE
     recorded_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     resource_json TEXT COMPRESSION lz4,    -- opaque snapshot; see resources.resource_json
     UNIQUE (tenant_id, fhir_id, resource_type, version_id)
