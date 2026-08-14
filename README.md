@@ -70,7 +70,14 @@ docker compose down -v
 
 ## 2. Building
 
-**Prerequisites:** Go 1.25+
+**Prerequisites:** Go 1.25+ (building from source only)
+
+> **Don't want to build?** Every [GitHub release](https://github.com/wso2/fhir-server/releases)
+> ships prebuilt `fhir-server` binaries for Linux and macOS (amd64 and arm64) as
+> `.tar.gz` archives with a `SHA256SUMS` file, and publishes a multi-arch
+> container image to `ghcr.io/wso2/fhir-server` (tagged `v<version>` and
+> `latest`). Download and unpack one, then continue with
+> [Running Locally](#3-running-locally).
 
 ### Binary
 
@@ -94,9 +101,9 @@ docker build -t fhir-server:latest .
 
 ## 3. Running Locally
 
-Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)); the steps below invoke `./fhir-server`.
+Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)) or download a prebuilt one from the [releases page](https://github.com/wso2/fhir-server/releases); the steps below invoke `./fhir-server`.
 
-**Prerequisites:** PostgreSQL 14+ running locally, and a built `fhir-server` binary
+**Prerequisites:** PostgreSQL 14+ running locally, and a `fhir-server` binary (built or downloaded from a release)
 
 ### Create the database and role
 
