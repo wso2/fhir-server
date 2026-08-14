@@ -1,6 +1,6 @@
 # FHIR Server — Developer Guide
 
-A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy architecture of 150+ per-resource tables with a compact normalized schema (19 tables), reducing write amplification and enabling cross-resource search without schema changes.
+A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy architecture of 150+ per-resource tables with a compact normalized schema (19 tables), so new resource types and Implementation Guides require no schema changes and search works uniformly across resource types.
 
 **FHIR version:** R4 (4.0.1)  
 **Language:** Go 1.25  
