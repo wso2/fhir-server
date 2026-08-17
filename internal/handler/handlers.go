@@ -1443,26 +1443,29 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 	writeFHIR(w, r, http.StatusOK, cs)
 }
 
-// validateRequiredFields returns a non-empty error message if key required
-// FHIR R4 fields are missing from the resource body. Coverage is intentionally
-// limited to a small set of commonly-created resources whose required fields
-// are simple 1..1 top-level elements; unknown types and more complex
-// cardinality rules are left to the base StructureDefinition validator.
+// requiredFieldsByType lists, per resource type, the FHIR R4 fields with 1..1
+// cardinality that the handler checks on create/update. The set is intentionally
+// small: it covers only resources whose required fields are simple top-level
+// elements; unknown types and more complex cardinality rules are left to the
+// base StructureDefinition validator.
+var requiredFieldsByType = map[string][]string{
+	"Observation":        {"code"},
+	"Encounter":          {"status", "class"},
+	"Condition":          {"subject"},
+	"DiagnosticReport":   {"status", "code"},
+	"AllergyIntolerance": {"patient"},
+}
+
+// validateRequiredFields returns a non-empty error message if a key required
+// FHIR R4 field is missing or empty in the resource body.
 func validateRequiredFields(rt string, body map[string]any) string {
-	required := map[string][]string{
-		"Observation":        {"code"},
-		"Encounter":          {"status", "class"},
-		"Condition":          {"subject"},
-		"DiagnosticReport":   {"status", "code"},
-		"AllergyIntolerance": {"patient"},
-	}
-	fields, ok := required[rt]
+	fields, ok := requiredFieldsByType[rt]
 	if !ok {
 		return ""
 	}
 	for _, f := range fields {
 		if v, exists := body[f]; !exists || !isPresent(v) {
-			return fmt.Sprintf("missing required field %q for %s", f, rt)
+			return fmt.Sprintf("missing or empty required field %q for %s", f, rt)
 		}
 	}
 	return ""

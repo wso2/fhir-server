@@ -287,6 +287,11 @@ func TestCreate_RequiredFields_Condition_MissingSubject(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("want 422, got %d", w.Code)
 	}
+	body := decodeJSON(t, w)
+	issue := body["issue"].([]any)[0].(map[string]any)
+	if got := issue["diagnostics"]; got != `missing or empty required field "subject" for Condition` {
+		t.Errorf("unexpected diagnostics: %v", got)
+	}
 }
 
 func TestCreate_RequiredFields_Condition_NullSubject(t *testing.T) {
@@ -306,6 +311,19 @@ func TestCreate_RequiredFields_DiagnosticReport_MissingStatus(t *testing.T) {
 	h := newRouter(&mockStore{})
 	payload := map[string]any{
 		"resourceType": "DiagnosticReport",
+		"code":         map[string]any{"text": "blood panel"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_EmptyStatus(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"status":       "",
 		"code":         map[string]any{"text": "blood panel"},
 	}
 	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)

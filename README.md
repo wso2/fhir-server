@@ -762,7 +762,7 @@ curl -X POST http://localhost:9090/fhir/r4/Patient/\$validate \
 curl -X POST http://localhost:9090/fhir/r4/Observation/\$validate \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Observation","status":"final"}'
-# → 422: missing required field "code" for Observation
+# → 422: missing or empty required field "code" for Observation
 ```
 
 #### Capability Statement
@@ -781,7 +781,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 |---|---|---|
 | Content-Type must be `application/fhir+json` or `application/json` | 415 | Wrong or unsupported `Content-Type` header |
 | `resourceType` in body must match URL resource type | 422 | e.g. sending `{"resourceType":"Observation"}` to `/Patient` |
-| Required fields present | 422 | Observation requires `code`; Encounter requires `status` and `class` |
+| Required fields present | 422 | Observation requires `code`; Encounter requires `status` and `class`; Condition requires `subject`; DiagnosticReport requires `status` and `code`; AllergyIntolerance requires `patient`. A present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing |
 | Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
 
@@ -973,13 +973,16 @@ go test -tags integration ./...
 
 ### Adding a required-field validation rule
 
-Edit `validateRequiredFields` in `internal/handler/handlers.go`. Add the resource type and its required fields to the map:
+Edit `requiredFieldsByType` in `internal/handler/handlers.go`. Add the resource type and its required fields to the map:
 
 ```go
-required := map[string][]string{
-    "Observation": {"code"},
-    "Encounter":   {"status", "class"},
-    "YourType":    {"fieldOne", "fieldTwo"},   // ← add here
+var requiredFieldsByType = map[string][]string{
+    "Observation":        {"code"},
+    "Encounter":          {"status", "class"},
+    "Condition":          {"subject"},
+    "DiagnosticReport":   {"status", "code"},
+    "AllergyIntolerance": {"patient"},
+    "YourType":           {"fieldOne", "fieldTwo"},   // ← add here
 }
 ```
 
