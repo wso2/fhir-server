@@ -307,6 +307,32 @@ func TestCreate_RequiredFields_Condition_NullSubject(t *testing.T) {
 	}
 }
 
+func TestCreate_RequiredFields_Condition_EmptySubjectObject(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      map[string]any{},
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_AllergyIntolerance_EmptyPatientArray(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "AllergyIntolerance",
+		"patient":      []any{},
+		"code":         map[string]any{"text": "peanuts"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/AllergyIntolerance", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
 func TestCreate_RequiredFields_DiagnosticReport_MissingStatus(t *testing.T) {
 	h := newRouter(&mockStore{})
 	payload := map[string]any{

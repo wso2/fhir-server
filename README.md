@@ -750,7 +750,7 @@ curl "http://localhost:9090/fhir/r4/Patient/550e8400-e29b-41d4-a716-446655440000
 
 #### $validate
 
-Validates a resource body against required-field rules without persisting it:
+Validates a resource body against the base FHIR R4 structure (and any profiles) without persisting it:
 
 ```bash
 # Valid resource → 200 OperationOutcome (severity: information)
@@ -758,11 +758,10 @@ curl -X POST http://localhost:9090/fhir/r4/Patient/\$validate \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Patient","name":[{"family":"Test"}]}'
 
-# Invalid resource → 422 OperationOutcome
+# Invalid resource → 422 OperationOutcome (base validation reports the missing element)
 curl -X POST http://localhost:9090/fhir/r4/Observation/\$validate \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Observation","status":"final"}'
-# → 422: missing or empty required field "code" for Observation
 ```
 
 #### Capability Statement
@@ -781,7 +780,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 |---|---|---|
 | Content-Type must be `application/fhir+json` or `application/json` | 415 | Wrong or unsupported `Content-Type` header |
 | `resourceType` in body must match URL resource type | 422 | e.g. sending `{"resourceType":"Observation"}` to `/Patient` |
-| Required fields present | 422 | Observation requires `code`; Encounter requires `status` and `class`; Condition requires `subject`; DiagnosticReport requires `status` and `code`; AllergyIntolerance requires `patient`. A present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing |
+| Required fields present (create/update) | 422 | Observation requires `code`; Encounter requires `status` and `class`; Condition requires `subject`; DiagnosticReport requires `status` and `code`; AllergyIntolerance requires `patient`. A present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing |
 | Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
 
