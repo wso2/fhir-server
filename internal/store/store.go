@@ -430,6 +430,45 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 	return result, nil
 }
 
+// UpdateOrCreate replaces a resource, creating it at the given id when no
+// resource exists there (FHIR "update as create"). The created return reports
+// which of the two happened, so the handler can answer 201 instead of 200.
+// A version precondition (ifMatchVersion >= 0) never creates: If-Match asserts
+// the client has seen a specific version, so a missing target stays a
+// NotFoundError exactly as in Update.
+func (s *Store) UpdateOrCreate(ctx context.Context, resourceType, resourceID string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, false, err
+	}
+
+	w := s.newBundleWriter(ctx)
+	created := false
+	result, err := s.updateInTx(ctx, tx, resourceType, resourceID, body, ifMatchVersion, w)
+	if _, missing := err.(NotFoundError); missing && ifMatchVersion < 0 {
+		created = true
+		result, err = s.createInTx(ctx, tx, resourceType, body, w, false)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if err := w.flush(ctx, tx); err != nil {
+		return nil, false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+
+	slog.Debug("upserted resource", "type", resourceType, "id", resourceID, "created", created, "version", metaVersionID(result))
+	return result, created, nil
+}
+
 // updateInTx performs an update within an existing transaction. Shared by the
 // public Update and by transaction/batch Bundle processing.
 func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourceID string, body map[string]any, ifMatchVersion int, w *bundleWriter) (map[string]any, error) {

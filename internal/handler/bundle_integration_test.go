@@ -141,6 +141,43 @@ func TestIntegration_Transaction_RollsBackOnError(t *testing.T) {
 	}
 }
 
+// ─── Transaction: update-as-create ─────────────────────────────────────────────
+
+func TestIntegration_Transaction_PutCreatesMissingResource(t *testing.T) {
+	srv := newRealServer(t)
+
+	bundle := map[string]any{
+		"resourceType": "Bundle",
+		"type":         "transaction",
+		"entry": []any{
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Patient", "active": true},
+				"request":  map[string]any{"method": "PUT", "url": "Patient/upsert-in-txn"},
+			},
+		},
+	}
+
+	resp := iDo(t, srv, http.MethodPost, "/fhir/r4", bundle)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transaction: want 200, got %d", resp.StatusCode)
+	}
+	body := iJSON(t, resp)
+	entries, _ := body["entry"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 response entry, got %d", len(entries))
+	}
+	entryResp, _ := entries[0].(map[string]any)["response"].(map[string]any)
+	if status, _ := entryResp["status"].(string); status != "201 Created" {
+		t.Errorf("want entry status 201 Created, got %q", status)
+	}
+
+	rd := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient/upsert-in-txn", nil)
+	if rd.StatusCode != http.StatusOK {
+		t.Fatalf("read after PUT-create in transaction: want 200, got %d", rd.StatusCode)
+	}
+	rd.Body.Close()
+}
+
 // ─── Batch: independent entries ────────────────────────────────────────────────
 
 func TestIntegration_Batch_IndependentEntries(t *testing.T) {

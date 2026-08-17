@@ -515,7 +515,7 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 | `GET` | `/{type}/{id}` | 200, 404, 410 | Read resource (410 if soft-deleted) |
 | `GET` | `/{type}/{id}/_history/{vid}` | 200, 400, 404 | Read specific version |
 | `POST` | `/{type}` | 201 | Create resource |
-| `PUT` | `/{type}/{id}` | 200, 400, 404, 412, 422 | Update resource |
+| `PUT` | `/{type}/{id}` | 200, 201, 400, 404, 412, 422 | Update resource (creates at the given id when missing — update-as-create; 404 only with `If-Match`) |
 | `PATCH` | `/{type}/{id}` | 200, 400, 404 | JSON Merge Patch (RFC 7396) |
 | `DELETE` | `/{type}/{id}` | 204, 404 | Soft delete |
 | `GET` | `/{type}` | 200 | Search |
@@ -532,12 +532,12 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 | Header | Set on | Value |
 |---|---|---|
 | `ETag` | Read, Create, Update, Patch | `W/"<version_id>"` e.g. `W/"3"` |
-| `Location` | Create | `{baseURL}/{type}/{id}/_history/1` |
+| `Location` | Create, Update-as-create | `{baseURL}/{type}/{id}/_history/1` |
 | `Content-Type` | All responses | `application/fhir+json` |
 
 ### If-Match (optimistic locking)
 
-Send `If-Match: W/"<version>"` on `PUT` to enforce that you're updating the version you last read. Returns **412** if the current version differs.
+Send `If-Match: W/"<version>"` on `PUT` to enforce that you're updating the version you last read. Returns **412** if the current version differs, and **404** if the resource does not exist (a version precondition never triggers update-as-create).
 
 ```bash
 # Read current version

@@ -87,7 +87,7 @@ type bundleOp struct {
 	ifMatch      int        // parsed If-Match version, or -1 for none
 	query        url.Values // GET search / conditional delete filter
 	isSearch     bool       // GET against a type (search) vs GET of an instance (read)
-	allowCreate  bool       // PUT may create when the target is missing (conditional update, 0 matches)
+	allowCreate  bool       // conditional update matched 0 resources — PUT creates at the assigned id
 
 	// conditional-create / -update that matched an existing resource: no write
 	// is performed and the entry resolves to the matched resource.
@@ -253,10 +253,12 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp, w *bundle
 	case "PUT":
 		res, err := s.updateInTx(ctx, tx, op.resourceType, op.id, op.body, op.ifMatch, w)
 		if err != nil {
-			// A conditional update that matched zero resources creates the target;
-			// a plain PUT to a missing id is a 404 (the server does not do
-			// update-as-create), which in a transaction rolls everything back.
-			if _, ok := err.(NotFoundError); ok && op.allowCreate {
+			// A missing target creates the resource at the requested id (FHIR
+			// "update as create"): a conditional update that matched zero
+			// resources (allowCreate), or a plain PUT to a new id. A PUT with an
+			// If-Match precondition never creates — the version check against a
+			// missing resource stays a 404, which rolls the transaction back.
+			if _, ok := err.(NotFoundError); ok && (op.allowCreate || op.ifMatch < 0) {
 				op.body["id"] = op.id
 				// Write this created row immediately (deferResource=false): the
 				// conditional target id may be referenced by a later entry.
