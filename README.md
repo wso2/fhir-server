@@ -1,6 +1,6 @@
 # FHIR Server — Developer Guide
 
-A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy architecture of 150+ per-resource tables with a normalized 11-table schema, reducing write amplification and enabling cross-resource search without schema changes.
+A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy architecture of 150+ per-resource tables with a compact normalized schema (19 tables), so new resource types and Implementation Guides require no schema changes and search works uniformly across resource types.
 
 **FHIR version:** R4 (4.0.1)  
 **Language:** Go 1.25  
@@ -33,7 +33,7 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 
 ```bash
 # 1. Start PostgreSQL + server
-docker-compose up
+docker compose up
 
 # 2. Wait for the server to report healthy (watch the container logs or poll):
 curl -sv http://localhost:9090/health/ready   # → look for "< HTTP/1.1 200 OK" when ready (body is empty)
@@ -63,14 +63,21 @@ a lightweight web UI, at **`http://localhost:8080`**. Log in with:
 
 To stop and remove all data:
 ```bash
-docker-compose down -v
+docker compose down -v
 ```
 
 ---
 
 ## 2. Building
 
-**Prerequisites:** Go 1.25+
+**Prerequisites:** Go 1.25+ (building from source only)
+
+> **Don't want to build?** Every [GitHub release](https://github.com/wso2/fhir-server/releases)
+> ships prebuilt `fhir-server` binaries for Linux and macOS (amd64 and arm64) as
+> `.tar.gz` archives with a `SHA256SUMS` file, and publishes a multi-arch
+> container image to `ghcr.io/wso2/fhir-server` (tagged `v<version>` and
+> `latest`). Download and unpack one, then continue with
+> [Running Locally](#3-running-locally).
 
 ### Binary
 
@@ -94,9 +101,9 @@ docker build -t fhir-server:latest .
 
 ## 3. Running Locally
 
-Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)); the steps below invoke `./fhir-server`.
+Run the server directly against a local PostgreSQL — handy for development without the [Docker Compose](#1-quick-start-docker-compose) stack. Build the binary first (see [Building](#2-building)) or download a prebuilt one from the [releases page](https://github.com/wso2/fhir-server/releases); the steps below invoke `./fhir-server`.
 
-**Prerequisites:** PostgreSQL 14+ running locally, and a built `fhir-server` binary
+**Prerequisites:** PostgreSQL 14+ running locally, and a `fhir-server` binary (built or downloaded from a release)
 
 ### Create the database and role
 
@@ -140,7 +147,7 @@ tables, then serves):
 FHIR_CREATE_TABLES=true ./fhir-server      # creates tables, then serves
 ```
 
-(The `docker-compose` setup sets this for you.)
+(The Docker Compose setup sets this for you.)
 
 ### Run the server
 
@@ -168,6 +175,12 @@ export BASE_URL=http://localhost:9090/fhir/r4
 export DB_PASSWORD="$(cat ~/.fhir-db-password)"
 ./fhir-server --config ./config.yaml
 ```
+
+> ⚠️ `DB_PASSWORD` (and the other `DB_*` component variables) are only consulted
+> when no full DSN is configured. `config.example.yaml` ships with `database.url`
+> set — comment it out (and use the `database.host`/`user`/`name` components
+> instead) or the exported password is silently ignored. Only `DATABASE_URL`
+> overrides a `database.url` from the file.
 
 The server logs a JSON line to stdout when listening:
 
@@ -206,6 +219,8 @@ FHIR_SERVER_CONFIG=/etc/fhir-server/config.yaml fhir-server
 ```
 
 If the path is set but the file is missing, malformed, or contains an unknown key, the server fails to start with a clear error.
+
+The only other CLI flags are `--version` / `-v`, which print version information and exit.
 
 ### File format
 
@@ -273,8 +288,8 @@ ig:
 > is the signature. Set it above your slowest bundle *and* above the client's own
 > timeout, so the client decides when to give up.
 
-> **Performance tunables.** The search (`search.*`, `database.planCacheMode`),
-> write (`write.*`) and bundle (`bundle.*`) parameters are documented with their
+> **Performance tunables.** The search (`search.*`, `database.planCacheMode`)
+> and write (`write.*`) parameters are documented with their
 > ranges and sizing rules in the
 > **[search-layer tuning reference](docs/performance-tuning.md)**. For the hardware
 > and PostgreSQL settings underneath them, see
@@ -289,15 +304,26 @@ ig:
 ```
 cmd/server/main.go           Entry point: wires all packages, starts HTTP
 │
-├── internal/config          Reads env vars, validates, provides typed Config struct
+├── internal/config          Reads YAML config file + env vars, validates, provides typed Config struct
 ├── internal/db              Opens pgxpool, creates schema tables on opt-in (idempotent)
-├── internal/seed            Inserts 100+ base FHIR R4 search param definitions (idempotent)
+├── internal/seed            Inserts ~1,700 base FHIR R4 search param definitions (idempotent)
+├── internal/basedef         Embedded base FHIR R4 StructureDefinitions; loads base_definitions
 ├── internal/searchparam     Thread-safe registry: resource type + param name → FHIRPath + type
 ├── internal/fhirpath        FHIRPath evaluator (path chains, where(), ofType(), arrays)
+├── internal/fhirxml         FHIR XML serialization (application/fhir+xml)
+├── internal/fhirttl         FHIR Turtle/RDF serialization (application/fhir+turtle)
 ├── internal/index           Extracts SP values from resource JSON and writes to sp_* tables
-├── internal/store           CRUD + Search + History against the normalized schema
+├── internal/store           CRUD + Search + History + Bundles against the normalized schema
+├── internal/patch           JSON Patch (RFC 6902) and XML Patch engines
+├── internal/compartment     Compartment definitions (compartment search, $everything)
+├── internal/tenant          Tenant id validation + request-context plumbing (multi-tenancy)
+├── internal/terminology     Client for an external terminology server ($expand, cached)
+├── internal/validate        StructureDefinition validation (base + profile)
 ├── internal/ig              Downloads IG .tgz packages and registers their SearchParameters
-├── internal/handler         chi router, HTTP handlers, OperationOutcome serialization
+├── internal/handler         chi router, HTTP handlers, content negotiation, OperationOutcome
+├── internal/obs             Observability: Prometheus /metrics + request middleware
+├── internal/version         Build version info (--version, stamped via -ldflags)
+├── internal/conformance     FHIR conformance test suite (build tag: conformance)
 └── internal/testutil        Integration test helpers (testcontainers-go, build tag: integration)
 ```
 
@@ -309,7 +335,7 @@ HTTP Request
      ▼
 handler (chi router)
      │  validates: Content-Type, body resourceType, required fields, If-Match
-     │  (Content-Type not validated on PATCH)
+     │  (on PATCH, Content-Type selects the patch format instead)
      ▼
 store.Create / Read / Update / Patch / Delete / Search
      │
@@ -355,18 +381,20 @@ store.Search
 ### Startup sequence
 
 ```
-1. Load config from env
-2. Connect to PostgreSQL (pgxpool)
-3. Create schema tables if FHIR_CREATE_TABLES=true (idempotent CREATE TABLE IF NOT EXISTS); otherwise skip
-4. Seed base FHIR R4 search params (ON CONFLICT DO NOTHING)
-5. Load search param registry from DB
-6. Create store + HTTP router
-7. Start HTTP listener  ← liveness probe passes here
-8. Load IG packages in background (goroutine per package)
-9. Set igReady=1           ← readiness probe passes here
+ 1. Load config (YAML file and/or env vars)
+ 2. Connect to PostgreSQL (pgxpool)
+ 3. Create schema tables if FHIR_CREATE_TABLES=true (idempotent CREATE TABLE IF NOT EXISTS); otherwise skip
+ 4. Seed base FHIR R4 search params (ON CONFLICT DO NOTHING)
+ 5. Load base FHIR R4 StructureDefinitions into base_definitions (skipped when
+    FHIR_BASE_VALIDATION=false; a load failure is fatal when base validation is on)
+ 6. Load search param registry from DB
+ 7. Create store + HTTP router
+ 8. Start HTTP listener  ← liveness probe passes here
+ 9. Load IG packages in background (goroutine per package)
+10. Set igReady=1           ← readiness probe passes here
 ```
 
-If `IG_PACKAGES` is empty, steps 8–9 are skipped and the server is ready immediately.
+If `IG_PACKAGES` is empty, steps 9–10 are skipped and the server is ready immediately.
 
 ---
 
@@ -427,7 +455,7 @@ The `resources`, `resource_history`, and `sp_*` indexes lead with `tenant_id`, s
 
 ## 7. Database Schema
 
-The schema is embedded in the binary (`internal/db/schema.sql`, schema version 7). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#6-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Locally](#3-running-locally)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
+The schema is embedded in the binary (`internal/db/schema.sql`; the version it creates is recorded in the `schema_version` table). It describes the database from scratch — every PHI table carries a `tenant_id` column and tenant-leading primary/foreign keys, and Row-Level Security is declared on each (see [Multi-Tenancy](#6-multi-tenancy)). It is applied at startup by `db.CreateTables()` **only when `FHIR_CREATE_TABLES=true`** (off by default — see [Running Locally](#3-running-locally)). This is table creation, not a migration system: statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a fresh database can be (re)initialised safely but it can only add tables/columns — it cannot perform destructive or altering changes. Upgrading a pre-existing database to a new schema version is handled by a separate migration step.
 
 ### Core tables
 
@@ -441,7 +469,7 @@ The schema is embedded in the binary (`internal/db/schema.sql`, schema version 7
 | `version_id` | `INT` | Monotonically increasing per resource |
 | `last_updated` | `TIMESTAMPTZ` | Timestamp of last write |
 | `is_deleted` | `BOOLEAN` | Soft-delete flag; deleted resources return HTTP 410 |
-| `resource_json` | `JSONB` | Full resource body |
+| `resource_json` | `TEXT` (lz4-compressed) | Full resource body. Deliberately **not** `JSONB`: the document is always read and written whole, so `TEXT` avoids JSONB's parse-and-normalize cost on every write and preserves the exact marshalled bytes |
 | `search_text` | `TSVECTOR` | Reserved for `_text`/`_content` full-text search — column exists but is not currently populated by the server |
 
 Primary key: `(tenant_id, resource_type, fhir_id)`.
@@ -458,7 +486,7 @@ Every create, update, and delete appends a row here. VRead (`GET /{type}/{id}/_h
 | `version_id` | `INT` | |
 | `operation` | `VARCHAR(10)` | `POST` (create), `PUT` (update), or `DELETE` |
 | `recorded_at` | `TIMESTAMPTZ` | |
-| `resource_json` | `JSONB` | Full snapshot at this version |
+| `resource_json` | `TEXT` (lz4-compressed) | Full snapshot at this version |
 
 Unique key: `(tenant_id, fhir_id, resource_type, version_id)`.
 
@@ -473,6 +501,7 @@ One table per FHIR search parameter type. Rows are deleted and re-inserted on ev
 | `sp_date` | `date` | `value_low`, `value_high`, `value_precision` (YEAR/MONTH/DAY/SECOND) |
 | `sp_number` | `number` | `value`, `value_low`, `value_high` (implicit-precision range) |
 | `sp_quantity` | `quantity` | `value`, `system`, `code`, `canonical_value`, `canonical_units` |
+| `sp_composite_token_quantity` | `composite` (token + quantity) | component `system`/`code` + quantity `value`/`value_low`/`value_high` from the **same element** (e.g. `Observation?code-value-quantity=…$…`); written alongside the component `sp_token`/`sp_quantity` rows |
 | `sp_uri` | `uri` | `value` (prefix index for `:below`) |
 | `sp_reference` | `reference` | `target_type`, `target_id` + identifier columns for `:identifier` modifier |
 | `sp_coords` | `special` | `latitude`, `longitude` (Location.near) |
@@ -498,12 +527,20 @@ Track which IG packages have been loaded (for skip-on-restart) and which profile
 
 Holds the core FHIR R4 resource StructureDefinitions (one row per resource type), shipped embedded in the binary and loaded at startup by `internal/basedef`. They drive base validation (see [Validation rules](#validation-rules)). Like `ig_profiles` this is reference data, not PHI, so it carries no `tenant_id` and is excluded from Row-Level Security.
 
+#### Other tables
+
+- `schema_version` — records the schema revision `schema.sql` creates.
+- `"ClosureContextTable"` / `"ClosureConceptTable"` / `"ClosureDeltaTable"` —
+  storage for terminology closure contexts (transitive subsumption pairs). The
+  `$closure` HTTP operation itself is not currently exposed; the tables are
+  declared so the schema is ready for it.
+
 ---
 
 ## 8. API Reference
 
 **Base path:** `/fhir/r4`  
-**Content-Type:** All request and response bodies use `application/fhir+json`.  
+**Content types:** JSON (`application/fhir+json`, the default), XML (`application/fhir+xml`), and Turtle (`application/fhir+turtle`) are supported for request **and** response bodies. The response format is negotiated from the `Accept` header, or forced with the `_format` query parameter (which wins over `Accept`). Examples below use JSON.  
 **Errors:** All error responses return an `OperationOutcome` resource.
 
 ### Endpoint table
@@ -514,18 +551,30 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 | `POST` | `/` (FHIR base) | 200, 400, 4xx, 500 | Process a `transaction` / `batch` Bundle |
 | `GET` | `/{type}/{id}` | 200, 404, 410 | Read resource (410 if soft-deleted) |
 | `GET` | `/{type}/{id}/_history/{vid}` | 200, 400, 404 | Read specific version |
-| `POST` | `/{type}` | 201 | Create resource |
+| `POST` | `/{type}` | 201, 400, 415, 422 | Create resource |
 | `PUT` | `/{type}/{id}` | 200, 400, 404, 412, 422 | Update resource |
-| `PATCH` | `/{type}/{id}` | 200, 400, 404 | JSON Merge Patch (RFC 7396) |
+| `PUT` | `/{type}?{search}` | 200, 201, 412 | Conditional update (create on zero matches; 412 on multiple) |
+| `PATCH` | `/{type}/{id}` | 200, 400, 404 | Patch — JSON Merge Patch, JSON Patch, XML Patch, or FHIR Patch, selected by `Content-Type` (see [Partial Update](#partial-update-patch)) |
 | `DELETE` | `/{type}/{id}` | 204, 404 | Soft delete |
+| `DELETE` | `/{type}?{search}` | 204, 412 | Conditional delete (no-op on zero matches; 412 on multiple) |
 | `GET` | `/{type}` | 200 | Search |
 | `POST` | `/{type}/_search` | 200 | Search (form-encoded body) |
 | `GET` | `/{type}/{id}/_history` | 200 | Instance history |
 | `GET` | `/{type}/_history` | 200 | Type-level history |
-| `GET` | `/{type}/{id}/$everything` | 200, 404 | Patient/resource graph |
-| `POST` | `/{type}/$validate` | 200, 415, 422 | Validate without persisting |
-| `GET` | `/health/live` | 200 | Liveness probe |
-| `GET` | `/health/ready` | 200, 503 | Readiness probe (503 while IGs loading) |
+| `GET` | `/_history` | 200 | System-level history (all types) |
+| `GET` | `/{type}/{id}/{compartmentType}` | 200, 404 | Compartment search (e.g. `/Patient/{id}/Observation`) |
+| `GET` | `/{type}/{id}/$everything` | 200, 404 | Patient/resource graph (instance) |
+| `GET` | `/{type}/$everything` | 200, 404 | Type-level `$everything` — unions the graphs of every instance (Patient, Encounter, and Group only) |
+| `GET` | `/Observation/$lastn` | 200, 400 | Most recent N observations per code |
+| `GET` | `/Composition/{id}/$document` | 200, 404 | Assemble a document Bundle from a Composition |
+| `POST` | `/$validate`, `/{type}/$validate`, `/{type}/{id}/$validate` | 200, 415, 422 | Validate without persisting (system / type / instance level) |
+| `POST` | `/$convert` | 200, 400, 415 | Convert a resource between JSON, XML, and Turtle |
+| `GET` | `/$meta`, `/{type}/$meta`, `/{type}/{id}/$meta` | 200 | Retrieve meta (system / type / instance level) |
+| `POST` | `/{type}/{id}/$meta-add` | 200, 400, 404 | Add profiles/tags/security labels to meta |
+| `POST` | `/{type}/{id}/$meta-delete` | 200, 400, 404 | Remove profiles/tags/security labels from meta |
+| `GET` | `/health/live` | 200 | Liveness probe (outside the FHIR base path) |
+| `GET` | `/health/ready` | 200, 503 | Readiness probe (503 while IGs loading; outside the FHIR base path) |
+| `GET` | `/metrics` | 200 | Prometheus metrics (outside the FHIR base path) |
 
 ### Response headers
 
@@ -533,7 +582,7 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 |---|---|---|
 | `ETag` | Read, Create, Update, Patch | `W/"<version_id>"` e.g. `W/"3"` |
 | `Location` | Create | `{baseURL}/{type}/{id}/_history/1` |
-| `Content-Type` | All responses | `application/fhir+json` |
+| `Content-Type` | All responses | `application/fhir+json` by default; `application/fhir+xml` / `application/fhir+turtle` when negotiated via `Accept` or `_format` |
 
 ### If-Match (optimistic locking)
 
@@ -608,11 +657,20 @@ The `id` in the body must match the URL id, or the server returns **400**.
 
 ```bash
 curl -X PATCH http://localhost:9090/fhir/r4/Patient/550e8400-e29b-41d4-a716-446655440000 \
-  -H "Content-Type: application/fhir+json" \
+  -H "Content-Type: application/merge-patch+json" \
   -d '{"active": true}'
 ```
 
-Uses [JSON Merge Patch (RFC 7396)](https://tools.ietf.org/html/rfc7396): set a key to `null` to delete it. PATCH does not enforce `Content-Type` — a wrong type will fail with 400 when the body cannot be parsed as JSON.
+The `Content-Type` header selects the patch format:
+
+| Content-Type | Format |
+|---|---|
+| `application/merge-patch+json` (or none) | [JSON Merge Patch (RFC 7396)](https://tools.ietf.org/html/rfc7396) — set a key to `null` to delete it |
+| `application/json-patch+json` | [JSON Patch (RFC 6902)](https://tools.ietf.org/html/rfc6902) — an array of `add`/`remove`/`replace`/… operations |
+| `application/xml-patch+xml` | [XML Patch (RFC 5261)](https://tools.ietf.org/html/rfc5261) |
+| `application/fhir+json` / `application/fhir+xml` | [FHIRPath Patch](https://hl7.org/fhir/R4/fhirpatch.html) — a `Parameters` resource of patch operations |
+
+An unrecognized `Content-Type` falls back to JSON Merge Patch and fails with 400 if the body cannot be parsed as JSON.
 
 #### Delete a Resource
 
@@ -696,7 +754,7 @@ curl "http://localhost:9090/fhir/r4/Patient?family=smith&birthdate=ge1980"
 curl "http://localhost:9090/fhir/r4/Patient?_count=10&_page=2"
 ```
 
-Response is a `Bundle` (type `searchset`) with `link` entries: `self`, `first`, `last`, `next` (if more pages exist), `previous` (if not on page 1).
+Response is a `Bundle` (type `searchset`) with `link` entries: `self`, `first`, `next` (if more pages exist), `previous` (if not on page 1), and `last` (only when the total match count is known — when it isn't, the server uses a full-page heuristic for `next` and omits `last`).
 
 #### Search (POST)
 
@@ -778,15 +836,15 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 
 | Check | Status | Condition |
 |---|---|---|
-| Content-Type must be `application/fhir+json` or `application/json` | 415 | Wrong or unsupported `Content-Type` header |
+| Content-Type must be a supported FHIR media type: `application/fhir+json`, `application/json`, `application/fhir+xml`, `application/xml`, or `application/fhir+turtle` | 415 | Wrong or unsupported `Content-Type` header |
 | `resourceType` in body must match URL resource type | 422 | e.g. sending `{"resourceType":"Observation"}` to `/Patient` |
 | Required fields present (create/update) | 422 | Observation requires `code`; Encounter requires `status` and `class`; Condition requires `subject`; DiagnosticReport requires `status` and `code`; AllergyIntolerance requires `patient`. A present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing |
 | Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
 
-**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#6-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
+**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#7-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
 
-**Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#10-implementation-guides). It is off by default and is independent of base validation.
+**Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#11-implementation-guides). It is off by default and is independent of base validation.
 
 ---
 
@@ -794,37 +852,52 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 
 ### Built-in parameters
 
-100+ FHIR R4 base search parameters are seeded from `internal/seed/fhir-r4-search-params.csv` at every startup. These cover all common parameters for Patient, Observation, Encounter, Condition, MedicationRequest, and other core resource types.
+~1,700 FHIR R4 base search parameters are seeded from `internal/seed/fhir-r4-search-params.csv` at every startup, covering the base spec's parameters for all resource types (Patient, Observation, Encounter, Condition, MedicationRequest, …).
 
 ### Supported parameter types and modifiers
 
 | Type | Example | Modifiers | Notes |
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
-| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#10-terminology). |
+| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:text`, `:of-type`, `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). `:text` matches the display text (case-insensitive substring); `:of-type` matches `Identifier.type` + value. The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#10-terminology). |
 | `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` | `eq` follows R4 containment semantics (the search range must fully contain the stored range); `ne` matches when the search range does not fully contain the stored range; `ap` matches on range overlap; `sa` matches values that start after the search range and `eb` matches values that end before it. Matching is per indexed value, so a resource with multiple values for one param can match both `eq` and `ne` |
-| `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
-| `reference` | `subject=Patient/abc123` | — | |
+| `number` | `probability=gt0.8` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` | Values match with implicit-precision ranges per the spec |
+| `quantity` | `value-quantity=gt5.4\|http://unitsofmeasure.org\|mg` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap`, `:missing` | Value is `[prefix]number\|system\|code`; `system` and `code` are optional. The code is matched against the coded (UCUM) unit |
+| `uri` | `url=http://example.com/fhir/ValueSet/x` | `:below`, `:above`, `:missing` | Default is exact match; `:below` is a prefix match, `:above` matches ancestor URIs |
+| `reference` | `subject=Patient/abc123` | `:identifier`, `:{Type}`, `:missing` | Accepts `Type/id`, a bare `id`, or an absolute URL. `subject:Patient=123` names the target type; `patient:identifier=system\|value` matches the reference's logical identifier |
+| `composite` | `code-value-quantity=8480-6$lt90` | — | Component values joined with `$`; both components must co-occur in the same element |
 
-**Not yet queryable** — these types are indexed (rows written to their `sp_*` tables) but the query builder does not read from them:
+The only parameter type that is indexed but **not queryable** is `special`
+(`Location.near`, indexed into `sp_coords`). A search using it fails closed with
+an error `OperationOutcome` rather than silently dropping the predicate.
 
-| Type | Table | Status |
-|---|---|---|
-| `quantity` | `sp_quantity` | Indexed only |
-| `uri` | `sp_uri` | Indexed only |
-| `special` (Location.near) | `sp_coords` | Indexed only |
+### Chaining, reverse chaining, and `_filter`
 
-Special parameters handled without `sp_*` tables:
+- **Chained parameters** — `GET /Observation?subject.name=smith` (optionally
+  typed: `subject:Patient.name=smith`) follow reference parameters into the
+  target resource. Chain depth is bounded by `SEARCH_MAX_CHAIN_DEPTH`
+  (default 5 — see [docs/performance-tuning.md](docs/performance-tuning.md)).
+- **`_has` (reverse chaining)** — `GET /Patient?_has:Observation:patient:code=1234-5`
+  matches resources that are *referenced by* resources matching the nested query.
+- **`_filter`** — a supported subset of the FHIR `_filter` grammar:
+  `and` / `or` / parentheses, operators `eq`, `ne`, `co`, `sw`, `ew`, `gt`, `lt`,
+  `ge`, `le`, and `pr` (present). Unsupported constructs fail closed with an error.
+
+### Special and control parameters
 
 | Parameter | Behaviour |
 |---|---|
-| `_id` | Matches `resources.fhir_id` directly |
+| `_id` | Matches `resources.fhir_id` directly (comma-separated values are OR-ed) |
 | `_lastUpdated` | Matches `resources.last_updated`; supports `eq`, `ne`, `lt`, `gt`, `le`, `ge` |
+| `_tag`, `_security`, `_profile`, `_source`, `_language` | Universal `Resource.meta`/`Resource.language` parameters, indexed for every resource type |
 | `_text` / `_content` | Queries `resources.search_text` tsvector — **not currently functional** (column is never populated) |
 | `_include` | Fetches all forward references for matched resources |
 | `_revinclude` | Fetches all reverse references for matched resources |
-| `_sort` | **Silently ignored** — results always ordered by `last_updated DESC` |
+| `_sort` | Comma-separated search params, leading `-` for descending (e.g. `_sort=-date,name`). Resources missing the sort value order last; without `_sort`, results are ordered `last_updated DESC` |
 | `_count`, `_page` | Pagination |
+| `_total` | Opt-in `Bundle.total`: defaults to `none` (no count is computed); `_total=accurate` (or `estimate`) requests the count |
+| `_summary`, `_elements` | Response projection (e.g. `_summary=true`, `_elements=id,name`) |
+| `_format` | Response format override — see [API Reference](#8-api-reference) |
 
 ### Registering a custom SearchParameter
 
@@ -933,7 +1006,7 @@ See [TESTING.md](TESTING.md) for the full test inventory. Quick reference:
 ### Unit tests (no database, no Docker)
 
 ```bash
-go test ./...                         # All unit tests (~107 tests, <5s)
+go test ./...                         # All unit tests (~340 tests, a few seconds)
 go test ./... -race                   # With race detector
 go test ./... -run TestEvaluate       # Filter by test name
 go test ./internal/store/... -v       # Single package, verbose
@@ -963,8 +1036,16 @@ go test -tags integration ./...
 
 | Package | Tests | What they verify |
 |---|---|---|
-| `internal/store` | ~22 | CRUD, soft-delete/410, If-Match conflicts, history, VRead, search by type/token/date, FetchReferences, custom SearchParameter sync |
-| `internal/handler` | ~21 | Full HTTP round-trips: CRUD + 410, VRead, If-Match 412/200, 415 Content-Type, 422 validation, 400 body-id mismatch, GET/POST search, pagination links, $validate, type-level history with `_since`/`_count`/`_page`, $everything |
+| `internal/store` | ~65 | CRUD, soft-delete/410, If-Match conflicts, history, VRead, search by type/token/date, FetchReferences, custom SearchParameter sync, bundle write batching, tenant isolation, search plan selection |
+| `internal/handler` | ~55 | Full HTTP round-trips: CRUD + 410, VRead, If-Match 412/200, 415 Content-Type, 422 validation, 400 body-id mismatch, GET/POST search, pagination links, $validate, type-level history with `_since`/`_count`/`_page`, $everything, bundles, conditional operations, base validation |
+| `internal/db`, `internal/seed`, `internal/basedef` | ~10 | Schema creation, search-param seeding, base StructureDefinition loading |
+
+There is also a FHIR conformance suite (`internal/conformance`, build tag
+`conformance`) that exercises the server against spec-level expectations:
+
+```bash
+make test-conformance        # or: go test -tags conformance -timeout 300s ./internal/conformance/...
+```
 
 ---
 
@@ -990,7 +1071,7 @@ Add a corresponding test case in `internal/handler/handler_test.go`.
 ### Adding a new search parameter type
 
 1. Add a table to `internal/db/schema.sql` following the `sp_*` pattern.
-2. Add an indexer case in `internal/index/extractor.go` (the `Extractor.indexParam` method dispatches on `d.ParamType`).
+2. Add an indexer case in `internal/index/extractor.go` (the `Extractor.appendParam` method dispatches on `d.ParamType`).
 3. Add a query builder case in `internal/store/search.go`: add a `build<Type>Exists` method on `queryBuilder`, then wire it into `buildExistsForValue` (value-format heuristic) or `applyParam` (named special params).
 4. Add integration tests in `internal/store/store_integration_test.go`.
 
@@ -1003,7 +1084,7 @@ Add a corresponding test case in `internal/handler/handler_test.go`.
 
 ### Updating the schema
 
-Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so table creation stays idempotent. Bump the version number in the final `INSERT INTO schema_version` statement.
+Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so table creation stays idempotent. Bump the version number in the `INSERT INTO schema_version` statement near the top of the file.
 
 ---
 
@@ -1147,12 +1228,10 @@ upload of the same bundle.
 memory budget above. Additional connections do not increase write throughput once
 storage is saturated; they increase memory consumption and lock contention.
 
-**Bundle concurrency.** `BUNDLE_TRANSACTION_CONCURRENCY` distributes a transaction
-bundle across K database transactions. Enabling it requires a corresponding
-increase in pool size; otherwise each bundle waits for shard connections, fails to
-acquire them, and executes serially in any case, which is a net loss relative to
-leaving the feature disabled. Semantics, permitted values and the sizing rule are
-documented in
+**Write batching.** `WRITE_MAX_ROWS_PER_STATEMENT` and `WRITE_MAX_ROWS_PER_BUNDLE`
+bound how large one multi-row INSERT and one write transaction may grow, so a
+pathological bundle fails with a 413 instead of driving the database out of
+memory. Semantics, permitted values and the sizing rules are documented in
 [the search-layer tuning reference, §5](docs/performance-tuning.md#5-bulk-import--the-write-path).
 
 ### Verification

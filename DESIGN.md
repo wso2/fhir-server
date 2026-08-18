@@ -44,8 +44,8 @@ arbitrary.
 
 - **One schema for all resource types.** FHIR has 140+ resource types. Rather than a
   table per type (the legacy approach), every resource lives in a single `resources`
-  table as a JSONB document, with search values projected out into normalized index
-  tables. New resource types and Implementation Guides require *no schema changes*.
+  table as an opaque JSON document, with search values projected out into normalized
+  index tables. New resource types and Implementation Guides require *no schema changes*.
 
 - **Search reads never touch the resource JSON.** All query predicates resolve against
   narrow, purpose-built `sp_*` index tables. The full document is fetched only to
@@ -131,11 +131,13 @@ documents are fetched from `resources` and assembled into a `Bundle`.
 
 ## 3. Storage model
 
-### One `resources` table, JSONB document
+### One `resources` table, one document column
 
 Every FHIR resource of every type is stored as a row in `resources`, keyed by
 `(tenant_id, resource_type, fhir_id)`, with the full document in a `resource_json`
-JSONB column (`internal/db/schema.sql`).
+`TEXT` column, lz4-compressed (`internal/db/schema.sql` — deliberately not `JSONB`:
+the document is only ever read and written whole, so `TEXT` skips JSONB's
+parse-and-normalize cost on every write and preserves the exact marshalled bytes).
 
 - **Decision:** replace the legacy "150+ per-resource tables" model with one table.
 - **Why:** FHIR's resource set is large and evolves; per-type tables mean a migration
@@ -146,7 +148,7 @@ JSONB column (`internal/db/schema.sql`).
 
 ### No GIN index on `resource_json`
 
-The schema deliberately does **not** index the JSONB document
+The schema deliberately does **not** index the document column
 (`internal/db/schema.sql` header comment).
 
 - **Why:** all search predicates resolve through `sp_*` tables, so a document-wide GIN
@@ -157,7 +159,7 @@ The schema deliberately does **not** index the JSONB document
 ### Append-only history
 
 Every create, update, and delete writes a full snapshot row into `resource_history`
-with an immutable `version_id` and an `operation` tag (`CREATE|UPDATE|DELETE`).
+with an immutable `version_id` and an `operation` tag (`POST|PUT|DELETE`).
 
 - **Why:** FHIR mandates versioning (`vread`, `_history`) and healthcare deployments
   need audit trails.
@@ -177,7 +179,7 @@ recorded in history.
 
 | Table(s) | Purpose |
 |---|---|
-| `resources` | Current version of every resource (JSONB) |
+| `resources` | Current version of every resource (`TEXT`, lz4-compressed) |
 | `resource_history` | Immutable per-version snapshots |
 | `sp_string`, `sp_token`, `sp_date`, `sp_number`, `sp_quantity`, `sp_uri`, `sp_reference`, `sp_coords` | Extracted search values, one table per param type |
 | `search_param_definitions` | The search-parameter registry (base + IG + custom) |
