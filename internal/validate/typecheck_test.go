@@ -94,13 +94,13 @@ func check(body map[string]any) []Issue {
 
 func TestCheckTypes_ValidResource(t *testing.T) {
 	issues := check(map[string]any{
-		"resourceType":  "Patient",
-		"active":        true,
-		"gender":        "male",
-		"birthDate":     "1974-12-25",
-		"count":         float64(3),
-		"name":          []any{map[string]any{"family": "Chalmers", "given": []any{"Peter", "James"}}},
-		"maritalStatus": map[string]any{"coding": []any{}}, // interior not described by the mini SDs
+		"resourceType":    "Patient",
+		"active":          true,
+		"gender":          "male",
+		"birthDate":       "1974-12-25",
+		"count":           float64(3),
+		"name":            []any{map[string]any{"family": "Chalmers", "given": []any{"Peter", "James"}}},
+		"maritalStatus":   map[string]any{"coding": []any{}}, // interior not described by the mini SDs
 		"deceasedBoolean": false,
 	})
 	if len(issues) != 0 {

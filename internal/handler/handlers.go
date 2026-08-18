@@ -31,9 +31,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/wso2/fhir-server/internal/basedef"
 	"github.com/wso2/fhir-server/internal/compartment"
 	"github.com/wso2/fhir-server/internal/fhirttl"
-	"github.com/wso2/fhir-server/internal/basedef"
 	"github.com/wso2/fhir-server/internal/fhirxml"
 	"github.com/wso2/fhir-server/internal/ig"
 	"github.com/wso2/fhir-server/internal/patch"
