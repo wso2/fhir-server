@@ -1,0 +1,38 @@
+---
+title: Terminology
+description: Connect the FHIR server to an external terminology service.
+icon: tags
+---
+
+# Terminology integration
+
+WSO2 FHIR Server stores clinical resources but delegates terminology reasoning to a FHIR terminology service. This keeps ValueSet expansion, code validation, and subsumption outside the resource-store runtime.
+
+## Configure the service
+
+Set the terminology base URL through the server configuration supported by your deployment. For local evaluation, use a non-production terminology endpoint and verify its licensing and availability constraints.
+
+## Terminology-backed search
+
+Token searches can use terminology modifiers when the external service is configured. Examples include ValueSet membership and CodeSystem hierarchy searches:
+
+```bash
+curl -sS --get "http://localhost:9090/fhir/r4/Observation" \
+  --data-urlencode "code:in=http://example.org/fhir/ValueSet/lab-codes"
+```
+
+```bash
+curl -sS --get "http://localhost:9090/fhir/r4/Condition" \
+  --data-urlencode "code:below=http://snomed.info/sct|73211009"
+```
+
+## Operational considerations
+
+- Treat the terminology service as a runtime dependency for terminology-backed queries.
+- Set explicit timeouts and monitor error rates and latency.
+- Confirm CodeSystem and ValueSet licensing for every deployment.
+- Cache only where the terminology server's versioning semantics make cached results safe.
+
+<Warning>
+  Do not assume the public terminology sandbox provides production availability, performance, or licenses for every code system.
+</Warning>

@@ -1,0 +1,55 @@
+---
+title: WSO2 FHIR Server
+description: A production-oriented FHIR R4 REST server built in Go and backed by PostgreSQL.
+icon: heart-pulse
+mode: wide
+---
+
+# Build on a focused FHIR R4 foundation
+
+WSO2 FHIR Server stores, validates, searches, and versions FHIR R4 resources through a standards-aligned REST API. It is a single Go binary backed by PostgreSQL, with a normalized search index designed for predictable query performance.
+
+<CardGroup cols={3}>
+  <Card title="Run it locally" icon="rocket" href="/docs/get-started/quickstart">
+    Start PostgreSQL and the server with Docker Compose, then create your first Patient.
+  </Card>
+  <Card title="Understand the design" icon="diagram-project" href="/docs/concepts/architecture">
+    Follow requests from the HTTP API through validation, storage, indexing, and search.
+  </Card>
+  <Card title="Use the FHIR API" icon="brackets-curly" href="/docs/reference/api">
+    Work with CRUD, history, transactions, validation, search, and FHIR operations.
+  </Card>
+</CardGroup>
+
+## At a glance
+
+| Capability | Implementation |
+| --- | --- |
+| FHIR version | R4 (4.0.1) |
+| Runtime | Go 1.25 |
+| Database | PostgreSQL 14 through 18 |
+| Resource model | JSONB resources with normalized typed search indexes |
+| API formats | FHIR JSON, XML, and Turtle where supported |
+| Tenancy | Dedicated deployments or logical tenant isolation |
+| Extensibility | Custom SearchParameters and FHIR Implementation Guides |
+
+## Choose your path
+
+<CardGroup cols={2}>
+  <Card title="Application developer" icon="code">
+    Start with the [quickstart](/docs/get-started/quickstart), then use the [API reference](/docs/reference/api) and [search guide](/docs/reference/search).
+  </Card>
+  <Card title="Platform operator" icon="server">
+    Review [configuration](/docs/reference/configuration), [deployment](/docs/operations/deployment), and [performance tuning](/docs/performance-tuning).
+  </Card>
+  <Card title="FHIR implementer" icon="file-medical">
+    Learn how [Implementation Guides](/docs/guides/implementation-guides), [validation](/docs/guides/validation), and [terminology](/docs/guides/terminology) work.
+  </Card>
+  <Card title="Contributor" icon="code-pull-request">
+    Read the [testing](/docs/development/testing), [extension](/docs/development/extending), and [contribution](/docs/development/contributing) guides.
+  </Card>
+</CardGroup>
+
+<Note>
+  This project implements FHIR server capabilities. Always validate deployment-specific security, consent, audit, retention, and compliance requirements before handling health information.
+</Note>

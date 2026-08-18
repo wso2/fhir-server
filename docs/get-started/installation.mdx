@@ -1,0 +1,60 @@
+---
+title: Installation
+description: Build and run WSO2 FHIR Server as a binary or container.
+icon: download
+---
+
+# Install and run the server
+
+## Build a binary
+
+**Prerequisite:** Go 1.25 or later.
+
+```bash
+go build -o fhir-server ./cmd/server
+```
+
+## Build a container image
+
+```bash
+docker build -t fhir-server:latest .
+```
+
+## Prepare PostgreSQL
+
+The server supports PostgreSQL 14 through 18. Create a database and runtime role, then apply the idempotent schema:
+
+```bash
+psql "postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable" \
+  -f internal/db/schema.sql
+```
+
+Alternatively, set `FHIR_CREATE_TABLES=true` for a one-time startup using a role with DDL privileges.
+
+<Warning>
+  Keep DDL privileges out of the steady-state runtime role. Provision the schema separately for production deployments.
+</Warning>
+
+## Run with a configuration file
+
+```bash
+cp config.example.yaml config.yaml
+./fhir-server --config ./config.yaml
+```
+
+## Run with environment variables
+
+```bash
+export DATABASE_URL="postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable"
+export SERVER_PORT=9090
+export BASE_URL="http://localhost:9090/fhir/r4"
+./fhir-server
+```
+
+Configuration precedence is:
+
+```text
+environment variable > configuration file > built-in default
+```
+
+See the complete [configuration reference](/docs/reference/configuration) before deploying the server.

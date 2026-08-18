@@ -1,0 +1,81 @@
+---
+title: Quickstart
+description: Start the server with Docker Compose and create your first FHIR resource.
+icon: rocket
+---
+
+# Run the server with Docker Compose
+
+## Prerequisites
+
+- Docker Desktop, Docker Engine, or Colima
+- `curl`
+- `jq` for the response examples
+
+## Start the stack
+
+From the repository root:
+
+```bash
+docker-compose up
+```
+
+The stack starts:
+
+| Service | Address |
+| --- | --- |
+| FHIR base URL | `http://localhost:9090/fhir/r4` |
+| Readiness endpoint | `http://localhost:9090/health/ready` |
+| Adminer | `http://localhost:8080` |
+| PostgreSQL | `localhost:5432` |
+
+Wait until readiness returns `200 OK`:
+
+```bash
+curl -sv http://localhost:9090/health/ready
+```
+
+## Create a Patient
+
+```bash
+curl -sS -X POST http://localhost:9090/fhir/r4/Patient \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Patient",
+    "name": [{"family": "Smith", "given": ["Alice"]}]
+  }' | jq
+```
+
+The server assigns an `id`, sets version metadata, and returns the created Patient.
+
+## Search for the Patient
+
+```bash
+curl -sS "http://localhost:9090/fhir/r4/Patient?family=Smith" | jq
+```
+
+The response is a FHIR searchset Bundle.
+
+## Inspect PostgreSQL
+
+Open `http://localhost:8080` and use:
+
+| Field | Value |
+| --- | --- |
+| System | PostgreSQL |
+| Server | `db` |
+| Username | `fhir` |
+| Password | `fhir` |
+| Database | `fhirdb` |
+
+<Warning>
+  These credentials are local development defaults. Do not reuse them in a shared or production environment.
+</Warning>
+
+## Stop and remove local data
+
+```bash
+docker-compose down -v
+```
+
+Continue with [Installation](/docs/get-started/installation) to run the binary directly or build a container image.

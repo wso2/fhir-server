@@ -1,0 +1,44 @@
+---
+title: Validation
+description: Understand structural and profile validation behavior.
+icon: shield-check
+---
+
+# Validate FHIR resources
+
+The server validates basic FHIR resource structure and can apply loaded profile constraints when profile validation is enabled.
+
+## Use `$validate`
+
+Validate a resource without storing it:
+
+```bash
+curl -sS -X POST "http://localhost:9090/fhir/r4/Observation/$validate" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Observation",
+    "status": "final",
+    "code": {"text": "Heart rate"}
+  }' | jq
+```
+
+The response is an OperationOutcome:
+
+- `200 OK` when validation succeeds.
+- `422 Unprocessable Entity` when the resource violates an applicable rule.
+
+## Validation on write
+
+Base resource checks protect fundamental structure. Profile validation is deployment-controlled and applies to profiles declared in `meta.profile` when their StructureDefinitions are available.
+
+<Note>
+  The default behavior favors FHIR interoperability. Load the required Implementation Guides and enable the corresponding validation policy when a deployment requires profile enforcement.
+</Note>
+
+## Profile availability
+
+Use `/metadata` to confirm that the expected packages and profiles loaded successfully before sending profile-constrained traffic.
+
+## Application behavior
+
+Clients should parse OperationOutcome issues instead of relying only on HTTP status text. Preserve the issue severity, code, diagnostics, and expression fields when presenting validation failures.

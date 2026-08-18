@@ -1,0 +1,63 @@
+---
+title: Deployment
+description: Prepare the server and PostgreSQL for a controlled deployment.
+icon: server
+---
+
+# Prepare a controlled deployment
+
+The server ships as a Go binary and container image. A production deployment also needs PostgreSQL, schema provisioning, ingress and identity controls, backups, secrets, monitoring, and a deliberate tenant model.
+
+## Deployment checklist
+
+1. Build an immutable binary or container from a reviewed commit.
+2. Provision a supported PostgreSQL version and apply `internal/db/schema.sql` with a controlled DDL role.
+3. Create a least-privileged runtime database role.
+4. Store database credentials and other secrets outside the image and repository.
+5. Set `BASE_URL` to the canonical externally reachable FHIR base URL.
+6. Configure read, write, idle, client, ingress, and database timeouts coherently.
+7. Put TLS and authenticated authorization enforcement in front of the service.
+8. Configure readiness and liveness probes separately.
+9. Establish backup, restore, retention, and disaster-recovery procedures.
+10. Run smoke, search, tenancy, and restore tests before accepting traffic.
+
+## Container
+
+```bash
+docker build -t fhir-server:latest .
+```
+
+Pass runtime configuration through environment variables or mount a YAML configuration file. Do not bake credentials into the image.
+
+## Database provisioning
+
+Apply the schema separately:
+
+```bash
+psql "$DATABASE_URL" -f internal/db/schema.sql
+```
+
+`FHIR_CREATE_TABLES=true` is intended for controlled first-start or local workflows, not as a default runtime privilege.
+
+## Network and identity boundary
+
+The FHIR server handles FHIR resources and tenant-scoped storage. Deploy an API gateway, service mesh, or equivalent enforcement point for:
+
+- TLS termination and certificate policy.
+- Authentication and token validation.
+- Tenant binding and authorization.
+- Rate limits and abuse controls.
+- Network allowlists and request-size controls.
+- Security audit integration.
+
+## Timeouts
+
+`SERVER_WRITE_TIMEOUT` bounds the entire handler execution from the HTTP server's perspective. Large transaction Bundles can exceed the default. Measure the largest supported request under expected concurrency, then coordinate the server, proxy, client, and database timeout budgets.
+
+<Warning>
+  A client-side EOF during a long transaction Bundle can represent an indeterminate outcome. Reconcile resource state before retrying.
+</Warning>
+
+## After bulk loading
+
+Run `VACUUM (ANALYZE)` on `resources` and the search-parameter tables after a bulk import. This refreshes visibility maps and planner statistics before serving search traffic.

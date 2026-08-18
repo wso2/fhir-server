@@ -1,10 +1,15 @@
-# Performance Tuning
+---
+title: Performance tuning
+description: Tune search planning, PostgreSQL, and the bulk-write path using measured workload behavior.
+icon: gauge-high
+---
+
+# Tune with measured workload behavior
 
 > **Scope.** This document covers the **search layer** — the density-probe
 > architecture and the knobs around it. For hardware sizing (storage IOPS, the
 > memory budget under a container limit), PostgreSQL server settings, and the
-> write/import path, see [Performance Tuning](../README.md#14-performance-tuning) in
-> the README.
+> write/import path, see [Performance Tuning in the repository guide](https://github.com/wso2/fhir-server/blob/main/README.md#14-performance-tuning).
 > Tune in that order — storage, then PostgreSQL, then these knobs. No search knob
 > rescues a saturated disk.
 

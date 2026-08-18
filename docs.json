@@ -1,0 +1,134 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "WSO2 FHIR Server",
+  "description": "Documentation for the WSO2 FHIR R4 Server",
+  "colors": {
+    "primary": "#F36C21",
+    "light": "#FF8A4C",
+    "dark": "#C94F0C"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Welcome",
+            "pages": [
+              "docs/index"
+            ]
+          },
+          {
+            "group": "Get started",
+            "pages": [
+              "docs/get-started/introduction",
+              "docs/get-started/quickstart",
+              "docs/get-started/installation"
+            ]
+          },
+          {
+            "group": "Core concepts",
+            "pages": [
+              "docs/concepts/architecture",
+              "docs/concepts/storage",
+              "docs/concepts/multi-tenancy"
+            ]
+          },
+          {
+            "group": "Platform capabilities",
+            "pages": [
+              "docs/guides/implementation-guides",
+              "docs/guides/terminology",
+              "docs/guides/validation"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "icon": "brackets-curly",
+        "groups": [
+          {
+            "group": "FHIR API",
+            "pages": [
+              "docs/reference/api",
+              "docs/reference/search",
+              "docs/reference/configuration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Operations",
+        "icon": "server",
+        "groups": [
+          {
+            "group": "Run the server",
+            "pages": [
+              "docs/operations/deployment",
+              "docs/operations/health-and-observability",
+              "docs/performance-tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "Contribute",
+            "pages": [
+              "docs/development/testing",
+              "docs/development/extending",
+              "docs/development/contributing"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/wso2/fhir-server",
+          "icon": "github"
+        },
+        {
+          "anchor": "WSO2",
+          "href": "https://wso2.com/",
+          "icon": "globe"
+        }
+      ]
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "FHIR R4",
+        "href": "https://hl7.org/fhir/R4/"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/wso2/fhir-server"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/wso2/fhir-server"
+    }
+  }
+}
