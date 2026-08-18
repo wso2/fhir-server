@@ -1443,24 +1443,51 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 	writeFHIR(w, r, http.StatusOK, cs)
 }
 
-// validateRequiredFields returns a non-empty error message if key required
-// FHIR R4 fields are missing from the resource body. Covers only the resource
-// types exercised by the integration test suite; returns "" for unknown types.
+// requiredFieldsByType lists, per resource type, the FHIR R4 fields with 1..1
+// cardinality that the handler checks on create/update. The set is intentionally
+// small: it covers only resources whose required fields are simple top-level
+// elements; unknown types and more complex cardinality rules are left to the
+// base StructureDefinition validator.
+var requiredFieldsByType = map[string][]string{
+	"Observation":        {"code"},
+	"Encounter":          {"status", "class"},
+	"Condition":          {"subject"},
+	"DiagnosticReport":   {"status", "code"},
+	"AllergyIntolerance": {"patient"},
+}
+
+// validateRequiredFields returns a non-empty error message if a key required
+// FHIR R4 field is missing or empty in the resource body.
 func validateRequiredFields(rt string, body map[string]any) string {
-	required := map[string][]string{
-		"Observation": {"code"},
-		"Encounter":   {"status", "class"},
-	}
-	fields, ok := required[rt]
+	fields, ok := requiredFieldsByType[rt]
 	if !ok {
 		return ""
 	}
 	for _, f := range fields {
-		if _, exists := body[f]; !exists {
-			return fmt.Sprintf("missing required field %q for %s", f, rt)
+		if v, exists := body[f]; !exists || !isPresent(v) {
+			return fmt.Sprintf("missing or empty required field %q for %s", f, rt)
 		}
 	}
 	return ""
+}
+
+// isPresent reports whether a decoded JSON value carries actual content.
+// A required field whose key is present but whose value is null, an empty
+// string, or an empty object/array is treated as absent, matching FHIR
+// cardinality semantics for 1..1 elements.
+func isPresent(v any) bool {
+	if v == nil {
+		return false
+	}
+	switch t := v.(type) {
+	case string:
+		return t != ""
+	case map[string]any:
+		return len(t) > 0
+	case []any:
+		return len(t) > 0
+	}
+	return true
 }
 
 // enforceWrite runs validation on a create/update and, when there is a blocking
