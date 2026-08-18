@@ -33,6 +33,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/wso2/fhir-server/internal/compartment"
 	"github.com/wso2/fhir-server/internal/fhirttl"
+	"github.com/wso2/fhir-server/internal/basedef"
 	"github.com/wso2/fhir-server/internal/fhirxml"
 	"github.com/wso2/fhir-server/internal/ig"
 	"github.com/wso2/fhir-server/internal/patch"
@@ -1148,12 +1149,7 @@ func (h *fhirHandler) validate(w http.ResponseWriter, r *http.Request) {
 		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
 		return
 	}
-	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
-		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
-			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
-		return
-	}
-	h.runValidate(w, r, body)
+	h.runValidate(w, r, body, rt, true)
 }
 
 // validateSystem is the system-level $validate (POST [base]/$validate). The
@@ -1167,7 +1163,7 @@ func (h *fhirHandler) validateSystem(w http.ResponseWriter, r *http.Request) {
 		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
 		return
 	}
-	h.runValidate(w, r, body)
+	h.runValidate(w, r, body, "", true)
 }
 
 // validateInstance is the instance-level $validate (POST /{type}/{id}/$validate).
@@ -1194,15 +1190,51 @@ func (h *fhirHandler) validateInstance(w http.ResponseWriter, r *http.Request) {
 			handleError(w, err)
 			return
 		}
-		body = stored
+		// A stored resource is validated as-is — never unwrapped, so a stored
+		// Parameters resource is not mistaken for an operation envelope.
+		h.runValidate(w, r, stored, rt, false)
+		return
 	}
-	h.runValidate(w, r, body)
+	h.runValidate(w, r, body, rt, true)
 }
 
 // runValidate validates a resource against the profiles named by ?profile= or
 // meta.profile and writes the OperationOutcome (200 informational when valid,
 // 422 with issues when not).
-func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body map[string]any) {
+//
+// When allowWrapper is set and the body is a Parameters resource, it is treated
+// as the operation's input envelope per the FHIR operation framework: the
+// resource to validate is taken from the parameter named "resource". urlType,
+// when non-empty, is the resource type from the URL; after any unwrapping the
+// (inner) resource's type must match it.
+func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body map[string]any, urlType string, allowWrapper bool) {
+	if bodyRT, _ := body["resourceType"].(string); allowWrapper && bodyRT == "Parameters" {
+		inner, mode := unwrapValidateParams(body)
+		if inner == nil {
+			if mode == "delete" {
+				// Deletes carry no resource; there is nothing to check.
+				writeFHIR(w, r, http.StatusOK, map[string]any{
+					"resourceType": "OperationOutcome",
+					"issue": []any{map[string]any{
+						"severity":    "information",
+						"code":        "informational",
+						"diagnostics": "Resource is valid",
+					}},
+				})
+				return
+			}
+			operationOutcome(w, http.StatusBadRequest, "error", "required",
+				"$validate requires a resource parameter (Parameters.parameter where name = \"resource\")")
+			return
+		}
+		body = inner
+	}
+	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && urlType != "" && bodyRT != urlType {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, urlType))
+		return
+	}
+
 	var profileURLs []string
 	if p := r.URL.Query().Get("profile"); p != "" {
 		profileURLs = []string{p}
@@ -1273,6 +1305,32 @@ func (h *fhirHandler) convert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeFHIR(w, r, http.StatusOK, body)
+}
+
+// unwrapValidateParams extracts the resource to validate and the mode code from
+// a $validate Parameters envelope. Returns a nil resource when the envelope
+// carries none.
+func unwrapValidateParams(params map[string]any) (resource map[string]any, mode string) {
+	parameters, _ := params["parameter"].([]any)
+	for _, raw := range parameters {
+		pm, _ := raw.(map[string]any)
+		if pm == nil {
+			continue
+		}
+		switch pm["name"] {
+		case "resource":
+			if res, ok := pm["resource"].(map[string]any); ok && resource == nil {
+				resource = res
+			}
+		case "mode":
+			if s, ok := pm["valueCode"].(string); ok {
+				mode = s
+			} else if s, ok := pm["valueString"].(string); ok {
+				mode = s
+			}
+		}
+	}
+	return resource, mode
 }
 
 // validateAgainstProfiles looks up each profile URL in ig_profiles and runs
@@ -1542,6 +1600,23 @@ func (h *fhirHandler) baseValidationIssues(ctx context.Context, body map[string]
 			issues[i].Severity = "warning"
 		}
 	}
+
+	// Instance type/shape checking: JSON kinds, primitive lexical rules, and
+	// array-vs-scalar shape against the element types declared in the base
+	// definitions. Datatype interiors come from the embedded types bundle;
+	// nested resources (contained, Bundle.entry.resource, …) resolve through
+	// the same base-definition cache.
+	lookup := func(typeName string) *validate.Profile {
+		if dt := basedef.Datatype(typeName); dt != nil {
+			return dt
+		}
+		sub, err := h.baseDefs.Lookup(ctx, typeName)
+		if err != nil {
+			return nil
+		}
+		return sub
+	}
+	issues = append(issues, prof.CheckTypes(body, lookup)...)
 	return issues
 }
 

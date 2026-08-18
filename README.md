@@ -523,7 +523,7 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 | `GET` | `/{type}/{id}/_history` | 200 | Instance history |
 | `GET` | `/{type}/_history` | 200 | Type-level history |
 | `GET` | `/{type}/{id}/$everything` | 200, 404 | Patient/resource graph |
-| `POST` | `/{type}/$validate` | 200, 415, 422 | Validate without persisting |
+| `POST` | `/{type}/$validate` | 200, 400, 415, 422 | Validate without persisting; accepts a bare resource or a Parameters envelope (`parameter[name=resource].resource`) |
 | `GET` | `/health/live` | 200 | Liveness probe |
 | `GET` | `/health/ready` | 200, 503 | Readiness probe (503 while IGs loading) |
 
@@ -785,7 +785,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
 
-**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#6-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
+**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#6-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. It also enforces the FHIR JSON representation rules: primitive values must match their declared type's JSON kind and lexical form (booleans as JSON booleans, integers without fractions and in range, dates/times/codes/ids matching the spec regexes), arrays only where elements repeat, no `null`/empty values (`""`, `{}`, `[]`, `[null]` without an extension fill), and well-formed `_field` primitive-extension pairing. Complex-datatype interiors (HumanName, CodeableConcept, …) are checked against an embedded copy of the R4 datatype definitions. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
 
 **Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#10-implementation-guides). It is off by default and is independent of base validation.
 

@@ -363,6 +363,62 @@ func TestUpdate_IfMatchMissingResourceIs404(t *testing.T) {
 	}
 }
 
+// ─── $validate: Parameters envelope ─────────────────────────────────────────────
+
+func wrapInParameters(resource map[string]any) map[string]any {
+	return map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{map[string]any{"name": "resource", "resource": resource}},
+	}
+}
+
+func TestValidate_ParametersWrappedValidResource(t *testing.T) {
+	h := newRouter(&mockStore{})
+	patient := map[string]any{"resourceType": "Patient", "id": "example"}
+
+	for _, path := range []string{"/fhir/r4/Patient/$validate", "/fhir/r4/$validate"} {
+		w := do(t, h, http.MethodPost, path, wrapInParameters(patient))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: want 200, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestValidate_ParametersWrappedTypeMismatchIs422(t *testing.T) {
+	h := newRouter(&mockStore{})
+	obs := map[string]any{"resourceType": "Observation", "code": map[string]any{"text": "x"}}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", wrapInParameters(obs))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestValidate_ParametersWithoutResourceIsRejected(t *testing.T) {
+	h := newRouter(&mockStore{})
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", w.Code)
+	}
+	body := decodeJSON(t, w)
+	if body["resourceType"] != "OperationOutcome" {
+		t.Fatalf("want OperationOutcome, got %v", body["resourceType"])
+	}
+}
+
+func TestValidate_ParametersModeDeleteWithoutResourceIsValid(t *testing.T) {
+	h := newRouter(&mockStore{})
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{map[string]any{"name": "mode", "valueCode": "delete"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ─── Patch ────────────────────────────────────────────────────────────────────
 
 func TestPatch_Success(t *testing.T) {
