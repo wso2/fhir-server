@@ -1,6 +1,7 @@
 ---
 title: WSO2 FHIR Server
 description: A production-oriented FHIR R4 REST server built in Go and backed by PostgreSQL.
+slug: /
 ---
 
 # Build on a focused FHIR R4 foundation
