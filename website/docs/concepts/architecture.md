@@ -1,63 +1,50 @@
 ---
 title: Architecture
-description: Understand the request lifecycle and boundaries of the WSO2 FHIR Server.
+description: What WSO2 FHIR Server does and how its main parts fit together.
 ---
 
-# How requests move through the server
+# A blazing-fast, lightweight FHIR server written in Go
 
-WSO2 FHIR Server is a single Go service connected to PostgreSQL. HTTP handlers coordinate storage, validation, search, indexing, and terminology integrations through focused internal packages.
+WSO2 FHIR Server is a single binary that speaks FHIR R4 over REST and stores everything in PostgreSQL. There is nothing else to deploy: one service, one database.
+
+## What it can do
+
+- Full FHIR REST interactions: create, read, update, patch, delete, versioned read, and history.
+- FHIR search across string, token, date, number, quantity, URI, reference, and composite parameters, including chained and reverse-chained queries.
+- Transaction and batch Bundles with atomic transaction semantics.
+- Base R4 validation on every write, plus profile validation against loaded Implementation Guides and `$validate`.
+- Implementation Guide packages loaded at startup from the FHIR package registry.
+- Terminology-backed search (`:in`, `:below`, and related modifiers) through an external terminology server.
+- Patient, Encounter, and Practitioner compartment search and `$everything`.
+- Single-tenant and shared multi-tenant deployment models.
+- JSON, XML, and Turtle representations negotiated per request.
+
+See [supported resource types](../reference/resource-types.md) for what you can store and the [FHIR API reference](../reference/api.md) for how to call it.
+
+## How it fits together
 
 ```mermaid
 flowchart LR
-    Client["FHIR client"] --> Router["HTTP router and handlers"]
-    Router --> Validate["Validation"]
-    Router --> Store["Resource store"]
-    Router --> Search["Search builder"]
-    Store --> Index["Search extraction"]
-    Search --> Registry["Search parameter registry"]
-    Index --> FHIRPath["FHIRPath evaluator"]
-    Store --> DB[("PostgreSQL")]
+    Client["FHIR client"] --> API["FHIR REST API"]
+    API --> Validation["Validation"]
+    API --> Search["Search"]
+    API --> Storage["Resource storage"]
+    Storage --> DB[("PostgreSQL")]
     Search --> DB
-    Index --> DB
-    Router --> TX["Terminology service"]
-    IG["FHIR packages"] --> Registry
-    IG --> Validate
+    API -.-> TX["External terminology server"]
+    IG["FHIR IG packages"] --> Validation
+    IG --> Search
 ```
 
-## Package responsibilities
+All resource types share one storage model: resources are stored as JSON documents with their full version history, and the values used by search are extracted into typed indexes at write time. A write and its history snapshot and search-index updates commit in a single database transaction, so a resource is never searchable in a state that was not stored.
 
-| Package | Responsibility |
-| --- | --- |
-| `cmd/server` | Configuration, dependency wiring, startup, and shutdown |
-| `internal/handler` | Routing, content negotiation, FHIR interactions, and OperationOutcome responses |
-| `internal/store` | CRUD, transactions, history, versioning, and SQL query construction |
-| `internal/index` | Write-time extraction into typed search tables |
-| `internal/fhirpath` | FHIRPath parsing and evaluation |
-| `internal/validate` | Base structural and profile validation |
-| `internal/ig` | Implementation Guide package loading |
-| `internal/terminology` | External terminology calls and closure bookkeeping |
-| `internal/tenant` | Tenant resolution and PostgreSQL tenant scope |
+Searches run against the typed indexes first and load the matching JSON documents last, which keeps queries predictable as data grows. [Storage](./storage.md) covers this model in more depth.
 
-## Write lifecycle
+## What stays outside
 
-1. The router resolves the tenant and negotiates the FHIR representation.
-2. The handler decodes the resource and applies configured validation.
-3. The store opens a PostgreSQL transaction and sets the tenant scope.
-4. The current resource is created or updated and its version advances.
-5. An immutable history snapshot is appended.
-6. Search values are extracted and the resource's `sp_*` rows are refreshed.
-7. The transaction commits all changes atomically.
+The server deliberately delegates two concerns:
 
-## Search lifecycle
-
-1. The handler parses query parameters and resolves the tenant.
-2. The search registry determines each parameter's type and expression.
-3. The store builds predicates against the corresponding `sp_*` tables.
-4. PostgreSQL identifies and orders matching resource IDs.
-5. The full JSON documents are loaded and returned in a searchset Bundle.
-
-## Startup lifecycle
-
-The service loads configuration, connects to PostgreSQL, prepares the schema when explicitly enabled, seeds base R4 definitions, and initializes the search registry. Implementation Guides can load during startup; readiness remains closed until required initialization completes.
+- **Terminology reasoning** — ValueSet expansion and code hierarchy questions go to a FHIR terminology server you configure.
+- **Identity and policy** — authentication, authorization, and TLS termination belong to the gateway or ingress in front of the server. See [Deployment](../operations/deployment.md).
 
 For design rationale and accepted tradeoffs, read [`DESIGN.md`](https://github.com/wso2/fhir-server/blob/main/DESIGN.md).

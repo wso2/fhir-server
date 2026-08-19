@@ -37,7 +37,7 @@ Wait until readiness returns `200 OK`:
 ```bash
 for i in $(seq 1 30); do
   curl -sf -m 5 http://localhost:9090/health/ready && break
-  [ "$i" -eq 30 ] && { echo "server not ready after 60s; check docker compose logs" >&2; exit 1; }
+  [ "$i" -eq 30 ] && { echo "server not ready after the retry window; check docker compose logs" >&2; exit 1; }
   sleep 2
 done
 ```
