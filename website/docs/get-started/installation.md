@@ -28,7 +28,9 @@ docker build -t fhir-server:latest .
 
 ## Prepare PostgreSQL
 
-The server supports PostgreSQL 14 through 18. Create the runtime role and database as a PostgreSQL superuser:
+The server supports PostgreSQL 14 through 18. The commands below set up a **local development** database; the `fhir`/`fhir` credentials and `sslmode=disable` must not be reused outside a local environment. Production deployments need unique credentials injected from a secret manager and TLS on the database connection.
+
+Create the runtime role and database as a PostgreSQL superuser:
 
 ```bash
 psql -U postgres -c "CREATE ROLE fhir LOGIN PASSWORD 'fhir'"

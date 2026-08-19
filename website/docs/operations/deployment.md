@@ -22,8 +22,10 @@ The server ships as a Go binary and container image. A production deployment als
 
 ## Container
 
+Tag images with a reviewed commit or release version rather than a mutable tag, and deploy by immutable digest:
+
 ```bash
-docker build -t fhir-server:latest .
+docker build -t "fhir-server:$(git rev-parse --short HEAD)" .
 ```
 
 Pass runtime configuration through environment variables or mount a YAML configuration file. Do not bake credentials into the image.
@@ -59,4 +61,4 @@ A client-side EOF during a long transaction Bundle can represent an indeterminat
 
 ## After bulk loading
 
-Run `VACUUM (ANALYZE)` on `resources` and the search-parameter tables after a bulk import. This refreshes visibility maps and planner statistics before serving search traffic.
+Run `VACUUM (ANALYZE)` on `resources` and on every search-parameter table after a bulk import, executing each statement outside a transaction. This refreshes visibility maps and planner statistics before serving search traffic. See [Performance tuning](https://github.com/wso2/fhir-server/blob/main/docs/performance-tuning.md) for the full procedure.

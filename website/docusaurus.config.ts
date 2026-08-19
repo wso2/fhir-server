@@ -20,7 +20,7 @@ const config: Config = {
           path: 'docs',
           routeBasePath: '/',
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/wso2/fhir-server/tree/main/website/',
+          editUrl: 'https://github.com/wso2/fhir-server/edit/main/website/',
         },
         blog: false,
         theme: {

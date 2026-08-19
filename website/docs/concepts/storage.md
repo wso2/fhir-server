@@ -28,7 +28,7 @@ The current representation is identified by tenant, FHIR resource type, and logi
 
 Creates, updates, and deletes append a complete resource snapshot to `resource_history`. This supports:
 
-- Version-specific reads with `/_history/{version}`.
+- Version-specific reads with `/{type}/{id}/_history/{version}`.
 - Instance and type history interactions.
 - Optimistic concurrency with weak ETags and `If-Match`.
 - Audit and reconciliation workflows at the resource-store level.

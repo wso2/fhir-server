@@ -12,7 +12,7 @@ The server validates basic FHIR resource structure and can apply loaded profile 
 Validate a resource without storing it:
 
 ```bash
-curl -sS -X POST "http://localhost:9090/fhir/r4/Observation/$validate" \
+curl -sS -X POST 'http://localhost:9090/fhir/r4/Observation/$validate' \
   -H "Content-Type: application/fhir+json" \
   -d '{
     "resourceType": "Observation",

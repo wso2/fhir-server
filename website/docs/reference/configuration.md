@@ -39,6 +39,8 @@ logging:
   level: info
 
 database:
+  # local development only - use unique credentials and TLS (sslmode=require or
+  # stricter) in any shared or production environment
   url: postgres://fhir:fhir@localhost:5432/fhirdb?sslmode=disable
   createTables: false
   planCacheMode: force_custom_plan

@@ -15,13 +15,13 @@ Check liveness (the process is up and serving HTTP):
 curl -i http://localhost:9090/health/live
 ```
 
-Check readiness (the instance can accept FHIR traffic):
+Check readiness (startup work has completed):
 
 ```bash
 curl -i http://localhost:9090/health/ready
 ```
 
-A `200 OK` readiness response indicates required initialization has completed. During startup, Implementation Guide loading and registry preparation can keep readiness closed after the listener is available, while liveness already returns `200 OK`.
+A `200 OK` readiness response indicates startup has completed, including Implementation Guide package loading, which runs in the background and can keep readiness closed after the listener is available while liveness already returns `200 OK`. Readiness does not probe PostgreSQL or other runtime dependencies on each request; monitor database availability separately.
 
 ## Structured logs
 

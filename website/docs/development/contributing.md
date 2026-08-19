@@ -14,7 +14,7 @@ make build
 make test
 ```
 
-Required development tools include Go 1.25 or later and PostgreSQL 14 or later. Docker can provide the database used by integration tests.
+Required development tools include Go 1.25 or later, PostgreSQL 14 or later, and [golangci-lint](https://golangci-lint.run) for `make lint`. Docker can provide the database used by integration tests.
 
 ## Development workflow
 

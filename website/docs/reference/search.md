@@ -18,7 +18,7 @@ Parameters are combined with AND semantics. Repeated or comma-separated values f
 | Type | Examples and behavior |
 | --- | --- |
 | String | Case-insensitive prefix by default; supports `:exact` and `:contains` |
-| Token | Code, `system|code`, identifier, and text matching |
+| Token | Code, `system\|code`, identifier, and text matching |
 | Date | Partial precision and `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` prefixes |
 | Number | Precision-aware numeric comparisons |
 | Quantity | Numeric comparisons with system and unit handling, including UCUM canonicalization |
