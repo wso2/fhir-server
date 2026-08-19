@@ -6,7 +6,7 @@ const config: Config = {
   title: 'WSO2 FHIR Server',
   tagline: 'A production-oriented FHIR R4 REST server built in Go and backed by PostgreSQL',
   url: 'https://wso2.github.io',
-  baseUrl: '/fhir-server/',
+  baseUrl: '/',
   organizationName: 'wso2',
   projectName: 'fhir-server',
   onBrokenLinks: 'throw',
