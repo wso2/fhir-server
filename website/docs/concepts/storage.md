@@ -1,57 +1,34 @@
 ---
 title: Storage model
-description: Learn how FHIR resources, history, and search values are represented in PostgreSQL.
+description: How FHIR resources, history, and search values live in your PostgreSQL database.
 ---
 
 # Storage model
 
-All FHIR resource types share one primary table. Searchable values are projected into typed relational indexes at write time.
+Everything the server stores lives in a small, fixed set of PostgreSQL tables — around a dozen, no matter how many resource types you use. Adding a new resource type, profile, or search parameter never requires a schema migration.
 
-## Core tables
+## What this means for you
+
+- **One database to operate.** Backups, monitoring, and capacity planning cover a handful of tables, not one table per resource type.
+- **Nothing to migrate when your data model grows.** Start storing a new resource type, load a new Implementation Guide, or add a custom SearchParameter without touching the schema.
+- **Every write is atomic.** A resource, its history snapshot, and its search-index entries commit in one transaction — a resource is never searchable in a state that was not stored.
+- **Full version history.** Creates, updates, and deletes append immutable snapshots, which is what powers versioned reads (`/{type}/{id}/_history/{version}`), history interactions, optimistic locking with `If-Match`, and audit workflows. Deletes are soft, so history stays available.
+
+## The tables you will see
+
+Operators looking at the database will find:
 
 | Table | Purpose |
 | --- | --- |
-| `resources` | Current JSONB representation and metadata for every resource |
-| `resource_history` | Immutable snapshots for versioned reads and history |
-| `sp_*` | Typed search values extracted from resources |
+| `resources` | Current JSON representation and metadata for every resource |
+| `resource_history` | Immutable version snapshots |
+| `sp_string`, `sp_token`, `sp_date`, `sp_number`, `sp_quantity`, `sp_uri`, `sp_reference`, `sp_coords` | Typed search values extracted at write time |
 | `search_param_definitions` | Base, IG-provided, and custom SearchParameter definitions |
-| `ig_packages` | Loaded FHIR package records |
-| `ig_profiles` | StructureDefinitions available for profile validation |
-| `base_definitions` | Base FHIR R4 StructureDefinitions |
+| `ig_packages`, `ig_profiles`, `base_definitions` | Loaded FHIR packages and StructureDefinitions |
 | `schema_version` | Applied schema revision |
 
-## Resource identity
-
-The current representation is identified by tenant, FHIR resource type, and logical ID. Metadata tracks the current version and last-updated instant. Deletes are soft deletes so history remains available.
-
-## Version history
-
-Creates, updates, and deletes append a complete resource snapshot to `resource_history`. This supports:
-
-- Version-specific reads with `/{type}/{id}/_history/{version}`.
-- Instance and type history interactions.
-- Optimistic concurrency with weak ETags and `If-Match`.
-- Audit and reconciliation workflows at the resource-store level.
-
-## Search indexes
-
-The server does not scan arbitrary JSON for normal FHIR search. It stores extracted values in tables shaped for FHIR matching semantics:
-
-- `sp_string`
-- `sp_token`
-- `sp_date`
-- `sp_number`
-- `sp_quantity`
-- `sp_uri`
-- `sp_reference`
-- `sp_coords`
-
-This shifts work to writes and produces bounded, index-oriented reads. Resource storage, history, and index refreshes share the same transaction.
-
-:::note
-A full-document JSONB GIN index is intentionally absent. Search is implemented through the typed indexes, while full-text behavior uses the dedicated search vector.
-:::
+Search never scans raw JSON: queries resolve against the typed `sp_*` indexes first and load the matching documents last, which keeps search latency predictable as data grows.
 
 ## Schema management
 
-The canonical schema is [`internal/db/schema.sql`](https://github.com/wso2/fhir-server/blob/main/internal/db/schema.sql). It is idempotent, but production deployments should apply schema changes out of band with a controlled database role.
+The canonical schema is [`internal/db/schema.sql`](https://github.com/wso2/fhir-server/blob/main/internal/db/schema.sql). It is idempotent; production deployments should apply schema changes out of band with a controlled database role rather than granting the runtime role DDL privileges.
