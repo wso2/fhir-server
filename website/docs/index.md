@@ -4,12 +4,12 @@ description: A production-oriented FHIR R4 REST server built in Go and backed by
 slug: /
 ---
 
-# Build on a focused FHIR R4 foundation
+# WSO2 FHIR Server
 
-WSO2 FHIR Server stores, validates, searches, and versions FHIR R4 resources through a standards-aligned REST API. It is a single Go binary backed by PostgreSQL, with a normalized search index designed for predictable query performance.
+A blazing-fast, lightweight FHIR server written in Go. It stores, validates, searches, and versions FHIR R4 resources through a standards-aligned REST API, running as a single binary backed by PostgreSQL.
 
   - [**Run it locally**](./get-started/quickstart.md) — Start PostgreSQL and the server with Docker Compose, then create your first Patient.
-  - [**Understand the design**](./concepts/architecture.md) — Follow requests from the HTTP API through validation, storage, indexing, and search.
+  - [**Understand the architecture**](./concepts/architecture.md) — See how the server, database, and search fit together in a deployment.
   - [**Use the FHIR API**](./reference/api.md) — Work with CRUD, history, transactions, validation, search, and FHIR operations.
   - [**See what you can store**](./reference/resource-types.md) — Every FHIR R4 resource type is supported out of the box; browse them by clinical purpose.
 
@@ -20,7 +20,6 @@ WSO2 FHIR Server stores, validates, searches, and versions FHIR R4 resources thr
 | FHIR version | R4 (4.0.1) |
 | Runtime | Go 1.25 |
 | Database | PostgreSQL 14 through 18 |
-| Resource model | JSONB resources with normalized typed search indexes |
 | API formats | FHIR JSON, XML, and Turtle where supported |
 | Tenancy | Dedicated deployments or logical tenant isolation |
 | Extensibility | Custom SearchParameters and FHIR Implementation Guides |

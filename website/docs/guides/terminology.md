@@ -5,11 +5,11 @@ description: Connect the FHIR server to an external terminology service.
 
 # Terminology integration
 
-WSO2 FHIR Server stores clinical resources but delegates terminology reasoning to a FHIR terminology service. This keeps ValueSet expansion, code validation, and subsumption outside the resource-store runtime.
+WSO2 FHIR Server supports terminology-backed searches — ValueSet membership and CodeSystem hierarchy filters — by connecting to an external FHIR terminology service. Point the server at a terminology endpoint and the `:in`, `:not-in`, `:below`, and `:above` token search modifiers become available.
 
 ## Configure the service
 
-Set the terminology server base URL with the `FHIR_TERMINOLOGY_URL` environment variable. When it is unset, terminology-backed search modifiers are disabled:
+Set the terminology server base URL with the `FHIR_TERMINOLOGY_URL` environment variable (env only — there is no YAML key). When it is unset, the server runs normally but terminology-backed search modifiers return an error instead of failing silently:
 
 ```bash
 export FHIR_TERMINOLOGY_URL="https://tx.example.org/fhir"

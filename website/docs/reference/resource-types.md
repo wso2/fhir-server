@@ -19,7 +19,7 @@ curl -X POST http://localhost:9090/fhir/r4/Observation \
   -d '{"resourceType": "Observation", "status": "final", "code": {"text": "Heart rate"}}'
 ```
 
-There is no per-type enablement step. All resource types share the same storage tables, so using a type for the first time requires no migration or configuration. By default, each incoming resource is validated against the base R4 StructureDefinition for its type, which the server ships and loads at startup (`FHIR_BASE_VALIDATION=false` disables this).
+There is no per-type enablement step. Using a type for the first time requires no migration or configuration. By default, each incoming resource is validated against the base R4 StructureDefinition for its type, which the server ships and loads at startup (`FHIR_BASE_VALIDATION=false` disables this).
 
 :::tip
 The authoritative list for a running server is its CapabilityStatement: `GET /metadata`. Clients should prefer it over documentation, since deployments may add Implementation Guides and custom SearchParameters.
@@ -52,12 +52,9 @@ Support for storage and CRUD is uniform, but a few capabilities are richer for c
 - **Compartments.** `GET /Patient/{id}/*` style compartment search is available for the Patient, Encounter, and Practitioner compartments.
 - **Profiles.** Loading an [Implementation Guide](../guides/implementation-guides.md) adds profile [validation](../guides/validation.md) on top of base R4 validation for the types it constrains.
 
-## Why it works this way
-
-The storage layer does not model each resource type as its own table. Resources live as JSONB rows in shared resource and history tables, with search values extracted into normalized, typed index tables. That design is what makes every type available out of the box and keeps new profiles and types migration-free — see [Storage](../concepts/storage.md) and [Architecture](../concepts/architecture.md) for the details.
-
 ## Where to go next
 
 - [FHIR API reference](./api.md) — the operations available on every resource endpoint.
 - [Search](./search.md) — how to query what you have stored.
 - [Quickstart](../get-started/quickstart.md) — a running server in one command.
+- [Storage](../concepts/storage.md) — how resources are stored, for readers who want the details behind the migration-free design.

@@ -41,8 +41,6 @@ For example:
 curl -sS "http://localhost:9090/t/acme/fhir/r4/Patient"
 ```
 
-The server sets the tenant scope on each transaction before accessing protected tables.
-
 Set `BASE_URL` to the bare FHIR base URL without a tenant prefix. The server inserts `/t/{tenant}` into generated links (search Bundles, `Location` headers, the CapabilityStatement) automatically for tenant-prefixed requests.
 
 :::warning
