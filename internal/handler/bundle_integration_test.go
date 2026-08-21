@@ -178,6 +178,98 @@ func TestIntegration_Transaction_PutCreatesMissingResource(t *testing.T) {
 	rd.Body.Close()
 }
 
+// ─── Conditional update with If-Match: zero matches must not create ────────────
+
+func TestIntegration_Transaction_ConditionalPutIfMatchZeroMatchFails(t *testing.T) {
+	srv := newRealServer(t)
+
+	bundle := map[string]any{
+		"resourceType": "Bundle",
+		"type":         "transaction",
+		"entry": []any{
+			map[string]any{
+				"fullUrl":  "urn:uuid:sibling",
+				"resource": map[string]any{"resourceType": "Patient", "name": []any{map[string]any{"family": "IfMatchZeroMatch"}}},
+				"request":  map[string]any{"method": "POST", "url": "Patient"},
+			},
+			// Conditional update that matches nothing but asserts a version via
+			// If-Match: the precondition cannot hold against a missing resource,
+			// so the entry must fail (not create) and roll the transaction back.
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Patient", "active": true},
+				"request": map[string]any{
+					"method":  "PUT",
+					"url":     "Patient?family=NoSuchFamilyAnywhere",
+					"ifMatch": "W/\"3\"",
+				},
+			},
+		},
+	}
+
+	resp := iDo(t, srv, http.MethodPost, "/fhir/r4", bundle)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected transaction to fail, got 200")
+	}
+	body := iJSON(t, resp)
+	if body["resourceType"] != "OperationOutcome" {
+		t.Fatalf("want OperationOutcome on failure, got %v", body["resourceType"])
+	}
+
+	search := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=IfMatchZeroMatch", nil)
+	sbody := iJSON(t, search)
+	if total, _ := sbody["total"].(float64); total != 0 {
+		t.Errorf("rollback failed: found %v sibling Patients that should not exist", total)
+	}
+}
+
+func TestIntegration_Batch_ConditionalPutIfMatchZeroMatchFailsEntry(t *testing.T) {
+	srv := newRealServer(t)
+
+	bundle := map[string]any{
+		"resourceType": "Bundle",
+		"type":         "batch",
+		"entry": []any{
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Patient", "name": []any{map[string]any{"family": "BatchIfMatchSibling"}}},
+				"request":  map[string]any{"method": "POST", "url": "Patient"},
+			},
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Patient", "active": true},
+				"request": map[string]any{
+					"method":  "PUT",
+					"url":     "Patient?family=NoSuchFamilyAnywhere",
+					"ifMatch": "W/\"3\"",
+				},
+			},
+		},
+	}
+
+	resp := iDo(t, srv, http.MethodPost, "/fhir/r4", bundle)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("batch: want 200, got %d", resp.StatusCode)
+	}
+	body := iJSON(t, resp)
+	entries, _ := body["entry"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("want 2 response entries, got %d", len(entries))
+	}
+	first, _ := entries[0].(map[string]any)["response"].(map[string]any)
+	if status, _ := first["status"].(string); !strings.HasPrefix(status, "201") {
+		t.Errorf("sibling POST: want 201, got %q", status)
+	}
+	second, _ := entries[1].(map[string]any)["response"].(map[string]any)
+	if status, _ := second["status"].(string); strings.HasPrefix(status, "2") {
+		t.Errorf("conditional PUT with If-Match on zero matches must fail, got %q", status)
+	}
+
+	// Nothing was created by the failing entry.
+	search := iDo(t, srv, http.MethodGet, "/fhir/r4/Patient?family=NoSuchFamilyAnywhere", nil)
+	sbody := iJSON(t, search)
+	if total, _ := sbody["total"].(float64); total != 0 {
+		t.Errorf("conditional PUT with If-Match created a resource: total=%v", total)
+	}
+}
+
 // ─── Batch: independent entries ────────────────────────────────────────────────
 
 func TestIntegration_Batch_IndependentEntries(t *testing.T) {
