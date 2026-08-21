@@ -748,7 +748,7 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resource, err := h.store.Update(r.Context(), rt, id, body, ifMatchVersion)
+	resource, created, err := h.store.UpdateOrCreate(r.Context(), rt, id, body, ifMatchVersion)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -759,6 +759,11 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("ETag", fmt.Sprintf(`W/"%s"`, versionFromMeta(resource)))
+	if created {
+		w.Header().Set("Location", fmt.Sprintf("%s/%s/%s/_history/1", h.tenantBaseURL(r.Context()), rt, id))
+		writeFHIR(w, r, http.StatusCreated, resource)
+		return
+	}
 	writeFHIR(w, r, http.StatusOK, resource)
 }
 
@@ -1353,7 +1358,7 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 			},
 			"versioning":        "versioned",
 			"readHistory":       true,
-			"updateCreate":      false,
+			"updateCreate":      true,
 			"conditionalCreate": true,
 			"conditionalUpdate": true,
 			"conditionalDelete": "single",

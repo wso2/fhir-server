@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -36,6 +37,7 @@ type mockStore struct {
 	getVersionFn        func(ctx context.Context, rt, id string, vid int) (map[string]any, error)
 	createFn            func(ctx context.Context, rt string, body map[string]any) (map[string]any, error)
 	updateFn            func(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, error)
+	updateOrCreateFn    func(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error)
 	patchFn             func(ctx context.Context, rt, id string, patch map[string]any) (map[string]any, error)
 	deleteFn            func(ctx context.Context, rt, id string) error
 	getHistoryFn        func(ctx context.Context, rt, id string) ([]store.HistoryEntry, error)
@@ -60,6 +62,9 @@ func (m *mockStore) Create(ctx context.Context, rt string, body map[string]any) 
 }
 func (m *mockStore) Update(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, error) {
 	return m.updateFn(ctx, rt, id, body, ifMatchVersion)
+}
+func (m *mockStore) UpdateOrCreate(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+	return m.updateOrCreateFn(ctx, rt, id, body, ifMatchVersion)
 }
 func (m *mockStore) Patch(ctx context.Context, rt, id string, patch map[string]any) (map[string]any, error) {
 	return m.patchFn(ctx, rt, id, patch)
@@ -138,6 +143,28 @@ func doWithCT(t *testing.T, h http.Handler, method, path string, body any, conte
 	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
 	if body != nil {
 		req.Header.Set("Content-Type", contentType)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+func doWithHeaders(t *testing.T, h http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var bodyBytes []byte
+	if body != nil {
+		var err error
+		bodyBytes, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/fhir+json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -446,9 +473,9 @@ func TestCreate_RequiredFields_AllergyIntolerance_Valid(t *testing.T) {
 
 func TestUpdate_Success(t *testing.T) {
 	ms := &mockStore{}
-	ms.updateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, error) {
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, bool, error) {
 		body["meta"] = map[string]any{"versionId": "2"}
-		return body, nil
+		return body, false, nil
 	}
 
 	h := newRouter(ms)
@@ -459,15 +486,40 @@ func TestUpdate_Success(t *testing.T) {
 	}
 }
 
-func TestUpdate_NotFound(t *testing.T) {
+func TestUpdate_CreatesWhenMissing(t *testing.T) {
 	ms := &mockStore{}
-	ms.updateFn = func(_ context.Context, rt, id string, _ map[string]any, _ int) (map[string]any, error) {
-		return nil, store.NotFoundError{ResourceType: rt, ResourceID: id}
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, bool, error) {
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, true, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{"resourceType": "Patient", "id": "new-id", "active": true}
+	w := do(t, h, http.MethodPut, "/fhir/r4/Patient/new-id", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+	if loc := w.Header().Get("Location"); !strings.HasSuffix(loc, "/Patient/new-id/_history/1") {
+		t.Errorf("want Location ending in /Patient/new-id/_history/1, got %q", loc)
+	}
+	if et := w.Header().Get("ETag"); et != `W/"1"` {
+		t.Errorf(`want ETag W/"1", got %q`, et)
+	}
+}
+
+func TestUpdate_IfMatchMissingResourceIs404(t *testing.T) {
+	ms := &mockStore{}
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, _ map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+		if ifMatchVersion != 2 {
+			t.Errorf("want ifMatchVersion=2 passed through, got %d", ifMatchVersion)
+		}
+		return nil, false, store.NotFoundError{ResourceType: rt, ResourceID: id}
 	}
 
 	h := newRouter(ms)
 	payload := map[string]any{"resourceType": "Patient", "id": "missing"}
-	w := do(t, h, http.MethodPut, "/fhir/r4/Patient/missing", payload)
+	w := doWithHeaders(t, h, http.MethodPut, "/fhir/r4/Patient/missing", payload,
+		map[string]string{"If-Match": `W/"2"`})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", w.Code)
 	}
