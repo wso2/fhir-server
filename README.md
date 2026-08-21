@@ -533,7 +533,7 @@ Holds the core FHIR R4 resource StructureDefinitions (one row per resource type)
 |---|---|---|
 | `ETag` | Read, Create, Update, Patch | `W/"<version_id>"` e.g. `W/"3"` |
 | `Location` | Create, Update-as-create | `{baseURL}/{type}/{id}/_history/1` |
-| `Content-Type` | All responses | `application/fhir+json` |
+| `Content-Type` | All responses | `application/fhir+json` by default; `application/fhir+xml` or `application/fhir+turtle` when negotiated via `Accept`/`_format` |
 
 ### If-Match (optimistic locking)
 
