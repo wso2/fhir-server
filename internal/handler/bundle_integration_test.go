@@ -207,8 +207,8 @@ func TestIntegration_Transaction_ConditionalPutIfMatchZeroMatchFails(t *testing.
 	}
 
 	resp := iDo(t, srv, http.MethodPost, "/fhir/r4", bundle)
-	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("expected transaction to fail, got 200")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for If-Match against a missing target, got %d", resp.StatusCode)
 	}
 	body := iJSON(t, resp)
 	if body["resourceType"] != "OperationOutcome" {
@@ -258,8 +258,8 @@ func TestIntegration_Batch_ConditionalPutIfMatchZeroMatchFailsEntry(t *testing.T
 		t.Errorf("sibling POST: want 201, got %q", status)
 	}
 	second, _ := entries[1].(map[string]any)["response"].(map[string]any)
-	if status, _ := second["status"].(string); strings.HasPrefix(status, "2") {
-		t.Errorf("conditional PUT with If-Match on zero matches must fail, got %q", status)
+	if status, _ := second["status"].(string); !strings.HasPrefix(status, "404") {
+		t.Errorf("conditional PUT with If-Match on zero matches must return 404, got %q", status)
 	}
 
 	// Nothing was created by the failing entry.
