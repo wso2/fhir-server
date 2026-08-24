@@ -43,7 +43,9 @@ var (
 // datatype (HumanName, CodeableConcept, Extension, …), or nil when the name is
 // not a shipped datatype. Unlike the resource definitions, the datatype bundle
 // is small and never customized, so it is decoded from the embedded file and
-// compiled in memory on first use — no database involved.
+// compiled in memory on first use — no database involved. The embedded artifact
+// is generated — never hand-edited — by scripts/refresh-definitions.py
+// (make refresh-definitions).
 func Datatype(name string) *validate.Profile {
 	datatypesOnce.Do(func() {
 		m, err := decodeDatatypes()

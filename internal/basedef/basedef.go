@@ -20,7 +20,8 @@
 //
 // The definitions come from the official R4 `profiles-resources` bundle, stored
 // compressed in this package (profiles-resources.min.json.gz) and decompressed
-// at load time. Only base resource definitions are kept — entries with
+// at load time. The artifact is generated — never hand-edited — by
+// scripts/refresh-definitions.py (make refresh-definitions). Only base resource definitions are kept — entries with
 // kind=="resource" and derivation=="specialization" (i.e. the 147 base resource
 // types, not datatypes or constraint profiles).
 package basedef
