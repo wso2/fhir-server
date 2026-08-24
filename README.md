@@ -260,8 +260,10 @@ ig:
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
 | *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#10-terminology). |
-| *(env only)* | `FHIR_VALIDATE_ON_WRITE` | `false` | Enforce **profile** validation (against `meta.profile`) on create/update. Off by default. See [Validation rules](#validation-rules). |
-| *(env only)* | `FHIR_BASE_VALIDATION` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing). On by default; set to `false` to disable. See [Validation rules](#validation-rules). |
+| `validation.base` | `FHIR_VALIDATION_BASE` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing, primitive types). Set to `false` to disable. Legacy env name `FHIR_BASE_VALIDATION` is still honored. See [Validation rules](#validation-rules). |
+| `validation.profile` | `FHIR_VALIDATION_PROFILE` | `false` | Enforce **profile** validation (against `meta.profile`) on create/update. Legacy env name `FHIR_VALIDATE_ON_WRITE` is still honored. See [Validation rules](#validation-rules). |
+| `validation.referentialIntegrityOnWrite` | `FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE` | `true` | Reject a create/update/patch whose local literal references (`Patient/123`) do not resolve to a live resource (422). Disable for out-of-order bulk loads. See [Referential integrity](#referential-integrity). |
+| `validation.referentialIntegrityOnDelete` | `FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE` | `true` | Reject deleting a resource that live resources still reference (409 Conflict, naming referrers). See [Referential integrity](#referential-integrity). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
@@ -786,7 +788,22 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 
 **Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#7-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. It also enforces the FHIR JSON representation rules: primitive values must match their declared type's JSON kind and lexical form (booleans as JSON booleans, integers without fractions and in range, dates/times/codes/ids matching the spec regexes), arrays only where elements repeat, no `null`/empty values (`""`, `{}`, `[]`, `[null]` without an extension fill), and well-formed `_field` primitive-extension pairing. Complex-datatype interiors (HumanName, CodeableConcept, …) are checked against an embedded copy of the R4 datatype definitions. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
 
-**Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#11-implementation-guides). It is off by default and is independent of base validation.
+**Profile validation** (`validation.profile: true` / `FHIR_VALIDATION_PROFILE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#11-implementation-guides). It is off by default and is independent of base validation.
+
+All validation toggles live under the `validation:` block of the config file (or the matching `FHIR_VALIDATION_*` env vars — see [Configuration Reference](#4-configuration-reference)). The legacy env names `FHIR_BASE_VALIDATION` and `FHIR_VALIDATE_ON_WRITE` keep working; the `FHIR_VALIDATION_*` name wins if both are set.
+
+### Referential integrity
+
+The store enforces referential integrity on writes and deletes, both **on by default** and independently switchable (`validation.referentialIntegrityOnWrite` / `validation.referentialIntegrityOnDelete`):
+
+- **On write (422).** Every local literal reference (`Patient/123`, including versioned `Patient/123/_history/2`) carried by a created, updated, or patched resource must resolve to a live (non-deleted) resource. Violations return a 422 OperationOutcome naming the reference, its element path, and the referencing resource. Only local literal references are existence-checked: absolute URLs to other servers, `urn:` values, internal fragments (`#contained`), conditional references (`Patient?identifier=…`), and logical (identifier-only) references are never resolved. `Bundle`-typed resources are exempt (their entry references are entry-local, not server-local).
+- **On delete (409).** A resource cannot be deleted while live resources still reference it through an indexed reference search parameter (`sp_reference`). Violations return a 409 Conflict OperationOutcome naming a sample of the referrers. Delete or re-point the referrers first — or disable the check.
+
+Checks run **inside the write transaction, after all entries are applied**, so transaction Bundles are order-independent: a Bundle may create an Observation and the Patient it references in any order, or delete a Patient while re-pointing its referrers in the same transaction. A violation rolls the whole transaction back. In batch Bundles each entry is checked on its own; a violating entry fails alone.
+
+When both checks are enabled the CapabilityStatement advertises `referencePolicy: ["literal", "logical", "enforced"]`.
+
+Disable `referentialIntegrityOnWrite` when loading datasets whose resources arrive out of order across requests (e.g. Synthea exports uploaded file-by-file); single transaction Bundles with internal references do **not** need it disabled.
 
 ---
 

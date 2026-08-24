@@ -80,12 +80,13 @@ func defaultWriteTuning() WriteTuning {
 }
 
 type Store struct {
-	pool        *pgxpool.Pool
-	extractor   *index.Extractor
-	registry    *searchparam.Registry
-	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
-	tuning      SearchTuning
-	writeTuning WriteTuning
+	pool         *pgxpool.Pool
+	extractor    *index.Extractor
+	registry     *searchparam.Registry
+	terminology  *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning       SearchTuning
+	writeTuning  WriteTuning
+	refIntegrity RefIntegrity
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
@@ -217,6 +218,11 @@ type bundleWriter struct {
 	resources [][]any // deferred resources creates
 	history   [][]any // every create/update/patch/delete history row
 
+	// Referential-integrity bookkeeping (populated only when the matching
+	// RefIntegrity flag is on; verified post-flush by Store.verifyIntegrity).
+	refs    []pendingRef // local literal references carried by written resources
+	deletes [][2]string  // (resourceType, id) soft-deleted in this transaction
+
 	maxRowsPerStmt   int
 	maxRowsPerBundle int
 }
@@ -284,6 +290,17 @@ func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
 	return qb.Send(ctx, tx)
 }
 
+// flushAndVerify flushes the buffered writes and then runs the enabled
+// referential-integrity checks against the transaction's final state. Every
+// write path (single CRUD and Bundle processing) funnels through this so no
+// path can skip enforcement.
+func (s *Store) flushAndVerify(ctx context.Context, tx pgx.Tx, w *bundleWriter) error {
+	if err := w.flush(ctx, tx); err != nil {
+		return err
+	}
+	return s.verifyIntegrity(ctx, tx, w)
+}
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error) {
@@ -305,7 +322,7 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -359,6 +376,9 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 	}
 
 	s.extractor.Extract(w.rs, resourceType, resourceID, body, now)
+	if s.refIntegrity.OnWrite {
+		w.refs = append(w.refs, collectLocalRefs(resourceType, resourceID, body)...)
+	}
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, 1, "POST", raw, now})
 
 	return body, nil
@@ -418,7 +438,7 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -457,7 +477,7 @@ func (s *Store) UpdateOrCreate(ctx context.Context, resourceType, resourceID str
 	if err != nil {
 		return nil, false, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, false, err
 	}
 
@@ -523,6 +543,9 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 // rest. If the stored JSON cannot be parsed it falls back to the full
 // clear-and-reinsert of every table.
 func (s *Store) mergeReindex(w *bundleWriter, resourceType, resourceID string, oldRaw []byte, body map[string]any, lastUpdated time.Time) {
+	if s.refIntegrity.OnWrite {
+		w.refs = append(w.refs, collectLocalRefs(resourceType, resourceID, body)...)
+	}
 	// Unbounded (cap 0): the stored version already passed the row cap when it
 	// was written, and a LimitHit from re-extracting it must not abort this
 	// transaction — only the incoming version's rows count against the cap.
@@ -562,7 +585,7 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -672,7 +695,7 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 	if err := s.deleteInTx(ctx, tx, resourceType, resourceID, w); err != nil {
 		return err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return err
 	}
 
@@ -707,6 +730,9 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	}
 	if isDeleted {
 		return nil // idempotent: already deleted
+	}
+	if s.refIntegrity.OnDelete {
+		w.deletes = append(w.deletes, [2]string{resourceType, resourceID})
 	}
 
 	// DELETE is a new version in FHIR — bump to avoid UNIQUE(fhir_id, resource_type, version_id) conflict.

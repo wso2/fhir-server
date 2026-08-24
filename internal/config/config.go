@@ -38,18 +38,17 @@ import (
 //  2. The YAML configuration file (if one is specified)
 //  3. Built-in defaults
 type Config struct {
-	DatabaseURL     string
-	Port            int
-	BaseURL         string
-	LogLevel        string
-	IGPackages      []string // e.g. ["hl7.fhir.us.core@6.1.0", "hl7.fhir.us.carin-bb@2.0.0"]
-	IGRegistryURL   string   // default: https://packages.fhir.org
-	IGForceReload   bool     // re-load IGs even if already recorded in ig_packages
-	IGCacheDir      string   // local .tgz cache dir (default: .fhir-ig-cache)
-	ValidateOnWrite bool     // enforce profile validation on create/update (default off)
-	BaseValidation  bool     // validate writes against base FHIR R4 StructureDefinitions (default on)
-	TerminologyURL  string   // base URL of the FHIR terminology server for :in/:not-in (empty = disabled)
-	CreateTables    bool     // create database tables on startup (requires a DB role with DDL privileges; default off)
+	DatabaseURL    string
+	Port           int
+	BaseURL        string
+	LogLevel       string
+	IGPackages     []string // e.g. ["hl7.fhir.us.core@6.1.0", "hl7.fhir.us.carin-bb@2.0.0"]
+	IGRegistryURL  string   // default: https://packages.fhir.org
+	IGForceReload  bool     // re-load IGs even if already recorded in ig_packages
+	IGCacheDir     string   // local .tgz cache dir (default: .fhir-ig-cache)
+	Validation     ValidationConfig
+	TerminologyURL string // base URL of the FHIR terminology server for :in/:not-in (empty = disabled)
+	CreateTables   bool   // create database tables on startup (requires a DB role with DDL privileges; default off)
 
 	// HTTP server timeouts. WriteTimeout bounds the WHOLE handler execution in
 	// net/http, so it must accommodate the slowest legitimate request (e.g. a
@@ -75,6 +74,27 @@ type Config struct {
 	// of driving the database out of memory. See docs/performance-tuning.md.
 	WriteMaxRowsPerStatement int // rows per multi-row INSERT; default 1000
 	WriteMaxRowsPerBundle    int // total index rows one transaction may buffer; default 100000
+}
+
+// ValidationConfig groups every write-time validation toggle under one roof:
+// the YAML `validation:` block and the FHIR_VALIDATION_* env vars. Each field
+// resolves env > YAML > default; the legacy env names FHIR_BASE_VALIDATION and
+// FHIR_VALIDATE_ON_WRITE are still honored (the FHIR_VALIDATION_* name wins if
+// both are set).
+type ValidationConfig struct {
+	// Base validates writes against the base FHIR R4 StructureDefinitions
+	// (cardinality, fixed/pattern, slicing, type/shape). Default on.
+	Base bool
+	// Profile validates writes against the profiles named in meta.profile.
+	// Default off.
+	Profile bool
+	// ReferentialIntegrityOnWrite rejects a create/update/patch whose local
+	// literal references ("Type/id") do not resolve to a live resource.
+	// Default on.
+	ReferentialIntegrityOnWrite bool
+	// ReferentialIntegrityOnDelete rejects the delete of a resource that live
+	// resources still reference (409 Conflict). Default on.
+	ReferentialIntegrityOnDelete bool
 }
 
 // FileConfig is the on-disk YAML schema. Each field is optional — anything
@@ -113,6 +133,15 @@ type FileConfig struct {
 		ForceReload *bool    `yaml:"forceReload"` // pointer so absence is distinguishable from `false`
 		CacheDir    string   `yaml:"cacheDir"`
 	} `yaml:"ig"`
+
+	// Write-time validation toggles. Pointers so an absent key is
+	// distinguishable from an explicit `false`.
+	Validation struct {
+		Base                         *bool `yaml:"base"`
+		Profile                      *bool `yaml:"profile"`
+		ReferentialIntegrityOnWrite  *bool `yaml:"referentialIntegrityOnWrite"`
+		ReferentialIntegrityOnDelete *bool `yaml:"referentialIntegrityOnDelete"`
+	} `yaml:"validation"`
 
 	// Search performance tunables. Pointers so an absent key is distinguishable
 	// from an explicit value (matters for maxPageSize, where 0 is meaningful, and
@@ -190,9 +219,26 @@ func resolve(fc *FileConfig) (*Config, error) {
 		igForceReload = strings.EqualFold(v, "true")
 	}
 
-	validateOnWrite := strings.EqualFold(os.Getenv("FHIR_VALIDATE_ON_WRITE"), "true")
-	// Base validation is on by default; set FHIR_BASE_VALIDATION=false to disable.
-	baseValidation := !strings.EqualFold(os.Getenv("FHIR_BASE_VALIDATION"), "false")
+	// Validation toggles: env (FHIR_VALIDATION_* first, then the legacy names)
+	// > YAML `validation:` block > default. Unparseable values fail fast.
+	validation := ValidationConfig{}
+	var err2 error
+	if validation.Base, err2 = resolveBoolSetting(true, fc.Validation.Base,
+		"FHIR_VALIDATION_BASE", "FHIR_BASE_VALIDATION"); err2 != nil {
+		return nil, err2
+	}
+	if validation.Profile, err2 = resolveBoolSetting(false, fc.Validation.Profile,
+		"FHIR_VALIDATION_PROFILE", "FHIR_VALIDATE_ON_WRITE"); err2 != nil {
+		return nil, err2
+	}
+	if validation.ReferentialIntegrityOnWrite, err2 = resolveBoolSetting(true, fc.Validation.ReferentialIntegrityOnWrite,
+		"FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE"); err2 != nil {
+		return nil, err2
+	}
+	if validation.ReferentialIntegrityOnDelete, err2 = resolveBoolSetting(true, fc.Validation.ReferentialIntegrityOnDelete,
+		"FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE"); err2 != nil {
+		return nil, err2
+	}
 	terminologyURL := os.Getenv("FHIR_TERMINOLOGY_URL")
 
 	createTables := false
@@ -261,21 +307,20 @@ func resolve(fc *FileConfig) (*Config, error) {
 	// opt whole workloads into parallel mode without per-request headers.
 
 	return &Config{
-		DatabaseURL:     dbURL,
-		Port:            serverPort,
-		BaseURL:         baseURL,
-		LogLevel:        logLevel,
-		IGPackages:      igPackages,
-		IGRegistryURL:   igRegistry,
-		IGForceReload:   igForceReload,
-		IGCacheDir:      igCacheDir,
-		ValidateOnWrite: validateOnWrite,
-		BaseValidation:  baseValidation,
-		TerminologyURL:  terminologyURL,
-		CreateTables:    createTables,
-		ReadTimeout:     readTimeout,
-		WriteTimeout:    writeTimeout,
-		IdleTimeout:     idleTimeout,
+		DatabaseURL:    dbURL,
+		Port:           serverPort,
+		BaseURL:        baseURL,
+		LogLevel:       logLevel,
+		IGPackages:     igPackages,
+		IGRegistryURL:  igRegistry,
+		IGForceReload:  igForceReload,
+		IGCacheDir:     igCacheDir,
+		Validation:     validation,
+		TerminologyURL: terminologyURL,
+		CreateTables:   createTables,
+		ReadTimeout:    readTimeout,
+		WriteTimeout:   writeTimeout,
+		IdleTimeout:    idleTimeout,
 
 		SearchProbeCap:        probeCap,
 		SearchDefaultPageSize: defaultPageSize,
@@ -286,6 +331,31 @@ func resolve(fc *FileConfig) (*Config, error) {
 		WriteMaxRowsPerStatement: writeMaxRowsPerStatement,
 		WriteMaxRowsPerBundle:    writeMaxRowsPerBundle,
 	}, nil
+}
+
+// resolveBoolSetting resolves a boolean setting: the first set env var (in the
+// given order — canonical name first, then any legacy alias) wins, then the
+// YAML value, then the default. A set-but-unparseable env value fails fast
+// naming the variable, consistent with the numeric tunables.
+func resolveBoolSetting(def bool, fileVal *bool, envVars ...string) (bool, error) {
+	for _, name := range envVars {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		switch strings.ToLower(raw) {
+		case "true", "1", "yes", "on":
+			return true, nil
+		case "false", "0", "no", "off":
+			return false, nil
+		default:
+			return false, fmt.Errorf("invalid %s %q: must be true or false", name, raw)
+		}
+	}
+	if fileVal != nil {
+		return *fileVal, nil
+	}
+	return def, nil
 }
 
 // resolveIntTunable resolves one integer tunable: env var > config file > default,
