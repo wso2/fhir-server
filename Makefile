@@ -58,6 +58,10 @@ tidy: ## Tidy go.mod / go.sum
 docker: ## Build the Docker image
 	docker build -t $(DOCKER_IMAGE) .
 
+.PHONY: refresh-definitions
+refresh-definitions: ## Regenerate the embedded FHIR R4 definition bundles (internal/basedef/*.gz)
+	python3 scripts/refresh-definitions.py
+
 .PHONY: clean
 clean: ## Remove build artifacts
 	rm -f $(BINARY)

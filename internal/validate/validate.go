@@ -67,6 +67,23 @@ type sliceEntry struct {
 	min     int
 }
 
+// elemInfo is the per-element type metadata used by instance type/shape
+// checking (CheckTypes): the declared type codes, whether the element repeats,
+// and a contentReference target for BackboneElement reuse (e.g.
+// Questionnaire.item.item → #Questionnaire.item).
+type elemInfo struct {
+	types      []string
+	repeats    bool
+	contentRef string
+}
+
+// choiceElem is one choice-typed element ("value[x]") within a parent path,
+// indexed so instance keys like "valueBoolean" can be resolved to it.
+type choiceElem struct {
+	base string // element name without the [x] marker, e.g. "value"
+	path string // full SD path, e.g. "Parameters.parameter.value[x]"
+}
+
 // Profile is a compiled StructureDefinition. Everything derived solely from the
 // SD — the constraint map, invariants and slice groups — is extracted once by
 // Compile, so validating many resources of the same type does not re-parse the
@@ -76,6 +93,8 @@ type Profile struct {
 	constraints map[string]elemConstraint
 	invariants  []invariant
 	sliceGroups map[string][]sliceEntry
+	elements    map[string]elemInfo     // SD path → type metadata (first, non-slice entry wins)
+	choices     map[string][]choiceElem // parent SD path → choice elements at that level
 }
 
 // Compile extracts the SD-derived validation data from a StructureDefinition.
@@ -100,6 +119,8 @@ func Compile(sd map[string]any) *Profile {
 		rootType:    rootType,
 		constraints: make(map[string]elemConstraint, len(elements)),
 		sliceGroups: map[string][]sliceEntry{},
+		elements:    make(map[string]elemInfo, len(elements)),
+		choices:     map[string][]choiceElem{},
 	}
 
 	for _, raw := range elements {
@@ -133,6 +154,38 @@ func Compile(sd map[string]any) *Profile {
 			}
 		}
 		p.constraints[path] = c
+
+		// Type metadata for instance type/shape checking. Named slices repeat
+		// their parent element's path with narrower constraints — the base
+		// (first) entry is the one that describes the element itself.
+		sliceName, _ := el["sliceName"].(string)
+		if _, seen := p.elements[path]; !seen && sliceName == "" {
+			info := elemInfo{}
+			if maxV, ok := el["max"].(string); ok {
+				info.repeats = maxV != "1" && maxV != "0"
+			}
+			if ref, _ := el["contentReference"].(string); ref != "" {
+				info.contentRef = strings.TrimPrefix(ref, "#")
+			}
+			if typeArr, _ := el["type"].([]any); len(typeArr) > 0 {
+				for _, tRaw := range typeArr {
+					tm, _ := tRaw.(map[string]any)
+					if tm == nil {
+						continue
+					}
+					if code, _ := tm["code"].(string); code != "" {
+						info.types = append(info.types, normalizeTypeCode(code))
+					}
+				}
+			}
+			p.elements[path] = info
+			if base, ok := strings.CutSuffix(path, "[x]"); ok {
+				if i := strings.LastIndex(base, "."); i > 0 {
+					parent, leaf := base[:i], base[i+1:]
+					p.choices[parent] = append(p.choices[parent], choiceElem{base: leaf, path: path})
+				}
+			}
+		}
 
 		// FHIRPath invariants declared on this element.
 		constArr, _ := el["constraint"].([]any)
