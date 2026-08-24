@@ -89,7 +89,11 @@ func operationOutcome(w http.ResponseWriter, status int, severity, code, diagnos
 	})
 }
 
+// maxRequestBodyBytes caps how much of a request body the server will read.
+const maxRequestBodyBytes = 32 << 20 // 32 MiB
+
 func readBody(r *http.Request) (map[string]any, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		return nil, err
@@ -177,6 +181,7 @@ func requireFHIRContent(w http.ResponseWriter, r *http.Request) bool {
 
 // readFHIRBody parses a request body that may be JSON, XML, or Turtle.
 func readFHIRBody(r *http.Request) (map[string]any, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	ct := r.Header.Get("Content-Type")
 	base := strings.TrimSpace(strings.SplitN(ct, ";", 2)[0])
 	switch base {
@@ -859,6 +864,7 @@ func (h *fhirHandler) fhirPatch(w http.ResponseWriter, r *http.Request, rt, id s
 }
 
 func (h *fhirHandler) xmlPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	xmlBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "cannot read body: "+err.Error())

@@ -58,6 +58,24 @@ func TestToTurtle_RejectsInvalidNames(t *testing.T) {
 	}
 }
 
+func TestFromTurtle_RejectsExcessiveNesting(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("@prefix fhir: <http://hl7.org/fhir/> .\n[ a fhir:Patient ; fhir:x ")
+	const depth = maxTurtleDepth + 50
+	for i := 0; i < depth; i++ {
+		b.WriteString("( ")
+	}
+	b.WriteString(`"v"`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(" )")
+	}
+	b.WriteString(" ] .\n")
+
+	if _, err := FromTurtle([]byte(b.String())); err == nil {
+		t.Fatal("FromTurtle: expected an error for input past the depth limit, got nil")
+	}
+}
+
 func TestTurtle_RoundTrip(t *testing.T) {
 	original := map[string]any{
 		"resourceType": "Observation",
