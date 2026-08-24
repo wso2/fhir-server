@@ -205,6 +205,34 @@ func readFHIRBody(r *http.Request) (map[string]any, error) {
 	return body, nil
 }
 
+// isStructuredContentType reports whether the request body is XML or Turtle
+// (as opposed to JSON, which already carries typed primitives).
+func isStructuredContentType(r *http.Request) bool {
+	base := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0])
+	switch base {
+	case "application/fhir+xml", "application/xml", "application/fhir+turtle", "text/turtle":
+		return true
+	}
+	return false
+}
+
+// coerceStructured normalizes primitive value types for a body parsed from XML
+// or Turtle, using the base StructureDefinition for its resource type.
+func (h *fhirHandler) coerceStructured(ctx context.Context, r *http.Request, body map[string]any) {
+	if body == nil || !isStructuredContentType(r) || h.baseDefs == nil {
+		return
+	}
+	rt, _ := body["resourceType"].(string)
+	if rt == "" {
+		return
+	}
+	prof, err := h.baseDefs.Lookup(ctx, rt)
+	if err != nil || prof == nil {
+		return
+	}
+	prof.CoercePrimitives(body)
+}
+
 func firstVal(params map[string][]string, key string) string {
 	if vs := params[key]; len(vs) > 0 {
 		return vs[0]
@@ -648,6 +676,8 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.coerceStructured(r.Context(), r, body)
+
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
 		return
@@ -733,6 +763,8 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("body id %q does not match URL id %q", bodyID, id))
 		return
 	}
+
+	h.coerceStructured(r.Context(), r, body)
 
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
@@ -932,6 +964,7 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
 		return
 	}
+	h.coerceStructured(r.Context(), r, body)
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
 		return
@@ -1310,6 +1343,7 @@ func (h *fhirHandler) convert(w http.ResponseWriter, r *http.Request) {
 		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid input: "+err.Error())
 		return
 	}
+	h.coerceStructured(r.Context(), r, body)
 	writeFHIR(w, r, http.StatusOK, body)
 }
 
