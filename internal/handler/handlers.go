@@ -1605,14 +1605,7 @@ func isPresent(v any) bool {
 // profile validation against meta.profile runs when validateOnWrite is enabled.
 // Warning-only findings never block a write.
 func (h *fhirHandler) enforceWrite(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
-	var issues []validate.Issue
-	if h.baseValidation {
-		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
-	}
-	if h.validateOnWrite {
-		issues = append(issues, h.profileIssues(r, body)...)
-	}
-
+	issues := h.writeValidationIssues(r, body)
 	blocking := false
 	for _, iss := range issues {
 		if iss.Severity == "error" {
@@ -1625,6 +1618,19 @@ func (h *fhirHandler) enforceWrite(w http.ResponseWriter, r *http.Request, body 
 	}
 	writeIssues(w, r, issues)
 	return true
+}
+
+// writeValidationIssues runs base FHIR R4 and (when enabled) profile validation
+// on a create/update body and returns the findings without writing a response.
+func (h *fhirHandler) writeValidationIssues(r *http.Request, body map[string]any) []validate.Issue {
+	var issues []validate.Issue
+	if h.baseValidation {
+		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	}
+	if h.validateOnWrite {
+		issues = append(issues, h.profileIssues(r, body)...)
+	}
+	return issues
 }
 
 // profileIssues validates body against the profiles named in meta.profile.

@@ -72,6 +72,87 @@ func TestBundle_RoutesAndShapesTransactionResponse(t *testing.T) {
 	}
 }
 
+func TestBundle_RejectsEntryMissingRequiredField(t *testing.T) {
+	called := false
+	ms := &mockStore{
+		executeBundleFn: func(_ context.Context, _, _ string, _ []store.BundleEntryRequest) ([]store.BundleEntryResult, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	h := newRouter(ms)
+	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{
+		"resourceType": "Bundle",
+		"type":         "transaction",
+		"entry": []any{map[string]any{
+			"resource": map[string]any{"resourceType": "Observation", "status": "final"}, // missing code
+			"request":  map[string]any{"method": "POST", "url": "Observation"},
+		}},
+	})
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Error("ExecuteBundle must not run when an entry fails validation")
+	}
+}
+
+func TestBundle_RejectsEntryResourceTypeMismatch(t *testing.T) {
+	called := false
+	ms := &mockStore{
+		executeBundleFn: func(_ context.Context, _, _ string, _ []store.BundleEntryRequest) ([]store.BundleEntryResult, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	h := newRouter(ms)
+	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{
+		"resourceType": "Bundle",
+		"type":         "transaction",
+		"entry": []any{map[string]any{
+			"resource": map[string]any{"resourceType": "Observation", "status": "final", "code": map[string]any{"text": "x"}},
+			"request":  map[string]any{"method": "POST", "url": "Patient"}, // URL says Patient
+		}},
+	})
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Error("ExecuteBundle must not run when an entry's resourceType disagrees with its URL")
+	}
+}
+
+func TestBundle_AcceptsValidEntries(t *testing.T) {
+	called := false
+	ms := &mockStore{
+		executeBundleFn: func(_ context.Context, _, _ string, entries []store.BundleEntryRequest) ([]store.BundleEntryResult, error) {
+			called = true
+			return make([]store.BundleEntryResult, len(entries)), nil
+		},
+	}
+	h := newRouter(ms)
+	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{
+		"resourceType": "Bundle",
+		"type":         "transaction",
+		"entry": []any{
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Patient", "name": []any{map[string]any{"family": "Smith"}}},
+				"request":  map[string]any{"method": "POST", "url": "Patient"},
+			},
+			map[string]any{
+				"resource": map[string]any{"resourceType": "Observation", "status": "final", "code": map[string]any{"text": "x"}},
+				"request":  map[string]any{"method": "POST", "url": "Observation"},
+			},
+		},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("valid bundle status = %d, want 200; body=%s", resp.Code, resp.Body.String())
+	}
+	if !called {
+		t.Error("a fully valid bundle must reach ExecuteBundle")
+	}
+}
+
 func TestBundle_RejectsNonBundle(t *testing.T) {
 	h := newRouter(&mockStore{})
 	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{"resourceType": "Patient"})

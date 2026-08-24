@@ -57,6 +57,11 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if msg := h.validateBundleEntries(r, h.tenantBaseURL(r.Context()), entries); msg != "" {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid", msg)
+		return
+	}
+
 	ctx := r.Context()
 
 	results, err := h.store.ExecuteBundle(ctx, bundleType, h.tenantBaseURL(ctx), entries)
@@ -197,6 +202,42 @@ func parseBundleEntries(bundle map[string]any) ([]store.BundleEntryRequest, stri
 func stringField(m map[string]any, key string) string {
 	if v, ok := m[key].(string); ok {
 		return v
+	}
+	return ""
+}
+
+// validateBundleEntries applies the same content validation the single-resource
+// write path enforces to every resource-bearing Bundle entry: a resourceType
+// that disagrees with the entry's request.url, a missing base-required field, or
+// a base/profile validation error rejects the whole Bundle. It returns an empty
+// string when every entry passes.
+func (h *fhirHandler) validateBundleEntries(r *http.Request, baseURL string, entries []store.BundleEntryRequest) string {
+	for i, e := range entries {
+		method := strings.ToUpper(strings.TrimSpace(e.Method))
+		if method != "POST" && method != "PUT" {
+			continue
+		}
+		if e.Resource == nil {
+			continue
+		}
+		rt, _, _, _, perr := store.ParseEntryURL(baseURL, e.URL)
+		if perr != "" || rt == "" {
+			continue
+		}
+		if bodyRT, ok := e.Resource["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+			return fmt.Sprintf("entry[%d]: body resourceType %q does not match request.url resource type %q", i, bodyRT, rt)
+		}
+		if msg := validateRequiredFields(rt, e.Resource); msg != "" {
+			return fmt.Sprintf("entry[%d]: %s", i, msg)
+		}
+		if _, ok := e.Resource["resourceType"].(string); !ok {
+			e.Resource["resourceType"] = rt
+		}
+		for _, iss := range h.writeValidationIssues(r, e.Resource) {
+			if iss.Severity == "error" {
+				return fmt.Sprintf("entry[%d]: %s", i, iss.Diagnostics)
+			}
+		}
 	}
 	return ""
 }
