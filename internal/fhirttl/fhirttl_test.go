@@ -45,6 +45,19 @@ func TestToTurtle_Basic(t *testing.T) {
 	}
 }
 
+func TestToTurtle_RejectsInvalidNames(t *testing.T) {
+	cases := []map[string]any{
+		{"resourceType": `Patient . fhir:injected "pwned"`, "name": []any{map[string]any{"family": "x"}}},
+		{"resourceType": "Patient", `injected ; fhir:x "y"`: "z"},
+		{"resourceType": "Patient", "name": []any{map[string]any{`family ] . fhir:evil "z"`: "x"}}},
+	}
+	for _, r := range cases {
+		if out, err := ToTurtle(r); err == nil {
+			t.Errorf("ToTurtle(%v): expected error for illegal name, got output %q", r, out)
+		}
+	}
+}
+
 func TestTurtle_RoundTrip(t *testing.T) {
 	original := map[string]any{
 		"resourceType": "Observation",

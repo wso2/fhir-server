@@ -148,6 +148,32 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestToXML_RejectsInvalidElementName(t *testing.T) {
+	cases := []map[string]any{
+		{"resourceType": "Patient", "injected><forged": "x"},
+		{"resourceType": "Patient", "name;evil": "x"},
+		{"resourceType": "Pat ient"},
+		{"resourceType": "Patient?><!--"},
+	}
+	for _, resource := range cases {
+		out, err := ToXML(resource)
+		if err == nil {
+			t.Errorf("ToXML(%v): expected error for illegal name, got output %q", resource, out)
+		}
+	}
+}
+
+func TestToXML_AllowsNormalNames(t *testing.T) {
+	resource := map[string]any{
+		"resourceType": "Patient",
+		"active":       true,
+		"name":         []any{map[string]any{"family": "Smith"}},
+	}
+	if _, err := ToXML(resource); err != nil {
+		t.Fatalf("ToXML of a normal resource must succeed: %v", err)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

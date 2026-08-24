@@ -36,10 +36,21 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 )
 
 const fhirNS = "http://hl7.org/fhir"
+
+// validFHIRElementName matches the ASCII-identifier grammar FHIR element names
+// and resourceType values use.
+var validFHIRElementName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
+
+// isValidElementName reports whether name is a legal FHIR element name /
+// resourceType value.
+func isValidElementName(name string) bool {
+	return validFHIRElementName.MatchString(name)
+}
 
 // ToXML converts a FHIR JSON map to FHIR XML bytes.
 func ToXML(resource map[string]any) ([]byte, error) {
@@ -91,6 +102,9 @@ func FromXML(data []byte) (map[string]any, error) {
 // ─── Encoder ──────────────────────────────────────────────────────────────────
 
 func encodeElement(enc *xml.Encoder, name string, value any, isRoot bool) error {
+	if value != nil && !isValidElementName(name) {
+		return fmt.Errorf("invalid element name %q: not a legal FHIR element name", name)
+	}
 	switch v := value.(type) {
 	case map[string]any:
 		start := xml.StartElement{Name: xml.Name{Local: name}}
