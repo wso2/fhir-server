@@ -792,6 +792,12 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 
 // ─── History ──────────────────────────────────────────────────────────────────
 
+// histTenant is the explicit tenant predicate applied to every resource_history
+// read, matching the pattern used for every resources and sp_* read. It binds no
+// placeholder, so argument numbering is unaffected; an unset tenant yields NULL,
+// which matches no rows.
+const histTenant = `tenant_id = current_setting('app.current_tenant', true)`
+
 type HistoryEntry struct {
 	VersionID int
 	Operation string
@@ -808,7 +814,7 @@ func (s *Store) GetHistory(ctx context.Context, resourceType, resourceID string)
 	rows, err := c.Query(ctx, `
 		SELECT version_id, operation, resource_json, recorded_at
 		FROM resource_history
-		WHERE resource_type = $1 AND fhir_id = $2
+		WHERE resource_type = $1 AND fhir_id = $2 AND `+histTenant+`
 		ORDER BY version_id DESC`,
 		resourceType, resourceID,
 	)
@@ -854,26 +860,27 @@ func (s *Store) GetTypeHistory(ctx context.Context, p HistoryParams) (HistoryRes
 	system := p.ResourceType == ""
 	switch {
 	case system && p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history ORDER BY recorded_at DESC LIMIT $1 OFFSET $2`
+		           FROM resource_history WHERE ` + histTenant + `
+		           ORDER BY recorded_at DESC LIMIT $1 OFFSET $2`
 		args = []any{}
 	case system && !p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE recorded_at > $1`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND recorded_at > $1`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE recorded_at > $1
+		           FROM resource_history WHERE ` + histTenant + ` AND recorded_at > $1
 		           ORDER BY recorded_at DESC LIMIT $2 OFFSET $3`
 		args = []any{p.Since}
 	case !system && p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE resource_type = $1`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE resource_type = $1
+		           FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1
 		           ORDER BY recorded_at DESC LIMIT $2 OFFSET $3`
 		args = []any{p.ResourceType}
 	default:
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE resource_type = $1 AND recorded_at > $2`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1 AND recorded_at > $2`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE resource_type = $1 AND recorded_at > $2
+		           FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1 AND recorded_at > $2
 		           ORDER BY recorded_at DESC LIMIT $3 OFFSET $4`
 		args = []any{p.ResourceType, p.Since}
 	}
@@ -915,7 +922,7 @@ func (s *Store) GetVersion(ctx context.Context, resourceType, resourceID string,
 	defer c.Release()
 	err = c.QueryRow(ctx, `
 		SELECT resource_json, recorded_at FROM resource_history
-		WHERE resource_type = $1 AND fhir_id = $2 AND version_id = $3`,
+		WHERE resource_type = $1 AND fhir_id = $2 AND version_id = $3 AND `+histTenant,
 		resourceType, resourceID, versionID,
 	).Scan(&raw, &recordedAt)
 	if err != nil {

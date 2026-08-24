@@ -147,6 +147,54 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
+// TestTenantIsolation_History verifies the history and vread read paths are
+// scoped to the calling tenant, under genuinely enforced Row-Level Security.
+func TestTenantIsolation_History(t *testing.T) {
+	s := appRoleStore(t)
+	ctxA := tenant.WithTenant(context.Background(), "tenant-a")
+	ctxB := tenant.WithTenant(context.Background(), "tenant-b")
+
+	ra, err := s.Create(ctxA, "Patient", map[string]any{
+		"resourceType": "Patient", "name": []any{map[string]any{"family": "Anderson"}},
+	})
+	if err != nil {
+		t.Fatalf("tenant-a create: %v", err)
+	}
+	idA, _ := ra["id"].(string)
+	if _, err := s.Create(ctxB, "Patient", map[string]any{
+		"resourceType": "Patient", "name": []any{map[string]any{"family": "Becker"}},
+	}); err != nil {
+		t.Fatalf("tenant-b create: %v", err)
+	}
+
+	// Instance history of tenant-a's resource is invisible to tenant-b, visible to tenant-a.
+	if h, err := s.GetHistory(ctxB, "Patient", idA); err != nil || len(h) != 0 {
+		t.Fatalf("tenant-b GetHistory of tenant-a id: want 0 entries, got %d (err=%v)", len(h), err)
+	}
+	if h, err := s.GetHistory(ctxA, "Patient", idA); err != nil || len(h) != 1 {
+		t.Fatalf("tenant-a GetHistory of own id: want 1 entry, got %d (err=%v)", len(h), err)
+	}
+
+	// Type-level history is tenant-scoped.
+	rb, err := s.GetTypeHistory(ctxB, store.HistoryParams{ResourceType: "Patient"})
+	if err != nil {
+		t.Fatalf("tenant-b GetTypeHistory: %v", err)
+	}
+	for _, e := range rb.Entries {
+		if familyName(e.Resource) == "Anderson" {
+			t.Fatalf("tenant-b type history leaked tenant-a's resource")
+		}
+	}
+
+	// vread of tenant-a's version is a not-found for tenant-b.
+	if _, err := s.GetVersion(ctxB, "Patient", idA, 1); !errors.As(err, &store.NotFoundError{}) {
+		t.Fatalf("tenant-b vread of tenant-a version: want NotFoundError, got %v", err)
+	}
+	if _, err := s.GetVersion(ctxA, "Patient", idA, 1); err != nil {
+		t.Fatalf("tenant-a vread of own version must succeed: %v", err)
+	}
+}
+
 func familyName(resource map[string]any) string {
 	names, _ := resource["name"].([]any)
 	if len(names) == 0 {
