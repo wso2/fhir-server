@@ -195,6 +195,52 @@ func TestTenantIsolation_History(t *testing.T) {
 	}
 }
 
+// TestTenantIsolation_AggregateMeta verifies $meta does not disclose another
+// tenant's security labels, under genuinely enforced Row-Level Security.
+func TestTenantIsolation_AggregateMeta(t *testing.T) {
+	s := appRoleStore(t)
+	ctxA := tenant.WithTenant(context.Background(), "tenant-a")
+	ctxB := tenant.WithTenant(context.Background(), "tenant-b")
+
+	const secSystem = "http://example.org/sec"
+	if _, err := s.Create(ctxA, "Patient", map[string]any{
+		"resourceType": "Patient",
+		"meta":         map[string]any{"security": []any{map[string]any{"system": secSystem, "code": "SECRET-A"}}},
+		"name":         []any{map[string]any{"family": "Anderson"}},
+	}); err != nil {
+		t.Fatalf("tenant-a create: %v", err)
+	}
+	if _, err := s.Create(ctxB, "Patient", map[string]any{
+		"resourceType": "Patient",
+		"meta":         map[string]any{"security": []any{map[string]any{"system": secSystem, "code": "OK-B"}}},
+		"name":         []any{map[string]any{"family": "Becker"}},
+	}); err != nil {
+		t.Fatalf("tenant-b create: %v", err)
+	}
+
+	metaB, err := s.AggregateMeta(ctxB, "")
+	if err != nil {
+		t.Fatalf("tenant-b AggregateMeta: %v", err)
+	}
+	if metaHasSecurityCode(metaB, "SECRET-A") {
+		t.Fatalf("$meta leaked tenant-a's security label to tenant-b: %v", metaB)
+	}
+	if !metaHasSecurityCode(metaB, "OK-B") {
+		t.Fatalf("tenant-b's own security label missing from $meta: %v", metaB)
+	}
+}
+
+func metaHasSecurityCode(meta map[string]any, code string) bool {
+	sec, _ := meta["security"].([]any)
+	for _, raw := range sec {
+		c, _ := raw.(map[string]any)
+		if c["code"] == code {
+			return true
+		}
+	}
+	return false
+}
+
 func familyName(resource map[string]any) string {
 	names, _ := resource["name"].([]any)
 	if len(names) == 0 {

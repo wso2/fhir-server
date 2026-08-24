@@ -162,9 +162,7 @@ func setTenantTx(ctx context.Context, tx pgx.Tx) error {
 }
 
 // tenantConn acquires a pooled connection with the request's tenant applied,
-// for read paths that run outside a transaction. The caller must Release it;
-// the next acquirer overwrites app.current_tenant before use, so the value
-// never leaks across tenants.
+// for read paths that run outside a transaction. The caller must Release it.
 func (s *Store) tenantConn(ctx context.Context) (*pgxpool.Conn, error) {
 	c, err := s.pool.Acquire(ctx)
 	if err != nil {
