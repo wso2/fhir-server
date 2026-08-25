@@ -120,3 +120,29 @@ func TestReferencedByError_Message(t *testing.T) {
 		}
 	}
 }
+
+func TestBundleWriter_RecordWriteAndDelete_FinalStateWins(t *testing.T) {
+	w := &bundleWriter{}
+
+	// A later write replaces the earlier version's refs.
+	w.recordWrite("Observation", "o1", []pendingRef{{ref: "Patient/dangling"}})
+	w.recordWrite("Observation", "o1", []pendingRef{{ref: "Patient/p1"}})
+	if got := w.refs["Observation/o1"]; len(got) != 1 || got[0].ref != "Patient/p1" {
+		t.Errorf("later write must replace refs, got %+v", got)
+	}
+
+	// A delete drops the deleted resource's own outgoing refs.
+	w.recordDelete("Observation", "o1")
+	if _, ok := w.refs["Observation/o1"]; ok {
+		t.Error("delete must drop the resource's outgoing refs")
+	}
+	if _, ok := w.deletes["Observation/o1"]; !ok {
+		t.Error("delete must be recorded")
+	}
+
+	// A subsequent write (resurrection) cancels the pending delete.
+	w.recordWrite("Observation", "o1", nil)
+	if _, ok := w.deletes["Observation/o1"]; ok {
+		t.Error("a later write must cancel the pending delete")
+	}
+}

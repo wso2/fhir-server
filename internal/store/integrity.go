@@ -176,17 +176,43 @@ func walkRefs(node any, path, source string, out *[]pendingRef) {
 // the point is a actionable message, not an exhaustive listing.
 const referencedBySampleLimit = 5
 
+// recordWriteIntegrity records a written resource's final state for the
+// post-flush checks: its outgoing local references (only collected when the
+// write-side check is on) and the cancellation of any pending delete of the
+// same id. Recording runs when either check is enabled so a resurrecting
+// write clears the delete-side bookkeeping even with the write check off.
+func (s *Store) recordWriteIntegrity(w *bundleWriter, resourceType, resourceID string, body map[string]any) {
+	if !s.refIntegrity.OnWrite && !s.refIntegrity.OnDelete {
+		return
+	}
+	var refs []pendingRef
+	if s.refIntegrity.OnWrite {
+		refs = collectLocalRefs(resourceType, resourceID, body)
+	}
+	w.recordWrite(resourceType, resourceID, refs)
+}
+
 // verifyIntegrity runs the enabled referential-integrity checks against the
 // transaction's post-flush state. Must be called after w.flush so deferred
 // resources rows and all re-index deletes are visible to the queries.
 func (s *Store) verifyIntegrity(ctx context.Context, tx pgx.Tx, w *bundleWriter) error {
 	if len(w.refs) > 0 {
-		if err := s.verifyRefsResolve(ctx, tx, w.refs); err != nil {
-			return err
+		var refs []pendingRef
+		for _, rs := range w.refs {
+			refs = append(refs, rs...)
+		}
+		if len(refs) > 0 {
+			if err := s.verifyRefsResolve(ctx, tx, refs); err != nil {
+				return err
+			}
 		}
 	}
 	if len(w.deletes) > 0 {
-		if err := s.verifyNotReferenced(ctx, tx, w.deletes); err != nil {
+		deletes := make([][2]string, 0, len(w.deletes))
+		for _, d := range w.deletes {
+			deletes = append(deletes, d)
+		}
+		if err := s.verifyNotReferenced(ctx, tx, deletes); err != nil {
 			return err
 		}
 	}

@@ -424,8 +424,9 @@ any one resource body, so it belongs with the transaction that changes that stat
 - **Why post-flush verification:** both checks run once per transaction, *after* the
   batched flush, against the transaction's final state. This makes transaction Bundles
   order-independent (create target and referrer in any order; delete a target while
-  re-pointing its referrers in the same Bundle) and keeps the write path to at most two
-  extra queries per transaction, regardless of entry count.
+  re-pointing its referrers in the same Bundle) and keeps the write-path cost bounded:
+  one target-lookup query per 5,000 unique reference targets plus one referrer query
+  when the transaction deletes anything — independent of entry count.
 - **Why the store option defaults to off while the config defaults to on:** the zero
   value of `store.RefIntegrity` preserves the store's historical behavior for embedded
   callers and tests; `internal/config` resolves the production default (both on) and

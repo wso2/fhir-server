@@ -269,3 +269,74 @@ func TestRefIntegrity_TransactionDeleteWithRepointing(t *testing.T) {
 		t.Fatalf("want *BundleError 409, got %v", err)
 	}
 }
+
+func TestRefIntegrity_PatchToDanglingRejected(t *testing.T) {
+	s := newRIStore(t)
+	ctx := context.Background()
+
+	if _, err := s.Create(ctx, "Patient", patient("p1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "Observation", observation("obs-1", "Patient/p1")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Patch(ctx, "Observation", "obs-1", map[string]any{
+		"subject": map[string]any{"reference": "Patient/gone"},
+	})
+	var ri store.ReferentialIntegrityError
+	if !errors.As(err, &ri) {
+		t.Fatalf("want ReferentialIntegrityError on patch, got %v", err)
+	}
+	// Rollback: the stored observation still points at p1.
+	got, err := s.Read(ctx, "Observation", "obs-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref := got["subject"].(map[string]any)["reference"]; ref != "Patient/p1" {
+		t.Errorf("rejected patch must roll back, subject is %v", ref)
+	}
+}
+
+func TestRefIntegrity_BundleRewriteSameResourceFinalStateWins(t *testing.T) {
+	s := newRIStore(t)
+	ctx := context.Background()
+
+	if _, err := s.Create(ctx, "Patient", patient("p1")); err != nil {
+		t.Fatal(err)
+	}
+	// Two PUTs to the same Observation in one transaction: the first version
+	// carries a dangling reference, the final version a resolvable one. Only
+	// the final state may be verified.
+	entries := []store.BundleEntryRequest{
+		{Method: "PUT", URL: "Observation/obs-1", Resource: observation("obs-1", "Patient/dangling")},
+		{Method: "PUT", URL: "Observation/obs-1", Resource: observation("obs-1", "Patient/p1")},
+	}
+	if _, err := s.ExecuteBundle(ctx, "transaction", "http://localhost:9090/fhir/r4", entries); err != nil {
+		t.Fatalf("only the final version's references must be verified: %v", err)
+	}
+}
+
+func TestRefIntegrity_BundleDeleteThenResurrect(t *testing.T) {
+	s := newRIStore(t)
+	ctx := context.Background()
+
+	if _, err := s.Create(ctx, "Patient", patient("p1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "Observation", observation("obs-1", "Patient/p1")); err != nil {
+		t.Fatal(err)
+	}
+	// DELETE + PUT of the same Patient in one transaction resurrects it (FHIR
+	// verb order runs the DELETE first). The final state is alive, so the
+	// delete-side check must not fire even though obs-1 still references it.
+	entries := []store.BundleEntryRequest{
+		{Method: "DELETE", URL: "Patient/p1"},
+		{Method: "PUT", URL: "Patient/p1", Resource: patient("p1")},
+	}
+	if _, err := s.ExecuteBundle(ctx, "transaction", "http://localhost:9090/fhir/r4", entries); err != nil {
+		t.Fatalf("delete-then-resurrect must not trip the delete-side check: %v", err)
+	}
+	if _, err := s.Read(ctx, "Patient", "p1"); err != nil {
+		t.Errorf("patient must be alive after resurrection: %v", err)
+	}
+}
