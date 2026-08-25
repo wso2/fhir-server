@@ -33,9 +33,9 @@ func TestCollectLocalRefs(t *testing.T) {
 			map[string]any{"reference": "https://other.example.org/fhir/Practitioner/ext1"}, // absolute: skipped
 			map[string]any{"reference": "urn:uuid:0c38f28e-0a4e-4a9a-9a3b-1c1b3fa4a111"},    // urn: skipped
 			map[string]any{"reference": "#contained-1"},                                     // fragment: skipped
-			map[string]any{"reference": "Patient?identifier=mrn|1234"},                     // conditional: skipped
-			map[string]any{"identifier": map[string]any{"system": "s", "value": "v"}},      // logical: skipped
-			map[string]any{"display": "Someone"},                                           // display-only: skipped
+			map[string]any{"reference": "Patient?identifier=mrn|1234"},                      // conditional: skipped
+			map[string]any{"identifier": map[string]any{"system": "s", "value": "v"}},       // logical: skipped
+			map[string]any{"display": "Someone"},                                            // display-only: skipped
 		},
 		"note": []any{
 			map[string]any{"authorReference": map[string]any{"reference": "Patient/p1"}},
