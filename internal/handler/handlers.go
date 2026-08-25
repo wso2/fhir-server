@@ -205,6 +205,19 @@ func readFHIRBody(r *http.Request) (map[string]any, error) {
 	return body, nil
 }
 
+// writeBodyError maps a request-body read/parse failure to a response: a body
+// that overran the MaxBytesReader limit becomes 413 Payload Too Large, any
+// other malformed body stays 400. badRequestMsg prefixes the 400 diagnostics.
+func writeBodyError(w http.ResponseWriter, badRequestMsg string, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		operationOutcome(w, http.StatusRequestEntityTooLarge, "error", "too-costly",
+			fmt.Sprintf("request body exceeds the %d-byte limit", maxRequestBodyBytes))
+		return
+	}
+	operationOutcome(w, http.StatusBadRequest, "error", "invalid", badRequestMsg+err.Error())
+}
+
 // isStructuredContentType reports whether the request body is XML or Turtle
 // (as opposed to JSON, which already carries typed primitives).
 func isStructuredContentType(r *http.Request) bool {
@@ -666,7 +679,7 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 
@@ -748,7 +761,7 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 
@@ -827,7 +840,7 @@ func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
 	default: // application/merge-patch+json or empty
 		body, err := readFHIRBody(r)
 		if err != nil {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			writeBodyError(w, "invalid JSON: ", err)
 			return
 		}
 		resource, err := h.store.Patch(r.Context(), rt, id, body)
@@ -871,7 +884,7 @@ func (h *fhirHandler) fhirPatch(w http.ResponseWriter, r *http.Request, rt, id s
 	// FHIR Patch body is a Parameters resource, in JSON or XML.
 	params, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid Parameters body: "+err.Error())
+		writeBodyError(w, "invalid Parameters body: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)
@@ -899,7 +912,7 @@ func (h *fhirHandler) xmlPatch(w http.ResponseWriter, r *http.Request, rt, id st
 	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	xmlBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "cannot read body: "+err.Error())
+		writeBodyError(w, "cannot read body: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)
@@ -956,7 +969,7 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 	}
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
@@ -1185,7 +1198,7 @@ func (h *fhirHandler) validate(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	h.runValidate(w, r, body, rt, true)
@@ -1199,7 +1212,7 @@ func (h *fhirHandler) validateSystem(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	h.runValidate(w, r, body, "", true)
@@ -1219,7 +1232,7 @@ func (h *fhirHandler) validateInstance(w http.ResponseWriter, r *http.Request) {
 		}
 		b, err := readFHIRBody(r)
 		if err != nil {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			writeBodyError(w, "invalid JSON: ", err)
 			return
 		}
 		body = b
@@ -1340,7 +1353,7 @@ func (h *fhirHandler) convert(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid input: "+err.Error())
+		writeBodyError(w, "invalid input: ", err)
 		return
 	}
 	h.coerceStructured(r.Context(), r, body)
