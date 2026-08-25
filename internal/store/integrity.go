@@ -44,7 +44,7 @@ import (
 // passes, and one that deletes a Patient while re-pointing its referrers in
 // the same transaction also passes, regardless of FHIR verb ordering.
 //
-// Scope (mirrors HAPI FHIR's storage-level enforcement):
+// Scope:
 //   - Only local literal references are resolved. Absolute URLs, urn: values,
 //     internal fragments ("#..."), conditional references ("Type?query") and
 //     logical (identifier-only) references are never existence-checked.

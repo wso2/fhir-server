@@ -410,9 +410,9 @@ When a loaded profile is violated, the write fails with **422** and an `Operatio
 
 ### Referential integrity (configurable, on by default)
 
-Enforcement lives in the **store**, not the validator (`internal/store/integrity.go`),
-mirroring HAPI FHIR's storage-level design: it is a property of what the database is
-allowed to contain, not of any one resource body.
+Enforcement lives in the **store**, not the validator (`internal/store/integrity.go`):
+referential integrity is a property of what the database is allowed to contain, not of
+any one resource body, so it belongs with the transaction that changes that state.
 
 - **On write** (`validation.referentialIntegrityOnWrite`, default on): every local
   literal reference (`Type/id`) carried by a written resource must resolve to a live
@@ -614,7 +614,7 @@ Consolidated here so they're easy to find. Each is a conscious choice, not an ov
 | Terminology | No local code-system/value-set logic; delegate to external TX server | Terminology is a large, separately-maintained problem |
 | JSON indexing | No GIN index on `resource_json` | ~2.4× write cost for no benefit to the query patterns used |
 | Validation | Profile validation off by default, and only for resources declaring `meta.profile` | Interoperability first; strictness is opt-in |
-| Referential integrity | Enforced by default on write (422) and delete (409); each independently disableable via `validation.*` | Parity with HAPI FHIR's storage-level defaults; bulk loaders can opt out |
+| Referential integrity | Enforced by default on write (422) and delete (409); each independently disableable via `validation.*` | Safe by default — dangling references corrupt clinical data silently; bulk loaders can opt out |
 | Unknown profile URL | Soft-skip, not 422 | A resource may reference an IG this server hasn't loaded |
 | Reindex | No reindex of existing data when params change ([#11](https://github.com/wso2/fhir-server/issues/11)) | Indexing is write-time; bulk reindex is future work |
 | Search params | Composite & special (e.g. `Location.near` without support) fail closed | Don't silently widen result sets |
