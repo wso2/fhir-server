@@ -259,7 +259,7 @@ the base search path simple matters more than micro-optimizing the traversal cas
 
 ## 5. Multi-tenancy
 
-The server supports two deployment models (`internal/tenant`, README §5):
+The server supports two deployment models (`internal/tenant`, README §6):
 
 1. **One database (or server) per tenant** — ignore tenancy; everything uses the
    `default` tenant. Simplest, strongest isolation.
@@ -382,7 +382,7 @@ The server has two layers, and the profile layer is intentionally narrow.
 ### Structural validation (always on)
 
 Basic structural checks apply to create, update, and `$validate`
-(`internal/handler`, README §"Validation rules"): correct `Content-Type`, body
+(`internal/handler`, README §9 Validation): correct `Content-Type`, body
 `resourceType` matches the URL, required fields present, and body `id` matches URL `id`
 on `PUT`. These guard the store from obviously malformed input.
 
@@ -446,7 +446,7 @@ The `$validate` operation validates an arbitrary resource against profiles named
 
 ## 9. Terminology
 
-**The server is not a terminology server, by design** (`internal/terminology`, README §9).
+**The server is not a terminology server, by design** (`internal/terminology`, README §11).
 
 - It does **not** host `CodeSystem`/`ValueSet`/`ConceptMap`, expose `$lookup`/`$translate`,
   or validate coded values against their bound value sets. Structural validation is
