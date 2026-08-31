@@ -105,6 +105,17 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Guard the batch invariant the merge below relies on (one result per executed
+	// entry) so a store-side mismatch surfaces as a diagnosable error rather than
+	// an index-out-of-range panic on a request-serving path.
+	if bundleType == "batch" && len(results) != len(execEntries) {
+		slog.Error("bundle execution returned a result-count mismatch",
+			"results", len(results), "executed", len(execEntries))
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception",
+			fmt.Sprintf("bundle execution returned %d results for %d entries", len(results), len(execEntries)))
+		return
+	}
+
 	// Re-insert the held-back batch validation failures as per-entry outcomes,
 	// in the original request order, so every request entry has a response entry.
 	if bundleType == "batch" && len(invalid) > 0 {

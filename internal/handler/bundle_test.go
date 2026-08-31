@@ -250,6 +250,39 @@ func TestBundle_EmptyResourceTypeNormalizedToURLType(t *testing.T) {
 	}
 }
 
+func TestBundle_BatchResultCountMismatchIsDiagnosable(t *testing.T) {
+	// One invalid + one valid entry so the batch merge indexes into results;
+	// the store returns fewer results than executed entries with a nil error.
+	// The guard must turn that into a clean 500 OperationOutcome, not a panic.
+	ms := &mockStore{
+		executeBundleFn: func(_ context.Context, _, _ string, _ []store.BundleEntryRequest) ([]store.BundleEntryResult, error) {
+			return nil, nil // 0 results for 1 executed entry
+		},
+	}
+	h := newRouter(ms)
+	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{
+		"resourceType": "Bundle",
+		"type":         "batch",
+		"entry": []any{
+			map[string]any{ // invalid: Observation missing the required code
+				"resource": map[string]any{"resourceType": "Observation", "status": "final"},
+				"request":  map[string]any{"method": "POST", "url": "Observation"},
+			},
+			map[string]any{ // valid Patient — the one executed entry
+				"resource": map[string]any{"resourceType": "Patient", "name": []any{map[string]any{"family": "OK"}}},
+				"request":  map[string]any{"method": "POST", "url": "Patient"},
+			},
+		},
+	})
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", resp.Code, resp.Body.String())
+	}
+	body := decodeJSON(t, resp)
+	if body["resourceType"] != "OperationOutcome" {
+		t.Errorf("want a diagnosable OperationOutcome, got %v", body["resourceType"])
+	}
+}
+
 func TestBundle_RejectsNonBundle(t *testing.T) {
 	h := newRouter(&mockStore{})
 	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{"resourceType": "Patient"})
