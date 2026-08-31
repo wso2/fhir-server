@@ -41,8 +41,16 @@ const prefix = "@prefix fhir: <http://hl7.org/fhir/> .\n\n"
 // and resourceType values use.
 var validFHIRElementName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
 
+// validFHIRFieldName additionally allows the single leading underscore FHIR uses
+// for primitive-extension sibling keys (e.g. "_birthDate", "_status").
+var validFHIRFieldName = regexp.MustCompile(`^_?[A-Za-z][A-Za-z0-9]*$`)
+
 func isValidElementName(name string) bool {
 	return validFHIRElementName.MatchString(name)
+}
+
+func isValidFieldName(name string) bool {
+	return validFHIRFieldName.MatchString(name)
 }
 
 // ToTurtle serializes a FHIR resource map to Turtle.
@@ -76,7 +84,7 @@ func writeObjectBody(b *strings.Builder, obj map[string]any, depth int) error {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if !isValidElementName(k) {
+		if !isValidFieldName(k) {
 			return fmt.Errorf("invalid field name %q: not a legal FHIR element name", k)
 		}
 		b.WriteString(" ;\n")
