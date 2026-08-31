@@ -3,7 +3,7 @@
 > **Scope.** This document covers the **search layer** — the density-probe
 > architecture and the knobs around it. For hardware sizing (storage IOPS, the
 > memory budget under a container limit), PostgreSQL server settings, and the
-> write/import path, see [Performance Tuning](../README.md#14-performance-tuning) in
+> write/import path, see [Performance Tuning](../README.md#15-performance-tuning) in
 > the README.
 > Tune in that order — storage, then PostgreSQL, then these knobs. No search knob
 > rescues a saturated disk.

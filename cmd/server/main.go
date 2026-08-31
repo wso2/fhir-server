@@ -114,11 +114,12 @@ func run() error {
 	// (idempotent — skips the decompress/parse when already populated). When
 	// base validation is enabled, a load failure is fatal: continuing would
 	// silently serve writes without the validation the operator asked for.
-	// Disable with FHIR_BASE_VALIDATION=false if base definitions are unwanted.
-	if cfg.BaseValidation {
+	// Disable with validation.base=false (FHIR_VALIDATION_BASE=false) if base
+	// definitions are unwanted.
+	if cfg.Validation.Base {
 		n, err := basedef.Load(ctx, pool, false)
 		if err != nil {
-			return fmt.Errorf("load base FHIR R4 definitions (set FHIR_BASE_VALIDATION=false to disable): %w", err)
+			return fmt.Errorf("load base FHIR R4 definitions (set FHIR_VALIDATION_BASE=false to disable): %w", err)
 		}
 		slog.Info("base FHIR R4 definitions ready", "resourceTypes", n)
 	}
@@ -140,7 +141,15 @@ func run() error {
 		MaxRowsPerStatement: cfg.WriteMaxRowsPerStatement,
 		MaxRowsPerBundle:    cfg.WriteMaxRowsPerBundle,
 	}
-	storeOpts := []func(*store.Store){store.WithSearchTuning(searchTuning), store.WithWriteTuning(writeTuning)}
+	refIntegrity := store.RefIntegrity{
+		OnWrite:  cfg.Validation.ReferentialIntegrityOnWrite,
+		OnDelete: cfg.Validation.ReferentialIntegrityOnDelete,
+	}
+	storeOpts := []func(*store.Store){
+		store.WithSearchTuning(searchTuning),
+		store.WithWriteTuning(writeTuning),
+		store.WithReferentialIntegrity(refIntegrity),
+	}
 	if tc := terminology.New(cfg.TerminologyURL); tc != nil {
 		storeOpts = append(storeOpts, store.WithTerminology(tc))
 		slog.Info("terminology server configured", "url", cfg.TerminologyURL)
@@ -167,11 +176,15 @@ func run() error {
 	}
 
 	router := handler.NewRouter(s, pool, registry, cfg.BaseURL, &igReady, handler.Options{
-		ValidateOnWrite:       cfg.ValidateOnWrite,
-		DisableBaseValidation: !cfg.BaseValidation,
+		ValidateOnWrite:              cfg.Validation.Profile,
+		DisableBaseValidation:        !cfg.Validation.Base,
+		ReferentialIntegrityEnforced: refIntegrity.OnWrite && refIntegrity.OnDelete,
 	})
 	slog.Info("FHIR router initialized", "baseURL", cfg.BaseURL,
-		"validateOnWrite", cfg.ValidateOnWrite, "baseValidation", cfg.BaseValidation, "igPackages", len(cfg.IGPackages))
+		"baseValidation", cfg.Validation.Base, "profileValidation", cfg.Validation.Profile,
+		"refIntegrityOnWrite", cfg.Validation.ReferentialIntegrityOnWrite,
+		"refIntegrityOnDelete", cfg.Validation.ReferentialIntegrityOnDelete,
+		"igPackages", len(cfg.IGPackages))
 
 	// Timeouts are configurable (SERVER_READ/WRITE/IDLE_TIMEOUT or server.*Timeout
 	// in the config file): WriteTimeout bounds the whole handler execution, so the

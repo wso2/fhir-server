@@ -92,3 +92,31 @@ ig:
   registryUrl: https://packages.fhir.org
   forceReload: false
   cacheDir: .fhir-ig-cache
+
+validation:
+  # Write-time validation toggles. Every flag here also has an env var
+  # (env > file > default): FHIR_VALIDATION_BASE, FHIR_VALIDATION_PROFILE,
+  # FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE,
+  # FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE.
+  # The legacy names FHIR_BASE_VALIDATION / FHIR_VALIDATE_ON_WRITE are still
+  # honored for the first two.
+
+  # Validate writes against the base FHIR R4 StructureDefinitions
+  # (cardinality, fixed/pattern, slicing, primitive types). Default on.
+  # base: true
+
+  # Additionally validate writes against the profiles named in meta.profile
+  # (requires the referenced IGs to be loaded). Default off.
+  # profile: false
+
+  # Referential integrity on write: reject a create/update/patch carrying a
+  # local literal reference ("Patient/123") whose target does not exist as a
+  # live resource (HTTP 422). Absolute URLs, urn: values, "#" fragments,
+  # conditional and identifier-only references are not existence-checked.
+  # Default on; disable for out-of-order bulk loads.
+  # referentialIntegrityOnWrite: true
+
+  # Referential integrity on delete: reject deleting a resource that live
+  # resources still reference through an indexed reference search parameter
+  # (HTTP 409, naming the referrers). Default on.
+  # referentialIntegrityOnDelete: true

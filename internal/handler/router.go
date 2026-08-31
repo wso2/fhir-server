@@ -42,6 +42,10 @@ type Options struct {
 	// StructureDefinitions on write. Base validation is on by default, so the
 	// zero value keeps it enabled; set via FHIR_BASE_VALIDATION=false.
 	DisableBaseValidation bool
+	// ReferentialIntegrityEnforced reflects the store's referential-integrity
+	// setting so the CapabilityStatement can advertise referencePolicy
+	// "enforced". Purely informational: enforcement itself lives in the store.
+	ReferentialIntegrityEnforced bool
 }
 
 // NewRouter constructs the chi router. An optional Options controls validation
@@ -70,6 +74,7 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 		igReady:         igReady,
 		validateOnWrite: opt.ValidateOnWrite,
 		baseValidation:  !opt.DisableBaseValidation,
+		refIntegrity:    opt.ReferentialIntegrityEnforced,
 		baseDefs:        basedef.NewCache(pool),
 	}
 
@@ -204,5 +209,6 @@ type fhirHandler struct {
 	igReady         *atomic.Int32
 	validateOnWrite bool           // enforce profile validation on create/update when true
 	baseValidation  bool           // validate writes against base FHIR R4 SDs when true
+	refIntegrity    bool           // referential integrity enforced by the store (CapabilityStatement advertisement)
 	baseDefs        *basedef.Cache // memoized base StructureDefinition lookup by resource type
 }

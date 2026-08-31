@@ -1401,6 +1401,10 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 	if h.registry != nil {
 		fhirResourceTypes = h.registry.ResourceTypes()
 	}
+	referencePolicy := []string{"literal", "logical"}
+	if h.refIntegrity {
+		referencePolicy = append(referencePolicy, "enforced")
+	}
 	resources := make([]any, 0, len(fhirResourceTypes))
 	for _, rt := range fhirResourceTypes {
 		entry := map[string]any{
@@ -1422,7 +1426,9 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 			"conditionalDelete": "single",
 			// References may be stored as literal "Type/id" or as logical
 			// (identifier-based) references; both are indexed by sp_reference.
-			"referencePolicy": []string{"literal", "logical"},
+			// "enforced" is advertised when the store verifies referential
+			// integrity on write and delete (validation.referentialIntegrity*).
+			"referencePolicy": referencePolicy,
 		}
 		if profs, ok := profiles[rt]; ok && len(profs) > 0 {
 			entry["supportedProfile"] = profs
@@ -1837,6 +1843,16 @@ func handleError(w http.ResponseWriter, err error) {
 	var writeLimit store.WriteLimitError
 	if errors.As(err, &writeLimit) {
 		operationOutcome(w, http.StatusRequestEntityTooLarge, "error", "too-costly", err.Error())
+		return
+	}
+	var refIntegrity store.ReferentialIntegrityError
+	if errors.As(err, &refIntegrity) {
+		operationOutcome(w, http.StatusUnprocessableEntity, "error", "processing", err.Error())
+		return
+	}
+	var referencedBy store.ReferencedByError
+	if errors.As(err, &referencedBy) {
+		operationOutcome(w, http.StatusConflict, "error", "conflict", err.Error())
 		return
 	}
 	operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())

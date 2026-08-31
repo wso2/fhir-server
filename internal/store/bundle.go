@@ -188,7 +188,7 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	// Flush the whole bundle's buffered index, resources, and history writes as a
 	// handful of batched INSERT / DELETE statements before COMMIT. A row-limit
 	// overflow surfaces here as a 413 (WriteLimitError → storeErrToBundleErr).
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		be := storeErrToBundleErr(err)
 		be.EntryIndex = -1
 		return nil, be
@@ -384,7 +384,7 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 			results[i] = batchFailure(berr)
 			continue
 		}
-		if ferr := w.flush(ctx, tx); ferr != nil {
+		if ferr := s.flushAndVerify(ctx, tx, w); ferr != nil {
 			tx.Rollback(ctx)
 			results[i] = batchFailure(storeErrToBundleErr(ferr))
 			continue
@@ -734,6 +734,10 @@ func storeErrToBundleErr(err error) *BundleError {
 		return &BundleError{HTTPStatus: 412, Code: "conflict", Diagnostics: e.Error()}
 	case WriteLimitError:
 		return &BundleError{HTTPStatus: 413, Code: "too-costly", Diagnostics: e.Error()}
+	case ReferentialIntegrityError:
+		return &BundleError{HTTPStatus: 422, Code: "processing", Diagnostics: e.Error()}
+	case ReferencedByError:
+		return &BundleError{HTTPStatus: 409, Code: "conflict", Diagnostics: e.Error()}
 	default:
 		return &BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: err.Error()}
 	}
@@ -755,6 +759,8 @@ func httpReason(status int) string {
 		return "Method Not Allowed"
 	case 410:
 		return "Gone"
+	case 409:
+		return "Conflict"
 	case 412:
 		return "Precondition Failed"
 	case 422:

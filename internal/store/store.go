@@ -80,12 +80,13 @@ func defaultWriteTuning() WriteTuning {
 }
 
 type Store struct {
-	pool        *pgxpool.Pool
-	extractor   *index.Extractor
-	registry    *searchparam.Registry
-	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
-	tuning      SearchTuning
-	writeTuning WriteTuning
+	pool         *pgxpool.Pool
+	extractor    *index.Extractor
+	registry     *searchparam.Registry
+	terminology  *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning       SearchTuning
+	writeTuning  WriteTuning
+	refIntegrity RefIntegrity
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
@@ -217,6 +218,15 @@ type bundleWriter struct {
 	resources [][]any // deferred resources creates
 	history   [][]any // every create/update/patch/delete history row
 
+	// Referential-integrity bookkeeping (populated only when a RefIntegrity
+	// flag is on; verified post-flush by Store.verifyIntegrity). Both maps are
+	// keyed by "Type/id" and always reflect each resource's FINAL state in the
+	// transaction: a later write replaces the references of an earlier version
+	// and cancels a pending delete (resurrection); a delete drops the
+	// resource's outgoing references.
+	refs    map[string][]pendingRef // outgoing local refs of each written resource
+	deletes map[string][2]string    // (resourceType, id) soft-deleted in this transaction
+
 	maxRowsPerStmt   int
 	maxRowsPerBundle int
 }
@@ -236,6 +246,31 @@ func (s *Store) newBundleWriter(ctx context.Context) *bundleWriter {
 // index, resources, and history tables.
 func (w *bundleWriter) totalRows() int {
 	return w.rs.Count() + len(w.resources) + len(w.history)
+}
+
+// recordWrite tracks a create/update/patch for referential-integrity checking:
+// refs are the resource's outgoing local references (nil when the write-side
+// check is off). A write supersedes any earlier version written in the same
+// transaction and cancels a pending delete of the same id (resurrection).
+func (w *bundleWriter) recordWrite(resourceType, resourceID string, refs []pendingRef) {
+	key := resourceType + "/" + resourceID
+	if w.refs == nil {
+		w.refs = map[string][]pendingRef{}
+	}
+	w.refs[key] = refs
+	delete(w.deletes, key)
+}
+
+// recordDelete tracks a soft-delete for referential-integrity checking. The
+// deleted resource's own outgoing references vanish with it, so any refs an
+// earlier write in this transaction recorded for it are dropped.
+func (w *bundleWriter) recordDelete(resourceType, resourceID string) {
+	key := resourceType + "/" + resourceID
+	if w.deletes == nil {
+		w.deletes = map[string][2]string{}
+	}
+	w.deletes[key] = [2]string{resourceType, resourceID}
+	delete(w.refs, key)
 }
 
 // flush writes the buffer to tx in FK-safe order: parent resources first (sp_*
@@ -284,6 +319,17 @@ func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
 	return qb.Send(ctx, tx)
 }
 
+// flushAndVerify flushes the buffered writes and then runs the enabled
+// referential-integrity checks against the transaction's final state. Every
+// write path (single CRUD and Bundle processing) funnels through this so no
+// path can skip enforcement.
+func (s *Store) flushAndVerify(ctx context.Context, tx pgx.Tx, w *bundleWriter) error {
+	if err := w.flush(ctx, tx); err != nil {
+		return err
+	}
+	return s.verifyIntegrity(ctx, tx, w)
+}
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error) {
@@ -305,7 +351,7 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -359,6 +405,7 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 	}
 
 	s.extractor.Extract(w.rs, resourceType, resourceID, body, now)
+	s.recordWriteIntegrity(w, resourceType, resourceID, body)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, 1, "POST", raw, now})
 
 	return body, nil
@@ -418,7 +465,7 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -457,7 +504,7 @@ func (s *Store) UpdateOrCreate(ctx context.Context, resourceType, resourceID str
 	if err != nil {
 		return nil, false, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, false, err
 	}
 
@@ -523,6 +570,7 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 // rest. If the stored JSON cannot be parsed it falls back to the full
 // clear-and-reinsert of every table.
 func (s *Store) mergeReindex(w *bundleWriter, resourceType, resourceID string, oldRaw []byte, body map[string]any, lastUpdated time.Time) {
+	s.recordWriteIntegrity(w, resourceType, resourceID, body)
 	// Unbounded (cap 0): the stored version already passed the row cap when it
 	// was written, and a LimitHit from re-extracting it must not abort this
 	// transaction — only the incoming version's rows count against the cap.
@@ -562,7 +610,7 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -628,6 +676,7 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	newRS := index.NewRowSet(w.tenant, w.maxRowsPerBundle)
 	s.extractor.Extract(newRS, resourceType, resourceID, merged, now)
 	w.rs.MergeReindex(oldRS, newRS, resourceType, resourceID)
+	s.recordWriteIntegrity(w, resourceType, resourceID, merged)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PATCH", mergedRaw, now})
 
 	return merged, newVersion, nil
@@ -672,7 +721,7 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 	if err := s.deleteInTx(ctx, tx, resourceType, resourceID, w); err != nil {
 		return err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return err
 	}
 
@@ -707,6 +756,9 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	}
 	if isDeleted {
 		return nil // idempotent: already deleted
+	}
+	if s.refIntegrity.OnWrite || s.refIntegrity.OnDelete {
+		w.recordDelete(resourceType, resourceID)
 	}
 
 	// DELETE is a new version in FHIR — bump to avoid UNIQUE(fhir_id, resource_type, version_id) conflict.

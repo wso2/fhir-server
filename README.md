@@ -18,12 +18,13 @@ A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy 
 6. [Multi-Tenancy](#6-multi-tenancy)
 7. [Database Schema](#7-database-schema)
 8. [API Reference](#8-api-reference)
-9. [Search Parameters](#9-search-parameters)
-10. [Terminology](#10-terminology)
-11. [Implementation Guides](#11-implementation-guides)
-12. [Testing](#12-testing)
-13. [Extending the Server](#13-extending-the-server)
-14. [Performance Tuning](#14-performance-tuning)
+9. [Validation](#9-validation)
+10. [Search Parameters](#10-search-parameters)
+11. [Terminology](#11-terminology)
+12. [Implementation Guides](#12-implementation-guides)
+13. [Testing](#13-testing)
+14. [Extending the Server](#14-extending-the-server)
+15. [Performance Tuning](#15-performance-tuning)
 
 ---
 
@@ -255,13 +256,15 @@ ig:
 | `database.password` | `DB_PASSWORD` | `fhir` | PostgreSQL password |
 | `database.name` | `DB_NAME` | `fhirdb` | PostgreSQL database name |
 | `database.createTables` | `FHIR_CREATE_TABLES` | `false` | Create the server's tables on startup. Requires a DB role with DDL privileges, so it is off by default; enable it for a one-off first start, or create tables out-of-band with a privileged role. |
-| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#11-implementation-guides). |
+| `ig.packages` | `IG_PACKAGES` | *(empty)* | List of IG package specs to load at startup. In env vars, comma-separated. See [Implementation Guides](#12-implementation-guides). |
 | `ig.registryUrl` | `IG_REGISTRY_URL` | `https://packages.fhir.org` | FHIR package registry for resolving `name@version` specs. |
 | `ig.forceReload` | `IG_FORCE_RELOAD` | `false` | Set to `true` to re-download and re-process IGs even if already recorded in the database. |
 | `ig.cacheDir` | `IG_CACHE_DIR` | `.fhir-ig-cache` | Directory for caching downloaded `.tgz` packages between restarts. |
-| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#10-terminology). |
-| *(env only)* | `FHIR_VALIDATE_ON_WRITE` | `false` | Enforce **profile** validation (against `meta.profile`) on create/update. Off by default. See [Validation rules](#validation-rules). |
-| *(env only)* | `FHIR_BASE_VALIDATION` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing). On by default; set to `false` to disable. See [Validation rules](#validation-rules). |
+| *(env only)* | `FHIR_TERMINOLOGY_URL` | *(empty)* | Base URL of an external FHIR terminology server used for ValueSet `$expand` (e.g. `https://tx.fhir.org/r4`). Empty disables the `:in` / `:not-in` / `:below` / `:above` search filters. See [Terminology](#11-terminology). |
+| `validation.base` | `FHIR_VALIDATION_BASE` | `true` | Validate writes against the **base FHIR R4** StructureDefinitions (cardinality, fixed/pattern, slicing, primitive types). Set to `false` to disable. Legacy env name `FHIR_BASE_VALIDATION` is still honored. See [Validation](#9-validation). |
+| `validation.profile` | `FHIR_VALIDATION_PROFILE` | `false` | Enforce **profile** validation (against `meta.profile`) on create/update. Legacy env name `FHIR_VALIDATE_ON_WRITE` is still honored. See [Validation](#9-validation). |
+| `validation.referentialIntegrityOnWrite` | `FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE` | `true` | Reject a create/update/patch whose local literal references (`Patient/123`) do not resolve to a live resource (422). Disable for out-of-order bulk loads. See [Referential integrity](#referential-integrity). |
+| `validation.referentialIntegrityOnDelete` | `FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE` | `true` | Reject deleting a resource that live resources still reference (409 Conflict, naming referrers). See [Referential integrity](#referential-integrity). |
 
 > **Secrets:** Prefer environment variables (or a secret-manager-backed env) for `DB_PASSWORD` and any other sensitive value rather than committing them to the YAML file.
 
@@ -278,7 +281,7 @@ ig:
 > ranges and sizing rules in the
 > **[search-layer tuning reference](docs/performance-tuning.md)**. For the hardware
 > and PostgreSQL settings underneath them, see
-> [Performance Tuning](#14-performance-tuning).
+> [Performance Tuning](#15-performance-tuning).
 
 ---
 
@@ -496,7 +499,7 @@ Track which IG packages have been loaded (for skip-on-restart) and which profile
 
 #### `base_definitions` — base FHIR R4 StructureDefinitions
 
-Holds the core FHIR R4 resource StructureDefinitions (one row per resource type), shipped embedded in the binary and loaded at startup by `internal/basedef`. They drive base validation (see [Validation rules](#validation-rules)). Like `ig_profiles` this is reference data, not PHI, so it carries no `tenant_id` and is excluded from Row-Level Security.
+Holds the core FHIR R4 resource StructureDefinitions (one row per resource type), shipped embedded in the binary and loaded at startup by `internal/basedef`. They drive base validation (see [Validation](#9-validation)). Like `ig_profiles` this is reference data, not PHI, so it carries no `tenant_id` and is excluded from Row-Level Security.
 
 ---
 
@@ -772,25 +775,181 @@ curl http://localhost:9090/fhir/r4/metadata | jq '{fhirVersion: .fhirVersion, st
 
 ---
 
-### Validation rules
+### Validation
 
-These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update), and `POST /{type}/$validate`:
+Every write is validated before it is stored. The full description of each
+validation layer — request checks, base FHIR R4 structure, profile validation,
+referential integrity — and their configuration lives in the dedicated
+[Validation](#9-validation) section.
+
+---
+
+## 9. Validation
+
+Everything the server checks before accepting a write, in the order it runs.
+Each layer is independent; a layer only sees resources that passed the previous
+ones. Layers 1–2 are always on; 3–6 are configurable (see
+[Configuration](#configuring-validation) below).
+
+| # | Layer | Checks | Failure | Default | Config key |
+|---|---|---|---|---|---|
+| 1 | Request | `Content-Type`, body parses, `resourceType` matches URL, `id` matches URL (PUT) | 415 / 400 / 422 | always on | — |
+| 2 | Required fields | Key 1..1 fields for a small set of core types | 422 | always on | — |
+| 3 | Base FHIR R4 | Cardinality, `fixed[x]`/`pattern[x]`, slicing, primitive types & JSON shape | 422 | **on** | `validation.base` |
+| 4 | Profile | Conformance to the profiles named in `meta.profile` (from loaded IGs) | 422 | off | `validation.profile` |
+| 5 | Referential integrity (write) | Local literal references resolve to live resources | 422 | **on** | `validation.referentialIntegrityOnWrite` |
+| 6 | Referential integrity (delete) | No live resource still references the delete target | 409 | **on** | `validation.referentialIntegrityOnDelete` |
+
+What the server deliberately does **not** validate: coded values against their
+bound value sets (terminology is delegated — see [Terminology](#11-terminology))
+and full FHIRPath invariants (the engine implements a subset, so invariant
+failures are reported as **warnings** and never block a write).
+
+### Request-level checks (always on)
+
+These apply to `POST /{type}` (create), `PUT /{type}/{id}` (update), and
+`POST /{type}/$validate`:
 
 | Check | Status | Condition |
 |---|---|---|
 | Content-Type must be `application/fhir+json` or `application/json` | 415 | Wrong or unsupported `Content-Type` header |
 | `resourceType` in body must match URL resource type | 422 | e.g. sending `{"resourceType":"Observation"}` to `/Patient` |
-| Required fields present (create/update) | 422 | Observation requires `code`; Encounter requires `status` and `class`; Condition requires `subject`; DiagnosticReport requires `status` and `code`; AllergyIntolerance requires `patient`. A present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing |
-| Base FHIR R4 structure | 422 | Cardinality, `fixed[x]`, `pattern[x]`, and slicing from the base spec (e.g. missing `Observation.status`). On by default; see below |
 | `id` in body must match URL id | 400 | PUT only; body `id` ≠ URL id segment |
 
-**Base validation.** The server ships the core FHIR R4 resource StructureDefinitions (embedded, loaded into `base_definitions` at startup — see [Database Schema](#7-database-schema)) and validates every write against the base definition for its resource type. This catches structural problems — missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden (`max=0`) elements, and required slices — even when the client supplies no profile. It also enforces the FHIR JSON representation rules: primitive values must match their declared type's JSON kind and lexical form (booleans as JSON booleans, integers without fractions and in range, dates/times/codes/ids matching the spec regexes), arrays only where elements repeat, no `null`/empty values (`""`, `{}`, `[]`, `[null]` without an extension fill), and well-formed `_field` primitive-extension pairing. Complex-datatype interiors (HumanName, CodeableConcept, …) are checked against an embedded copy of the R4 datatype definitions. Choice elements (`value[x]`) and elements nested under absent optional parents are handled correctly, so valid resources are not falsely rejected. FHIRPath invariant failures are reported as **warnings** (they never block a write), because the engine implements a subset of FHIRPath. Disable the whole feature with `FHIR_BASE_VALIDATION=false`.
+### Required-field checks (always on)
 
-**Profile validation** (`FHIR_VALIDATE_ON_WRITE=true`) additionally validates writes against the profiles named in `meta.profile`, using StructureDefinitions loaded from [Implementation Guides](#11-implementation-guides). It is off by default and is independent of base validation.
+A fast handler-level check that a few key 1..1 fields are present before the
+full structural validation runs: Observation requires `code`; Encounter
+requires `status` and `class`; Condition requires `subject`; DiagnosticReport
+requires `status` and `code`; AllergyIntolerance requires `patient`. A
+present-but-empty value (`null`, `""`, `{}`, `[]`) counts as missing (422).
+
+### Base validation (`validation.base`, default on)
+
+The server ships the core FHIR R4 resource StructureDefinitions (embedded,
+loaded into `base_definitions` at startup — see
+[Database Schema](#7-database-schema)) and validates every write against the
+base definition for its resource type. This catches structural problems —
+missing required elements, `fixed[x]`/`pattern[x]` mismatches, forbidden
+(`max=0`) elements, and required slices — even when the client supplies no
+profile. It also enforces the FHIR JSON representation rules: primitive values
+must match their declared type's JSON kind and lexical form (booleans as JSON
+booleans, integers without fractions and in range, dates/times/codes/ids
+matching the spec regexes), arrays only where elements repeat, no `null`/empty
+values (`""`, `{}`, `[]`, `[null]` without an extension fill), and well-formed
+`_field` primitive-extension pairing. Complex-datatype interiors (HumanName,
+CodeableConcept, …) are checked against an embedded copy of the R4 datatype
+definitions. Choice elements (`value[x]`) and elements nested under absent
+optional parents are handled correctly, so valid resources are not falsely
+rejected. FHIRPath invariant failures are reported as **warnings** (they never
+block a write), because the engine implements a subset of FHIRPath.
+
+### Profile validation (`validation.profile`, default off)
+
+When enabled, each write is additionally validated against the profiles named
+in its `meta.profile`, using StructureDefinitions from loaded
+[Implementation Guides](#12-implementation-guides). Resources that declare no
+profile are unaffected.
+
+**Where profiles come from.** Only IG packages loaded at startup
+(`ig.packages`) supply validation profiles. Both registry specs
+(`hl7.fhir.us.core@6.1.0`, resolved via `ig.registryUrl`) and direct `.tgz`
+URLs work, so private/custom IGs are supported — package your profiles as a
+standard FHIR NPM package and point `ig.packages` at its URL. `POST`ing a
+`StructureDefinition` resource stores it as data but does **not** register it
+for validation.
+
+**Scope and caveats — read before enabling:**
+
+- **Exact, unversioned URL matching.** `meta.profile` entries are looked up by
+  exact canonical URL. A version-qualified claim
+  (`…/us-core-patient|6.1.0`) does not match and is skipped; whichever IG
+  version is loaded is what gets enforced.
+- **Unknown profiles soft-skip.** A profile URL that is not loaded is skipped
+  with a debug log — not rejected with 422 — so resources claiming profiles
+  from unloaded IGs remain acceptable.
+- **Structural conformance only.** Cardinality, `fixed[x]`/`pattern[x]`,
+  forbidden elements, and slicing discriminators are enforced. Terminology
+  bindings are **not** checked (see [Terminology](#11-terminology)), and
+  FHIRPath invariants run on a subset engine.
+- **Snapshots preferred.** Profiles shipped without a snapshot fall back to
+  differential-only checking, which is partial. Published IGs normally ship
+  snapshots; hand-rolled packages should too.
+
+Because `meta.profile` on real-world data is often a claim rather than a
+request for enforcement, enabling this can reject data other systems consider
+valid — enable it deliberately, per deployment.
+
+### Referential integrity
+
+The store enforces referential integrity on writes and deletes, both **on by
+default** and independently switchable:
+
+- **On write (422)** — `validation.referentialIntegrityOnWrite`. Every local
+  literal reference (`Patient/123`, including versioned
+  `Patient/123/_history/2`) carried by a created, updated, or patched resource
+  must resolve to a live (non-deleted) resource. Violations return a 422
+  OperationOutcome naming the reference, its element path, and the referencing
+  resource. Only local literal references are existence-checked: absolute URLs
+  to other servers, `urn:` values, internal fragments (`#contained`),
+  conditional references (`Patient?identifier=…`), and logical
+  (identifier-only) references are never resolved. `Bundle`-typed resources
+  are exempt (their entry references are entry-local, not server-local).
+- **On delete (409)** — `validation.referentialIntegrityOnDelete`. A resource
+  cannot be deleted while live resources still reference it through an indexed
+  reference search parameter (`sp_reference`). Violations return a 409
+  Conflict OperationOutcome naming a sample of the referrers. Delete or
+  re-point the referrers first — or disable the check.
+
+Checks run **inside the write transaction, after all entries are applied**, so
+transaction Bundles are order-independent: a Bundle may create an Observation
+and the Patient it references in any order, rewrite the same resource multiple
+times (only the final version is verified), or delete a Patient while
+re-pointing its referrers in the same transaction. A violation rolls the whole
+transaction back. In batch Bundles each entry is checked on its own; a
+violating entry fails alone.
+
+When both checks are enabled the CapabilityStatement advertises
+`referencePolicy: ["literal", "logical", "enforced"]`.
+
+**Cost:** one target-lookup query per 5,000 unique reference targets per write
+transaction, plus one referrer query when the transaction deletes anything —
+independent of bundle size. Reads and searches are unaffected.
+
+Disable `referentialIntegrityOnWrite` when loading datasets whose resources
+arrive out of order across requests (e.g. Synthea exports uploaded
+file-by-file); single transaction Bundles with internal references do **not**
+need it disabled.
+
+### `$validate`
+
+`POST /{type}/$validate` runs layers 1–4 against the supplied resource without
+storing it and returns an OperationOutcome (200 with informational issues when
+valid, 422 with error issues otherwise). Referential integrity is not checked
+by `$validate` — it is a property of the write transaction.
+
+### Configuring validation
+
+All toggles live under the `validation:` block of the config file, each with a
+matching env var (env > file > default):
+
+```yaml
+validation:
+  base: true                          # FHIR_VALIDATION_BASE
+  profile: false                      # FHIR_VALIDATION_PROFILE
+  referentialIntegrityOnWrite: true   # FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE
+  referentialIntegrityOnDelete: true  # FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE
+```
+
+The legacy env names `FHIR_BASE_VALIDATION` (for `validation.base`) and
+`FHIR_VALIDATE_ON_WRITE` (for `validation.profile`) keep working; the
+`FHIR_VALIDATION_*` name wins if both are set. An unparseable boolean value
+fails startup, naming the offending variable. See the
+[Configuration Reference](#4-configuration-reference) for the full table.
 
 ---
 
-## 9. Search Parameters
+## 10. Search Parameters
 
 ### Built-in parameters
 
@@ -801,7 +960,7 @@ These checks apply to both `POST /{type}` (create), `PUT /{type}/{id}` (update),
 | Type | Example | Modifiers | Notes |
 |---|---|---|---|
 | `string` | `family=smith` | `:exact`, `:contains`, `:missing` | Default is case-insensitive prefix match |
-| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#10-terminology). |
+| `token` | `gender=female`, `code=http://loinc.org\|8310-5` | `:missing`, `:in`, `:not-in`, `:below`, `:above` | `system\|code`, `\|code` (any system), `system\|` (any code with that system). The `:in`/`:not-in`/`:below`/`:above` modifiers require an external terminology server — see [Terminology](#11-terminology). |
 | `date` | `birthdate=ge1980`, `date=2024-01-15` | `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `sa`, `eb`, `ap` | `eq` follows R4 containment semantics (the search range must fully contain the stored range); `ne` matches when the search range does not fully contain the stored range; `ap` matches on range overlap; `sa` matches values that start after the search range and `eb` matches values that end before it. Matching is per indexed value, so a resource with multiple values for one param can match both `eq` and `ne` |
 | `number` | `probability=gt0.8` | `eq`, `lt`, `gt` | |
 | `reference` | `subject=Patient/abc123` | — | |
@@ -846,9 +1005,9 @@ The parameter is available for searching immediately and persists across restart
 
 ---
 
-## 10. Terminology
+## 11. Terminology
 
-The server is **not a terminology server**. It does not host `CodeSystem`, `ValueSet`, or `ConceptMap` resources, it does not expose terminology operations (`$validate-code`, `$lookup`, `$translate`), and resource validation does **not** check coded values against their bound value sets (see [Validation rules](#validation-rules) — validation is structural only: cardinality, fixed values, patterns, FHIRPath invariants, and slicing).
+The server is **not a terminology server**. It does not host `CodeSystem`, `ValueSet`, or `ConceptMap` resources, it does not expose terminology operations (`$validate-code`, `$lookup`, `$translate`), and resource validation does **not** check coded values against their bound value sets (see [Validation](#9-validation) — validation is structural only: cardinality, fixed values, patterns, FHIRPath invariants, and slicing).
 
 What it *does* provide is a thin **client to an external FHIR terminology server**, used purely to support a handful of code-aware search filters. When a search uses one of these token modifiers, the server calls `ValueSet/$expand` on the configured terminology server and filters matched resources against the returned code list:
 
@@ -886,7 +1045,7 @@ If you need full terminology capabilities — hosting your own code systems and 
 
 ---
 
-## 11. Implementation Guides
+## 12. Implementation Guides
 
 IGs extend the server with additional SearchParameters and profiles without code changes.
 
@@ -926,7 +1085,7 @@ curl http://localhost:9090/fhir/r4/metadata | jq '.implementationGuide'
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 See [TESTING.md](TESTING.md) for the full test inventory. Quick reference:
 
@@ -968,7 +1127,7 @@ go test -tags integration ./...
 
 ---
 
-## 13. Extending the Server
+## 14. Extending the Server
 
 ### Adding a required-field validation rule
 
@@ -1007,7 +1166,7 @@ Add new statements to `internal/db/schema.sql`. Use `CREATE TABLE IF NOT EXISTS`
 
 ---
 
-## 14. Performance Tuning
+## 15. Performance Tuning
 
 The server delegates all data access to PostgreSQL, so deployment performance is
 determined primarily by the database host. Address the following areas in order —
