@@ -854,9 +854,10 @@ func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *fhirHandler) jsonPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	var ops []map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON Patch: "+err.Error())
+		writeBodyError(w, "invalid JSON Patch: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)

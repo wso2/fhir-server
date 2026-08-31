@@ -104,6 +104,18 @@ func TestRequestBody_OversizedReturns413(t *testing.T) {
 			body:        fill(oversized),
 		},
 		{
+			name:        "json-patch",
+			method:      http.MethodPatch,
+			path:        "/fhir/r4/Patient/p1",
+			contentType: "application/json-patch+json",
+			// Valid JSON Patch whose op value streams past the limit.
+			body: io.MultiReader(
+				strings.NewReader(`[{"op":"replace","path":"/x","value":"`),
+				fill(oversized),
+				strings.NewReader(`"}]`),
+			),
+		},
+		{
 			name:        "bundle-json",
 			method:      http.MethodPost,
 			path:        "/fhir/r4",
