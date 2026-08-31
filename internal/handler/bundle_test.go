@@ -216,6 +216,40 @@ func TestBundle_AcceptsValidEntries(t *testing.T) {
 	}
 }
 
+func TestBundle_EmptyResourceTypeNormalizedToURLType(t *testing.T) {
+	// An entry whose resourceType is an empty string must be normalized to the
+	// URL-derived type before validation/execution, so it is base-validated like
+	// any other entry rather than slipping through unchecked.
+	for _, bundleType := range []string{"transaction", "batch"} {
+		t.Run(bundleType, func(t *testing.T) {
+			var gotRT string
+			ms := &mockStore{
+				executeBundleFn: func(_ context.Context, _, _ string, entries []store.BundleEntryRequest) ([]store.BundleEntryResult, error) {
+					if len(entries) == 1 {
+						gotRT, _ = entries[0].Resource["resourceType"].(string)
+					}
+					return make([]store.BundleEntryResult, len(entries)), nil
+				},
+			}
+			h := newRouter(ms)
+			resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{
+				"resourceType": "Bundle",
+				"type":         bundleType,
+				"entry": []any{map[string]any{
+					"resource": map[string]any{"resourceType": "", "name": []any{map[string]any{"family": "X"}}},
+					"request":  map[string]any{"method": "POST", "url": "Patient"},
+				}},
+			})
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", resp.Code, resp.Body.String())
+			}
+			if gotRT != "Patient" {
+				t.Errorf("empty resourceType should be normalized to %q before execution, got %q", "Patient", gotRT)
+			}
+		})
+	}
+}
+
 func TestBundle_RejectsNonBundle(t *testing.T) {
 	h := newRouter(&mockStore{})
 	resp := do(t, h, http.MethodPost, "/fhir/r4", map[string]any{"resourceType": "Patient"})

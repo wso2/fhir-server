@@ -271,7 +271,7 @@ func (h *fhirHandler) validateBundleEntry(r *http.Request, baseURL string, e sto
 	if msg := validateRequiredFields(rt, e.Resource); msg != "" {
 		return msg
 	}
-	if _, ok := e.Resource["resourceType"].(string); !ok {
+	if s, ok := e.Resource["resourceType"].(string); !ok || s == "" {
 		e.Resource["resourceType"] = rt
 	}
 	for _, iss := range h.writeValidationIssues(r, e.Resource) {
