@@ -1287,6 +1287,11 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 		return
 	}
 
+	// Match the write paths: coerce XML/Turtle primitives to their declared types
+	// before validating, so a structured resource is not falsely rejected for a
+	// boolean/integer arriving as a string.
+	h.coerceStructured(r.Context(), r, body)
+
 	var profileURLs []string
 	if p := r.URL.Query().Get("profile"); p != "" {
 		profileURLs = []string{p}
