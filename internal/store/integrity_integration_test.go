@@ -340,3 +340,49 @@ func TestRefIntegrity_BundleDeleteThenResurrect(t *testing.T) {
 		t.Errorf("patient must be alive after resurrection: %v", err)
 	}
 }
+
+func TestRefIntegrity_OnWriteOnly_AllowsReferencedDelete(t *testing.T) {
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	s := store.New(pool, reg, store.WithReferentialIntegrity(store.RefIntegrity{OnWrite: true, OnDelete: false}))
+	ctx := context.Background()
+
+	if _, err := s.Create(ctx, "Patient", patient("p1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "Observation", observation("obs-1", "Patient/p1")); err != nil {
+		t.Fatal(err)
+	}
+	// The write-side check must still fire...
+	if _, err := s.Create(ctx, "Observation", observation("obs-2", "Patient/nope")); err == nil {
+		t.Error("OnWrite must still reject dangling references")
+	}
+	// ...but deleting a referenced resource must be permitted with OnDelete off.
+	if err := s.Delete(ctx, "Patient", "p1"); err != nil {
+		t.Fatalf("OnDelete=false must permit deleting a referenced resource: %v", err)
+	}
+}
+
+func TestRefIntegrity_OnDeleteOnly_AllowsDanglingWrite(t *testing.T) {
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	s := store.New(pool, reg, store.WithReferentialIntegrity(store.RefIntegrity{OnWrite: false, OnDelete: true}))
+	ctx := context.Background()
+
+	// Dangling references must be accepted with OnWrite off...
+	if _, err := s.Create(ctx, "Observation", observation("obs-1", "Patient/nope")); err != nil {
+		t.Fatalf("OnWrite=false must accept dangling references: %v", err)
+	}
+	// ...while the delete-side check still fires.
+	if _, err := s.Create(ctx, "Patient", patient("p1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "Observation", observation("obs-2", "Patient/p1")); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Delete(ctx, "Patient", "p1")
+	var rb store.ReferencedByError
+	if !errors.As(err, &rb) {
+		t.Fatalf("OnDelete must still reject deleting a referenced resource, got %v", err)
+	}
+}

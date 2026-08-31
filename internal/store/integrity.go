@@ -207,7 +207,10 @@ func (s *Store) verifyIntegrity(ctx context.Context, tx pgx.Tx, w *bundleWriter)
 			}
 		}
 	}
-	if len(w.deletes) > 0 {
+	// Deletes are recorded whenever either flag is on (the write-side
+	// bookkeeping needs them to drop a deleted resource's outgoing refs), so
+	// the delete-side check must gate on its own flag here.
+	if s.refIntegrity.OnDelete && len(w.deletes) > 0 {
 		deletes := make([][2]string, 0, len(w.deletes))
 		for _, d := range w.deletes {
 			deletes = append(deletes, d)
