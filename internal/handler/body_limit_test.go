@@ -122,6 +122,17 @@ func TestRequestBody_OversizedReturns413(t *testing.T) {
 			),
 		},
 		{
+			name:        "meta-add",
+			method:      http.MethodPost,
+			path:        "/fhir/r4/Patient/p1/$meta-add",
+			contentType: "application/fhir+json",
+			body: io.MultiReader(
+				strings.NewReader(`{"resourceType":"Parameters","parameter":[{"name":"meta","valueMeta":{"tag":[{"code":"`),
+				fill(oversized),
+				strings.NewReader(`"}]}}]}`),
+			),
+		},
+		{
 			name:        "bundle-json",
 			method:      http.MethodPost,
 			path:        "/fhir/r4",

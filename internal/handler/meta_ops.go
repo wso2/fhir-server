@@ -80,7 +80,7 @@ func (h *fhirHandler) metaMutate(w http.ResponseWriter, r *http.Request, add boo
 
 	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid Parameters body: "+err.Error())
+		writeBodyError(w, "invalid Parameters body: ", err)
 		return
 	}
 	inMeta := metaFromParameters(body)
