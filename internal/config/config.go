@@ -310,7 +310,7 @@ func resolve(fc *FileConfig) (*Config, error) {
 
 	// Request body cap (bytes): env > config file > default (200 MiB). Range
 	// [1 MiB, 2 GiB]; raise for large bulk imports.
-	maxRequestBodyBytes, err := resolveIntTunable("FHIR_MAX_REQUEST_BODY_BYTES", "server.maxRequestBodyBytes",
+	maxRequestBodyBytes, err := resolveIntTunable("SERVER_MAX_REQUEST_BODY_BYTES", "server.maxRequestBodyBytes",
 		fc.Server.MaxRequestBodyBytes, 200<<20, 1<<20, 2048<<20)
 	if err != nil {
 		return nil, err

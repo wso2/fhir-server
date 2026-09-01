@@ -248,6 +248,7 @@ ig:
 | `server.readTimeout` | `SERVER_READ_TIMEOUT` | `30s` | Max time to read a request **including its body** — a large transaction bundle upload must fit inside it. `0` disables. |
 | `server.writeTimeout` | `SERVER_WRITE_TIMEOUT` | `60s` | In Go's `net/http` this bounds the **entire handler execution**, not just the response write, so it must exceed your slowest legitimate request. `0` disables. See the note below and [Bulk import & the write path](docs/performance-tuning.md#5-bulk-import--the-write-path). |
 | `server.idleTimeout` | `SERVER_IDLE_TIMEOUT` | `120s` | Keep-alive idle timeout. `0` disables. |
+| `server.maxRequestBodyBytes` | `SERVER_MAX_REQUEST_BODY_BYTES` | `209715200` (200 MiB) | Max bytes read from any request body before it is rejected with `413 Payload Too Large`, bounding server memory use. Raise it for large bulk-import bundles. Value in bytes; range 1 MiB – 2 GiB. |
 | `logging.level` | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. Logs are JSON (structured). |
 | `database.url` | `DATABASE_URL` | *(derived)* | Full PostgreSQL DSN. When set, overrides every other `database.*` field. |
 | `database.host` | `DB_HOST` | `localhost` | PostgreSQL host (only used when `database.url` is empty) |
