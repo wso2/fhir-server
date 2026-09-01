@@ -326,6 +326,29 @@ func TestLoad_Timeouts_Defaults(t *testing.T) {
 	if cfg.IdleTimeout != 120*time.Second {
 		t.Errorf("default IdleTimeout: got %v, want 120s", cfg.IdleTimeout)
 	}
+	if cfg.MaxRequestBodyBytes != 200<<20 {
+		t.Errorf("default MaxRequestBodyBytes: got %d, want %d (200 MiB)", cfg.MaxRequestBodyBytes, 200<<20)
+	}
+}
+
+func TestLoad_MaxRequestBodyBytes_EnvOverride(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("FHIR_MAX_REQUEST_BODY_BYTES", "524288000") // 500 MiB
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != 500<<20 {
+		t.Errorf("MaxRequestBodyBytes: got %d, want %d (env should win)", cfg.MaxRequestBodyBytes, 500<<20)
+	}
+}
+
+func TestLoad_MaxRequestBodyBytes_RejectsOutOfRange(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("FHIR_MAX_REQUEST_BODY_BYTES", "1024") // below the 1 MiB minimum
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected an error for an out-of-range MaxRequestBodyBytes, got nil")
+	}
 }
 
 func TestLoad_Timeouts_EnvOverride(t *testing.T) {

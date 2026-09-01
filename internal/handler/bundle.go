@@ -32,7 +32,7 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readBody(r)
+	body, err := h.readBody(r)
 	if err != nil {
 		writeBodyError(w, "invalid JSON: ", err)
 		return

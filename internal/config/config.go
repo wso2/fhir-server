@@ -57,6 +57,11 @@ type Config struct {
 	WriteTimeout time.Duration // default 60s
 	IdleTimeout  time.Duration // default 120s
 
+	// MaxRequestBodyBytes caps how much of any request body the server reads
+	// before rejecting it with 413, bounding memory use. Raise it for large
+	// bulk imports. Default 200 MiB.
+	MaxRequestBodyBytes int
+
 	// Search performance tunables. Defaults equal the store's historical
 	// hardcoded constants — see docs/performance-tuning.md for the tuning rules.
 	SearchProbeCap        int // density-probe cap; default 5000
@@ -104,9 +109,10 @@ type FileConfig struct {
 		Port    int    `yaml:"port"`
 		BaseURL string `yaml:"baseUrl"`
 		// Go duration strings ("30s", "5m"); "0" disables that timeout.
-		ReadTimeout  string `yaml:"readTimeout"`
-		WriteTimeout string `yaml:"writeTimeout"`
-		IdleTimeout  string `yaml:"idleTimeout"`
+		ReadTimeout         string `yaml:"readTimeout"`
+		WriteTimeout        string `yaml:"writeTimeout"`
+		IdleTimeout         string `yaml:"idleTimeout"`
+		MaxRequestBodyBytes *int   `yaml:"maxRequestBodyBytes"`
 	} `yaml:"server"`
 
 	Logging struct {
@@ -302,6 +308,14 @@ func resolve(fc *FileConfig) (*Config, error) {
 		return nil, err
 	}
 
+	// Request body cap (bytes): env > config file > default (200 MiB). Range
+	// [1 MiB, 2 GiB]; raise for large bulk imports.
+	maxRequestBodyBytes, err := resolveIntTunable("FHIR_MAX_REQUEST_BODY_BYTES", "server.maxRequestBodyBytes",
+		fc.Server.MaxRequestBodyBytes, 200<<20, 1<<20, 2048<<20)
+	if err != nil {
+		return nil, err
+	}
+
 	// Parallel transaction bundle tunables. Concurrency 1 (the default) keeps the
 	// capability off entirely; the processing default exists so a deployment can
 	// opt whole workloads into parallel mode without per-request headers.
@@ -318,9 +332,10 @@ func resolve(fc *FileConfig) (*Config, error) {
 		Validation:     validation,
 		TerminologyURL: terminologyURL,
 		CreateTables:   createTables,
-		ReadTimeout:    readTimeout,
-		WriteTimeout:   writeTimeout,
-		IdleTimeout:    idleTimeout,
+		ReadTimeout:         readTimeout,
+		WriteTimeout:        writeTimeout,
+		IdleTimeout:         idleTimeout,
+		MaxRequestBodyBytes: maxRequestBodyBytes,
 
 		SearchProbeCap:        probeCap,
 		SearchDefaultPageSize: defaultPageSize,

@@ -78,7 +78,7 @@ func (h *fhirHandler) metaMutate(w http.ResponseWriter, r *http.Request, add boo
 	rt := chi.URLParam(r, "resourceType")
 	id := chi.URLParam(r, "id")
 
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
 		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid Parameters body: "+err.Error())
 		return

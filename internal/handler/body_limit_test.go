@@ -22,10 +22,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/wso2/fhir-server/internal/handler"
 )
 
-// oversized is one byte past the server's 32 MiB request-body cap.
-const oversized = (32 << 20) + 1
+// testBodyLimit is a small configured request-body cap so the oversized-body
+// tests exercise the limit cheaply (and prove it is configurable).
+const testBodyLimit = 1 << 20 // 1 MiB
+
+// oversized is one byte past the configured cap.
+const oversized = testBodyLimit + 1
 
 // fillReader streams n copies of b without materializing them, so oversized
 // bodies cost a fixed buffer rather than tens of megabytes of test allocation.
@@ -63,7 +69,7 @@ func sendRaw(t *testing.T, h http.Handler, method, path, contentType string, bod
 // TestRequestBody_OversizedReturns413 covers every body-reading format: an
 // oversized body must be rejected as 413, not read into memory in full.
 func TestRequestBody_OversizedReturns413(t *testing.T) {
-	h := newRouter(&mockStore{})
+	h := newRouter(&mockStore{}, handler.Options{MaxRequestBodyBytes: testBodyLimit})
 
 	cases := []struct {
 		name, method, path, contentType string
@@ -141,7 +147,7 @@ func TestRequestBody_OversizedReturns413(t *testing.T) {
 // TestRequestBody_MalformedStays400 confirms non-oversized parse failures are
 // still 400, not 413.
 func TestRequestBody_MalformedStays400(t *testing.T) {
-	h := newRouter(&mockStore{})
+	h := newRouter(&mockStore{}, handler.Options{MaxRequestBodyBytes: testBodyLimit})
 	resp := sendRaw(t, h, http.MethodPost, "/fhir/r4/Patient", "application/fhir+json",
 		strings.NewReader(`{"resourceType":`)) // truncated JSON
 	if resp.Code != http.StatusBadRequest {
