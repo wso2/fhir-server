@@ -93,10 +93,31 @@ func operationOutcome(w http.ResponseWriter, status int, severity, code, diagnos
 // configured (see config.MaxRequestBodyBytes / Options.MaxRequestBodyBytes).
 const defaultMaxRequestBodyBytes = 200 << 20 // 200 MiB
 
+// errTrailingJSON is returned when a request body carries content after its
+// single JSON value (trailing garbage, or a second smuggled value).
+var errTrailingJSON = errors.New("request body must contain a single JSON value")
+
+// decodeJSONBody decodes exactly one JSON value from r into v and rejects any
+// trailing content. r must already be size-capped by the caller; a
+// MaxBytesReader overflow is surfaced unchanged so writeBodyError maps it to 413.
+func decodeJSONBody(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errTrailingJSON
+	}
+	return nil
+}
+
 func (h *fhirHandler) readBody(r *http.Request) (map[string]any, error) {
 	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		return nil, err
 	}
 	return body, nil
@@ -200,7 +221,7 @@ func (h *fhirHandler) readFHIRBody(r *http.Request) (map[string]any, error) {
 		return fhirttl.FromTurtle(b)
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		return nil, err
 	}
 	return body, nil
@@ -857,7 +878,7 @@ func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
 func (h *fhirHandler) jsonPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
 	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	var ops []map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
+	if err := decodeJSONBody(r.Body, &ops); err != nil {
 		writeBodyError(w, "invalid JSON Patch: ", err)
 		return
 	}
