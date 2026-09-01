@@ -21,6 +21,7 @@ package handler_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -46,6 +47,39 @@ func baseValidationServer(t *testing.T, opts ...handler.Options) *httptest.Serve
 	srv := httptest.NewServer(handler.NewRouter(s, pool, reg, "http://test-server/fhir/r4", &ready, opts...))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// $validate must coerce XML/Turtle primitives before base type-checking, exactly
+// like the write paths — otherwise a boolean/integer arriving as a string is
+// falsely rejected. Both formats are checked against the loaded base definitions.
+func TestIntegration_Validate_CoercesStructuredPrimitives(t *testing.T) {
+	srv := baseValidationServer(t)
+
+	post := func(name, contentType, body string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/fhir/r4/Patient/$validate", strings.NewReader(body))
+		req.Header.Set("Content-Type", contentType)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s $validate: %v", name, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s $validate: want 200 (valid), got %d: %v", name, resp.StatusCode, iJSON(t, resp))
+		}
+	}
+
+	// XML: active (boolean) and multipleBirthInteger (integer) arrive as strings
+	// from the decoder; without coercion base type-checking would reject them.
+	post("XML", "application/fhir+xml", `<?xml version="1.0" encoding="UTF-8"?>
+<Patient xmlns="http://hl7.org/fhir">
+  <active value="true"/>
+  <multipleBirthInteger value="3"/>
+</Patient>`)
+
+	// Turtle: the same resource in FHIR Turtle.
+	post("Turtle", "application/fhir+turtle",
+		"@prefix fhir: <http://hl7.org/fhir/> .\n[ a fhir:Patient ;\n  fhir:active true ;\n  fhir:multipleBirthInteger 3 ] .\n")
 }
 
 // An Observation missing the required status is rejected by base validation

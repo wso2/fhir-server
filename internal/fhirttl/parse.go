@@ -149,9 +149,14 @@ func (t *ttlTokenizer) readBareword() string {
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
 
+// maxTurtleDepth bounds recursive-descent Turtle parsing. No conformant FHIR
+// resource nests anywhere near this deep.
+const maxTurtleDepth = 200
+
 type ttlParser struct {
-	toks []string
-	pos  int
+	toks  []string
+	pos   int
+	depth int
 }
 
 func (p *ttlParser) peek() string {
@@ -169,6 +174,11 @@ func (p *ttlParser) next() string {
 
 // parseNode parses an object "[ … ]", a collection "( … )", or a literal.
 func (p *ttlParser) parseNode() (any, error) {
+	p.depth++
+	defer func() { p.depth-- }()
+	if p.depth > maxTurtleDepth {
+		return nil, fmt.Errorf("turtle: input exceeds maximum nesting depth (%d)", maxTurtleDepth)
+	}
 	switch p.peek() {
 	case "[":
 		return p.parseObject()

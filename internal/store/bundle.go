@@ -471,6 +471,10 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 			if op.body == nil {
 				op.body = map[string]any{}
 			}
+			if existingRT, ok := op.body["resourceType"].(string); ok && existingRT != "" && existingRT != rt {
+				return nil, nil, &BundleError{HTTPStatus: 422, Code: "invalid", EntryIndex: i,
+					Diagnostics: fmt.Sprintf("body resourceType %q does not match request.url resource type %q", existingRT, rt)}
+			}
 			op.body["id"] = newID
 			op.body["resourceType"] = rt
 			if e.FullURL != "" {
@@ -577,6 +581,13 @@ func (s *Store) conditionalMatch(ctx context.Context, resourceType, rawQuery str
 }
 
 // ─── URL / reference helpers ───────────────────────────────────────────────────
+
+// ParseEntryURL splits a Bundle entry.request.url into its parts, exposing
+// parseEntryURL to the handler layer so both layers derive an entry's resource
+// type the same way.
+func ParseEntryURL(baseURL, raw string) (resourceType, id, versionID string, query url.Values, errMsg string) {
+	return parseEntryURL(baseURL, raw)
+}
 
 // parseEntryURL splits a Bundle entry.request.url (relative to the FHIR base,
 // or absolute under baseURL) into its parts. On a malformed URL it returns a

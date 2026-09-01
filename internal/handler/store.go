@@ -34,6 +34,7 @@ type StoreAPI interface {
 	Delete(ctx context.Context, resourceType, resourceID string) error
 	GetHistory(ctx context.Context, resourceType, resourceID string) ([]store.HistoryEntry, error)
 	GetTypeHistory(ctx context.Context, p store.HistoryParams) (store.HistoryResult, error)
+	AggregateMeta(ctx context.Context, resourceType string) (map[string]any, error)
 	Search(ctx context.Context, sp store.SearchParams) (store.SearchResult, error)
 	LastN(ctx context.Context, params map[string][]string, maxN int) (store.SearchResult, error)
 	ConditionalMatch(ctx context.Context, resourceType, rawQuery string) (string, int, error)

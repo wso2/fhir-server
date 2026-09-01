@@ -45,6 +45,68 @@ func TestToTurtle_Basic(t *testing.T) {
 	}
 }
 
+func TestToTurtle_AllowsPrimitiveExtensionKeys(t *testing.T) {
+	// Underscore-prefixed keys hold FHIR primitive extensions (valid, storable);
+	// they must serialize and round-trip, not be rejected as illegal names.
+	r := map[string]any{
+		"resourceType": "Patient",
+		"birthDate":    "2020-01-01",
+		"_birthDate": map[string]any{
+			"extension": []any{map[string]any{
+				"url":       "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+				"valueCode": "unknown",
+			}},
+		},
+	}
+	out, err := ToTurtle(r)
+	if err != nil {
+		t.Fatalf("primitive-extension key must serialize, got error: %v", err)
+	}
+	if !strings.Contains(string(out), "fhir:_birthDate") {
+		t.Errorf("expected fhir:_birthDate predicate in output:\n%s", out)
+	}
+	back, err := FromTurtle(out)
+	if err != nil {
+		t.Fatalf("FromTurtle: %v", err)
+	}
+	if _, ok := back["_birthDate"].(map[string]any); !ok {
+		t.Errorf("_birthDate should round-trip as an object, got %T", back["_birthDate"])
+	}
+}
+
+func TestToTurtle_RejectsInvalidNames(t *testing.T) {
+	cases := []map[string]any{
+		{"resourceType": `Patient . fhir:injected "pwned"`, "name": []any{map[string]any{"family": "x"}}},
+		{"resourceType": "Patient", `injected ; fhir:x "y"`: "z"},
+		{"resourceType": "Patient", "name": []any{map[string]any{`family ] . fhir:evil "z"`: "x"}}},
+		// A leading underscore is allowed, but must not be a hole for injection.
+		{"resourceType": "Patient", `_status ; fhir:evil "x"`: "z"},
+	}
+	for _, r := range cases {
+		if out, err := ToTurtle(r); err == nil {
+			t.Errorf("ToTurtle(%v): expected error for illegal name, got output %q", r, out)
+		}
+	}
+}
+
+func TestFromTurtle_RejectsExcessiveNesting(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("@prefix fhir: <http://hl7.org/fhir/> .\n[ a fhir:Patient ; fhir:x ")
+	const depth = maxTurtleDepth + 50
+	for i := 0; i < depth; i++ {
+		b.WriteString("( ")
+	}
+	b.WriteString(`"v"`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(" )")
+	}
+	b.WriteString(" ] .\n")
+
+	if _, err := FromTurtle([]byte(b.String())); err == nil {
+		t.Fatal("FromTurtle: expected an error for input past the depth limit, got nil")
+	}
+}
+
 func TestTurtle_RoundTrip(t *testing.T) {
 	original := map[string]any{
 		"resourceType": "Observation",

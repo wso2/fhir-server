@@ -89,9 +89,35 @@ func operationOutcome(w http.ResponseWriter, status int, severity, code, diagnos
 	})
 }
 
-func readBody(r *http.Request) (map[string]any, error) {
+// defaultMaxRequestBodyBytes is the fallback request-body cap when none is
+// configured (see config.MaxRequestBodyBytes / Options.MaxRequestBodyBytes).
+const defaultMaxRequestBodyBytes = 200 << 20 // 200 MiB
+
+// errTrailingJSON is returned when a request body carries content after its
+// single JSON value (trailing garbage, or a second smuggled value).
+var errTrailingJSON = errors.New("request body must contain a single JSON value")
+
+// decodeJSONBody decodes exactly one JSON value from r into v and rejects any
+// trailing content. r must already be size-capped by the caller; a
+// MaxBytesReader overflow is surfaced unchanged so writeBodyError maps it to 413.
+func decodeJSONBody(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errTrailingJSON
+	}
+	return nil
+}
+
+func (h *fhirHandler) readBody(r *http.Request) (map[string]any, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		return nil, err
 	}
 	return body, nil
@@ -176,7 +202,8 @@ func requireFHIRContent(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // readFHIRBody parses a request body that may be JSON, XML, or Turtle.
-func readFHIRBody(r *http.Request) (map[string]any, error) {
+func (h *fhirHandler) readFHIRBody(r *http.Request) (map[string]any, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	ct := r.Header.Get("Content-Type")
 	base := strings.TrimSpace(strings.SplitN(ct, ";", 2)[0])
 	switch base {
@@ -194,10 +221,51 @@ func readFHIRBody(r *http.Request) (map[string]any, error) {
 		return fhirttl.FromTurtle(b)
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		return nil, err
 	}
 	return body, nil
+}
+
+// writeBodyError maps a request-body read/parse failure to a response: a body
+// that overran the MaxBytesReader limit becomes 413 Payload Too Large, any
+// other malformed body stays 400. badRequestMsg prefixes the 400 diagnostics.
+func writeBodyError(w http.ResponseWriter, badRequestMsg string, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		operationOutcome(w, http.StatusRequestEntityTooLarge, "error", "too-costly",
+			fmt.Sprintf("request body exceeds the %d-byte limit", maxErr.Limit))
+		return
+	}
+	operationOutcome(w, http.StatusBadRequest, "error", "invalid", badRequestMsg+err.Error())
+}
+
+// isStructuredContentType reports whether the request body is XML or Turtle
+// (as opposed to JSON, which already carries typed primitives).
+func isStructuredContentType(r *http.Request) bool {
+	base := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0])
+	switch base {
+	case "application/fhir+xml", "application/xml", "application/fhir+turtle", "text/turtle":
+		return true
+	}
+	return false
+}
+
+// coerceStructured normalizes primitive value types for a body parsed from XML
+// or Turtle, using the base StructureDefinition for its resource type.
+func (h *fhirHandler) coerceStructured(ctx context.Context, r *http.Request, body map[string]any) {
+	if body == nil || !isStructuredContentType(r) || h.baseDefs == nil {
+		return
+	}
+	rt, _ := body["resourceType"].(string)
+	if rt == "" {
+		return
+	}
+	prof, err := h.baseDefs.Lookup(ctx, rt)
+	if err != nil || prof == nil {
+		return
+	}
+	prof.CoercePrimitives(body)
 }
 
 func firstVal(params map[string][]string, key string) string {
@@ -631,9 +699,9 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 
@@ -642,6 +710,8 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
 		return
 	}
+
+	h.coerceStructured(r.Context(), r, body)
 
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
@@ -711,9 +781,9 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 
@@ -728,6 +798,8 @@ func (h *fhirHandler) update(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("body id %q does not match URL id %q", bodyID, id))
 		return
 	}
+
+	h.coerceStructured(r.Context(), r, body)
 
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
@@ -788,9 +860,9 @@ func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
 	case "application/fhir+json", "application/fhir+xml":
 		h.fhirPatch(w, r, rt, id)
 	default: // application/merge-patch+json or empty
-		body, err := readFHIRBody(r)
+		body, err := h.readFHIRBody(r)
 		if err != nil {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			writeBodyError(w, "invalid JSON: ", err)
 			return
 		}
 		resource, err := h.store.Patch(r.Context(), rt, id, body)
@@ -804,9 +876,10 @@ func (h *fhirHandler) patch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *fhirHandler) jsonPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	var ops []map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON Patch: "+err.Error())
+	if err := decodeJSONBody(r.Body, &ops); err != nil {
+		writeBodyError(w, "invalid JSON Patch: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)
@@ -832,9 +905,9 @@ func (h *fhirHandler) jsonPatch(w http.ResponseWriter, r *http.Request, rt, id s
 
 func (h *fhirHandler) fhirPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
 	// FHIR Patch body is a Parameters resource, in JSON or XML.
-	params, err := readFHIRBody(r)
+	params, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid Parameters body: "+err.Error())
+		writeBodyError(w, "invalid Parameters body: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)
@@ -859,9 +932,10 @@ func (h *fhirHandler) fhirPatch(w http.ResponseWriter, r *http.Request, rt, id s
 }
 
 func (h *fhirHandler) xmlPatch(w http.ResponseWriter, r *http.Request, rt, id string) {
+	r.Body = http.MaxBytesReader(nil, r.Body, h.maxBodyBytes)
 	xmlBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "cannot read body: "+err.Error())
+		writeBodyError(w, "cannot read body: ", err)
 		return
 	}
 	resource, err := h.store.Read(r.Context(), rt, id)
@@ -916,9 +990,9 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 	if !requireFHIRContent(w, r) {
 		return
 	}
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	if bodyRT, ok := body["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
@@ -926,6 +1000,7 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, rt))
 		return
 	}
+	h.coerceStructured(r.Context(), r, body)
 	if msg := validateRequiredFields(rt, body); msg != "" {
 		operationOutcome(w, http.StatusUnprocessableEntity, "error", "required", msg)
 		return
@@ -1144,9 +1219,9 @@ func (h *fhirHandler) validate(w http.ResponseWriter, r *http.Request) {
 	if !requireFHIRContent(w, r) {
 		return
 	}
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	h.runValidate(w, r, body, rt, true)
@@ -1158,9 +1233,9 @@ func (h *fhirHandler) validateSystem(w http.ResponseWriter, r *http.Request) {
 	if !requireFHIRContent(w, r) {
 		return
 	}
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 	h.runValidate(w, r, body, "", true)
@@ -1178,9 +1253,9 @@ func (h *fhirHandler) validateInstance(w http.ResponseWriter, r *http.Request) {
 		if !requireFHIRContent(w, r) {
 			return
 		}
-		b, err := readFHIRBody(r)
+		b, err := h.readFHIRBody(r)
 		if err != nil {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+			writeBodyError(w, "invalid JSON: ", err)
 			return
 		}
 		body = b
@@ -1234,6 +1309,11 @@ func (h *fhirHandler) runValidate(w http.ResponseWriter, r *http.Request, body m
 			fmt.Sprintf("body resourceType %q does not match URL resource type %q", bodyRT, urlType))
 		return
 	}
+
+	// Match the write paths: coerce XML/Turtle primitives to their declared types
+	// before validating, so a structured resource is not falsely rejected for a
+	// boolean/integer arriving as a string.
+	h.coerceStructured(r.Context(), r, body)
 
 	var profileURLs []string
 	if p := r.URL.Query().Get("profile"); p != "" {
@@ -1299,11 +1379,12 @@ func (h *fhirHandler) convert(w http.ResponseWriter, r *http.Request) {
 	if !requireFHIRContent(w, r) {
 		return
 	}
-	body, err := readFHIRBody(r)
+	body, err := h.readFHIRBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid input: "+err.Error())
+		writeBodyError(w, "invalid input: ", err)
 		return
 	}
+	h.coerceStructured(r.Context(), r, body)
 	writeFHIR(w, r, http.StatusOK, body)
 }
 
@@ -1565,14 +1646,7 @@ func isPresent(v any) bool {
 // profile validation against meta.profile runs when validateOnWrite is enabled.
 // Warning-only findings never block a write.
 func (h *fhirHandler) enforceWrite(w http.ResponseWriter, r *http.Request, body map[string]any) bool {
-	var issues []validate.Issue
-	if h.baseValidation {
-		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
-	}
-	if h.validateOnWrite {
-		issues = append(issues, h.profileIssues(r, body)...)
-	}
-
+	issues := h.writeValidationIssues(r, body)
 	blocking := false
 	for _, iss := range issues {
 		if iss.Severity == "error" {
@@ -1585,6 +1659,19 @@ func (h *fhirHandler) enforceWrite(w http.ResponseWriter, r *http.Request, body 
 	}
 	writeIssues(w, r, issues)
 	return true
+}
+
+// writeValidationIssues runs base FHIR R4 and (when enabled) profile validation
+// on a create/update body and returns the findings without writing a response.
+func (h *fhirHandler) writeValidationIssues(r *http.Request, body map[string]any) []validate.Issue {
+	var issues []validate.Issue
+	if h.baseValidation {
+		issues = append(issues, h.baseValidationIssues(r.Context(), body)...)
+	}
+	if h.validateOnWrite {
+		issues = append(issues, h.profileIssues(r, body)...)
+	}
+	return issues
 }
 
 // profileIssues validates body against the profiles named in meta.profile.

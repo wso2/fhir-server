@@ -16,7 +16,11 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Mount the whole /var/lib/postgresql, not .../data: from 18 the images keep
+      # data in a major-version-specific subdirectory (PGDATA=/var/lib/postgresql/18/docker)
+      # and refuse to start if .../data is a mount point. A single mount here also
+      # keeps `pg_upgrade --link` inside one mount boundary for future major bumps.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fhir -d fhirdb"]
       interval: 5s

@@ -36,10 +36,25 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 )
 
 const fhirNS = "http://hl7.org/fhir"
+
+// maxXMLDepth bounds recursive-descent XML decoding. No conformant FHIR
+// resource nests anywhere near this deep.
+const maxXMLDepth = 200
+
+// validFHIRElementName matches the ASCII-identifier grammar FHIR element names
+// and resourceType values use.
+var validFHIRElementName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
+
+// isValidElementName reports whether name is a legal FHIR element name /
+// resourceType value.
+func isValidElementName(name string) bool {
+	return validFHIRElementName.MatchString(name)
+}
 
 // ToXML converts a FHIR JSON map to FHIR XML bytes.
 func ToXML(resource map[string]any) ([]byte, error) {
@@ -91,6 +106,9 @@ func FromXML(data []byte) (map[string]any, error) {
 // ─── Encoder ──────────────────────────────────────────────────────────────────
 
 func encodeElement(enc *xml.Encoder, name string, value any, isRoot bool) error {
+	if value != nil && !isValidElementName(name) {
+		return fmt.Errorf("invalid element name %q: not a legal FHIR element name", name)
+	}
 	switch v := value.(type) {
 	case map[string]any:
 		start := xml.StartElement{Name: xml.Name{Local: name}}
@@ -190,6 +208,13 @@ func decodeElement(dec *xml.Decoder) (any, error) {
 // the resource root — the only element that should carry resourceType; nested
 // complex elements must not get a synthetic resourceType.
 func decodeStarted(dec *xml.Decoder, start xml.StartElement, isRoot bool) (any, error) {
+	return decodeStartedDepth(dec, start, isRoot, 0)
+}
+
+func decodeStartedDepth(dec *xml.Decoder, start xml.StartElement, isRoot bool, depth int) (any, error) {
+	if depth > maxXMLDepth {
+		return nil, fmt.Errorf("XML input exceeds maximum nesting depth (%d)", maxXMLDepth)
+	}
 	localName := start.Name.Local
 
 	// Check for "value" attribute → primitive.
@@ -216,7 +241,7 @@ func decodeStarted(dec *xml.Decoder, start xml.StartElement, isRoot bool) (any, 
 		switch t := tok.(type) {
 		case xml.StartElement:
 			hasChildren = true
-			child, err := decodeStarted(dec, t, false)
+			child, err := decodeStartedDepth(dec, t, false, depth+1)
 			if err != nil {
 				return nil, err
 			}

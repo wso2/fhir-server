@@ -32,9 +32,9 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readBody(r)
+	body, err := h.readBody(r)
 	if err != nil {
-		operationOutcome(w, http.StatusBadRequest, "error", "invalid", "invalid JSON: "+err.Error())
+		writeBodyError(w, "invalid JSON: ", err)
 		return
 	}
 
@@ -58,8 +58,35 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	base := h.tenantBaseURL(ctx)
 
-	results, err := h.store.ExecuteBundle(ctx, bundleType, h.tenantBaseURL(ctx), entries)
+	// Content validation mirrors the single-resource write path. A transaction is
+	// atomic, so any invalid entry rejects the whole bundle; a batch processes
+	// entries independently, so an invalid entry yields a per-entry outcome while
+	// the valid entries still execute.
+	execEntries := entries
+	var invalid map[int]string
+	if bundleType == "batch" {
+		invalid = map[int]string{}
+		execEntries = make([]store.BundleEntryRequest, 0, len(entries))
+		for i, e := range entries {
+			if msg := h.validateBundleEntry(r, base, e); msg != "" {
+				invalid[i] = msg
+				continue
+			}
+			execEntries = append(execEntries, e)
+		}
+	} else {
+		for i, e := range entries {
+			if msg := h.validateBundleEntry(r, base, e); msg != "" {
+				operationOutcome(w, http.StatusUnprocessableEntity, "error", "invalid",
+					fmt.Sprintf("entry[%d]: %s", i, msg))
+				return
+			}
+		}
+	}
+
+	results, err := h.store.ExecuteBundle(ctx, bundleType, base, execEntries)
 	if err != nil {
 		var be *store.BundleError
 		if errors.As(err, &be) {
@@ -76,6 +103,36 @@ func (h *fhirHandler) bundle(w http.ResponseWriter, r *http.Request) {
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception",
 			"unexpected error processing the bundle; see server logs")
 		return
+	}
+
+	// Guard the batch invariant the merge below relies on (one result per executed
+	// entry) so a store-side mismatch surfaces as a diagnosable error rather than
+	// an index-out-of-range panic on a request-serving path.
+	if bundleType == "batch" && len(results) != len(execEntries) {
+		slog.Error("bundle execution returned a result-count mismatch",
+			"results", len(results), "executed", len(execEntries))
+		operationOutcome(w, http.StatusInternalServerError, "error", "exception",
+			fmt.Sprintf("bundle execution returned %d results for %d entries", len(results), len(execEntries)))
+		return
+	}
+
+	// Re-insert the held-back batch validation failures as per-entry outcomes,
+	// in the original request order, so every request entry has a response entry.
+	if bundleType == "batch" && len(invalid) > 0 {
+		merged := make([]store.BundleEntryResult, len(entries))
+		vi := 0
+		for i := range entries {
+			if msg, bad := invalid[i]; bad {
+				merged[i] = store.BundleEntryResult{
+					Status:  "422 Unprocessable Entity",
+					Outcome: bundleValidationOutcome(msg),
+				}
+				continue
+			}
+			merged[i] = results[vi]
+			vi++
+		}
+		results = merged
 	}
 
 	// Keep the in-memory SearchParameter registry in sync with any custom
@@ -199,4 +256,52 @@ func stringField(m map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// validateBundleEntry applies the same content validation the single-resource
+// write path enforces to one resource-bearing Bundle entry: a resourceType that
+// disagrees with the entry's request.url, a missing base-required field, or a
+// base/profile validation error. It returns an empty string when the entry
+// passes. Callers decide what a failure means per Bundle type — a transaction
+// rejects the whole bundle, a batch reports the entry individually.
+func (h *fhirHandler) validateBundleEntry(r *http.Request, baseURL string, e store.BundleEntryRequest) string {
+	method := strings.ToUpper(strings.TrimSpace(e.Method))
+	if method != "POST" && method != "PUT" {
+		return ""
+	}
+	if e.Resource == nil {
+		return ""
+	}
+	rt, _, _, _, perr := store.ParseEntryURL(baseURL, e.URL)
+	if perr != "" || rt == "" {
+		return ""
+	}
+	if bodyRT, ok := e.Resource["resourceType"].(string); ok && bodyRT != "" && bodyRT != rt {
+		return fmt.Sprintf("body resourceType %q does not match request.url resource type %q", bodyRT, rt)
+	}
+	if msg := validateRequiredFields(rt, e.Resource); msg != "" {
+		return msg
+	}
+	if s, ok := e.Resource["resourceType"].(string); !ok || s == "" {
+		e.Resource["resourceType"] = rt
+	}
+	for _, iss := range h.writeValidationIssues(r, e.Resource) {
+		if iss.Severity == "error" {
+			return iss.Diagnostics
+		}
+	}
+	return ""
+}
+
+// bundleValidationOutcome builds the OperationOutcome carried by a batch response
+// entry that failed handler-side content validation before execution.
+func bundleValidationOutcome(msg string) map[string]any {
+	return map[string]any{
+		"resourceType": "OperationOutcome",
+		"issue": []any{map[string]any{
+			"severity":    "error",
+			"code":        "invalid",
+			"diagnostics": msg,
+		}},
+	}
 }

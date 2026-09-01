@@ -127,6 +127,62 @@ func TestCompile_ReusableAcrossResources(t *testing.T) {
 	}
 }
 
+func typedEl(path, code string) map[string]any {
+	return map[string]any{"path": path, "type": []any{map[string]any{"code": code}}}
+}
+
+func TestCoercePrimitives_XMLTypes(t *testing.T) {
+	sd := minSD("Patient", []map[string]any{
+		typedEl("Patient.active", "boolean"),
+		{"path": "Patient.multipleBirth[x]", "type": []any{
+			map[string]any{"code": "boolean"}, map[string]any{"code": "integer"},
+		}},
+		typedEl("Patient.name", "HumanName"),
+		typedEl("Patient.name.family", "string"),
+	})
+	p := Compile(sd)
+
+	resource := map[string]any{
+		"resourceType":         "Patient",
+		"active":               "true",
+		"multipleBirthInteger": "3",
+		"name":                 []any{map[string]any{"family": "Smith"}},
+	}
+	p.CoercePrimitives(resource)
+
+	if v, ok := resource["active"].(bool); !ok || v != true {
+		t.Errorf("active: want bool true, got %T %v", resource["active"], resource["active"])
+	}
+	if v, ok := resource["multipleBirthInteger"].(float64); !ok || v != 3 {
+		t.Errorf("multipleBirthInteger: want number 3, got %T %v", resource["multipleBirthInteger"], resource["multipleBirthInteger"])
+	}
+	name := resource["name"].([]any)[0].(map[string]any)
+	if name["family"] != "Smith" {
+		t.Errorf("name.family should stay a string, got %T %v", name["family"], name["family"])
+	}
+}
+
+func TestCoercePrimitives_LeavesUnknownAndUnparseable(t *testing.T) {
+	sd := minSD("Observation", []map[string]any{
+		typedEl("Observation.valueInteger", "integer"),
+	})
+	p := Compile(sd)
+
+	resource := map[string]any{
+		"resourceType": "Observation",
+		"valueInteger": "not-a-number", // declared integer but unparseable → left as-is
+		"note":         "unmapped",     // no element metadata → untouched
+	}
+	p.CoercePrimitives(resource)
+
+	if resource["valueInteger"] != "not-a-number" {
+		t.Errorf("unparseable integer must be left unchanged, got %T %v", resource["valueInteger"], resource["valueInteger"])
+	}
+	if resource["note"] != "unmapped" {
+		t.Errorf("unmapped field must be left unchanged, got %T %v", resource["note"], resource["note"])
+	}
+}
+
 func TestCompile_NoElementsIsNoOp(t *testing.T) {
 	// An SD with no usable elements compiles to nil and validates as a no-op.
 	if p := Compile(map[string]any{"resourceType": "StructureDefinition", "type": "Patient"}); p != nil {

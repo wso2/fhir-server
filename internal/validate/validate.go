@@ -29,6 +29,7 @@ package validate
 import (
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/wso2/fhir-server/internal/fhirpath"
@@ -232,6 +233,84 @@ func Compile(sd map[string]any) *Profile {
 // SD should Compile once and reuse the returned *Profile.
 func AgainstProfile(resource, sd map[string]any) []Issue {
 	return Compile(sd).Validate(resource)
+}
+
+// CoercePrimitives converts primitive values in resource that arrived as JSON
+// strings to the Go type matching the element's declared FHIR type, so a
+// resource's stored shape does not depend on the wire format it was submitted
+// through. Values whose element type is unknown, or that do not parse as their
+// declared type, are left unchanged for downstream validation to handle.
+func (p *Profile) CoercePrimitives(resource map[string]any) {
+	if p == nil {
+		return
+	}
+	p.coerceObject(resource, p.rootType, 0)
+}
+
+// coerceObject walks obj against the profile's element metadata at sdPath,
+// mirroring CheckTypes' descent, and converts string primitives to their
+// declared FHIR type.
+func (p *Profile) coerceObject(obj map[string]any, sdPath string, depth int) {
+	if depth > maxCheckDepth {
+		return
+	}
+	for key, val := range obj {
+		if key == "resourceType" || strings.HasPrefix(key, "_") {
+			continue
+		}
+		info, choiceType, choiceBase := resolveElement(p, sdPath, key)
+		if info == nil {
+			continue
+		}
+		childSD := sdPath + "." + key
+		if choiceType != "" {
+			childSD = sdPath + "." + choiceBase + "[x]"
+		}
+		fhirType := choiceType
+		if fhirType == "" {
+			fhirType = firstType(info)
+		}
+		switch v := val.(type) {
+		case string:
+			if nv, ok := coercePrimitive(fhirType, v); ok {
+				obj[key] = nv
+			}
+		case map[string]any:
+			p.coerceObject(v, childSD, depth+1)
+		case []any:
+			for i, item := range v {
+				switch iv := item.(type) {
+				case string:
+					if nv, ok := coercePrimitive(fhirType, iv); ok {
+						v[i] = nv
+					}
+				case map[string]any:
+					p.coerceObject(iv, childSD, depth+1)
+				}
+			}
+		}
+	}
+}
+
+func coercePrimitive(fhirType, raw string) (any, bool) {
+	switch fhirType {
+	case "boolean":
+		if raw == "true" {
+			return true, true
+		}
+		if raw == "false" {
+			return false, true
+		}
+	case "integer", "unsignedInt", "positiveInt":
+		if n, err := strconv.Atoi(raw); err == nil {
+			return float64(n), true
+		}
+	case "decimal":
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f, true
+		}
+	}
+	return nil, false
 }
 
 // Validate checks resource against the compiled profile. A nil profile (an SD

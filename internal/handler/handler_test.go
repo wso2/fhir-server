@@ -42,6 +42,7 @@ type mockStore struct {
 	deleteFn            func(ctx context.Context, rt, id string) error
 	getHistoryFn        func(ctx context.Context, rt, id string) ([]store.HistoryEntry, error)
 	getTypeHistoryFn    func(ctx context.Context, p store.HistoryParams) (store.HistoryResult, error)
+	aggregateMetaFn     func(ctx context.Context, resourceType string) (map[string]any, error)
 	searchFn            func(ctx context.Context, sp store.SearchParams) (store.SearchResult, error)
 	lastNFn             func(ctx context.Context, params map[string][]string, maxN int) (store.SearchResult, error)
 	conditionalMatchFn  func(ctx context.Context, rt, rawQuery string) (string, int, error)
@@ -80,6 +81,12 @@ func (m *mockStore) GetTypeHistory(ctx context.Context, p store.HistoryParams) (
 		return m.getTypeHistoryFn(ctx, p)
 	}
 	return store.HistoryResult{}, nil
+}
+func (m *mockStore) AggregateMeta(ctx context.Context, resourceType string) (map[string]any, error) {
+	if m.aggregateMetaFn != nil {
+		return m.aggregateMetaFn(ctx, resourceType)
+	}
+	return map[string]any{}, nil
 }
 func (m *mockStore) Search(ctx context.Context, sp store.SearchParams) (store.SearchResult, error) {
 	return m.searchFn(ctx, sp)
@@ -120,10 +127,10 @@ func (m *mockStore) ExecuteBundle(ctx context.Context, bundleType, baseURL strin
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-func newRouter(s handler.StoreAPI) http.Handler {
+func newRouter(s handler.StoreAPI, opts ...handler.Options) http.Handler {
 	var ready atomic.Int32
 	ready.Store(1)
-	return handler.NewRouter(s, nil, nil, "http://localhost:9090/fhir/r4", &ready)
+	return handler.NewRouter(s, nil, nil, "http://localhost:9090/fhir/r4", &ready, opts...)
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
