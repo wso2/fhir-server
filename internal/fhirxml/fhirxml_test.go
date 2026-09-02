@@ -148,6 +148,67 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestToXML_RejectsInvalidElementName(t *testing.T) {
+	cases := []map[string]any{
+		{"resourceType": "Patient", "injected><forged": "x"},
+		{"resourceType": "Patient", "name;evil": "x"},
+		{"resourceType": "Pat ient"},
+		{"resourceType": "Patient?><!--"},
+	}
+	for _, resource := range cases {
+		out, err := ToXML(resource)
+		if err == nil {
+			t.Errorf("ToXML(%v): expected error for illegal name, got output %q", resource, out)
+		}
+	}
+}
+
+func TestToXML_AllowsNormalNames(t *testing.T) {
+	resource := map[string]any{
+		"resourceType": "Patient",
+		"active":       true,
+		"name":         []any{map[string]any{"family": "Smith"}},
+	}
+	if _, err := ToXML(resource); err != nil {
+		t.Fatalf("ToXML of a normal resource must succeed: %v", err)
+	}
+}
+
+func TestFromXML_RejectsExcessiveNesting(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<Patient xmlns="http://hl7.org/fhir">`)
+	const depth = maxXMLDepth + 50
+	for i := 0; i < depth; i++ {
+		b.WriteString("<x>")
+	}
+	for i := 0; i < depth; i++ {
+		b.WriteString("</x>")
+	}
+	b.WriteString(`</Patient>`)
+
+	if _, err := FromXML([]byte(b.String())); err == nil {
+		t.Fatal("FromXML: expected an error for input past the depth limit, got nil")
+	}
+}
+
+func TestFromXML_AllowsReasonableNesting(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<Patient xmlns="http://hl7.org/fhir">`)
+	const depth = 20
+	for i := 0; i < depth; i++ {
+		b.WriteString("<x>")
+	}
+	b.WriteString(`<family value="Smith"/>`)
+	for i := 0; i < depth; i++ {
+		b.WriteString("</x>")
+	}
+	b.WriteString(`</Patient>`)
+
+	if _, err := FromXML([]byte(b.String())); err != nil {
+		t.Fatalf("FromXML of moderately nested input must succeed: %v", err)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

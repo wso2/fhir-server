@@ -29,6 +29,7 @@ package fhirttl
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,22 +37,43 @@ import (
 
 const prefix = "@prefix fhir: <http://hl7.org/fhir/> .\n\n"
 
+// validFHIRElementName matches the ASCII-identifier grammar FHIR element names
+// and resourceType values use.
+var validFHIRElementName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
+
+// validFHIRFieldName additionally allows the single leading underscore FHIR uses
+// for primitive-extension sibling keys (e.g. "_birthDate", "_status").
+var validFHIRFieldName = regexp.MustCompile(`^_?[A-Za-z][A-Za-z0-9]*$`)
+
+func isValidElementName(name string) bool {
+	return validFHIRElementName.MatchString(name)
+}
+
+func isValidFieldName(name string) bool {
+	return validFHIRFieldName.MatchString(name)
+}
+
 // ToTurtle serializes a FHIR resource map to Turtle.
 func ToTurtle(resource map[string]any) ([]byte, error) {
 	rt, _ := resource["resourceType"].(string)
 	if rt == "" {
 		return nil, fmt.Errorf("resource has no resourceType")
 	}
+	if !isValidElementName(rt) {
+		return nil, fmt.Errorf("invalid resourceType %q: not a legal FHIR resource type name", rt)
+	}
 	var b strings.Builder
 	b.WriteString(prefix)
 	b.WriteString("[ a fhir:")
 	b.WriteString(rt)
-	writeObjectBody(&b, resource, 1)
+	if err := writeObjectBody(&b, resource, 1); err != nil {
+		return nil, err
+	}
 	b.WriteString("\n] .\n")
 	return []byte(b.String()), nil
 }
 
-func writeObjectBody(b *strings.Builder, obj map[string]any, depth int) {
+func writeObjectBody(b *strings.Builder, obj map[string]any, depth int) error {
 	indent := strings.Repeat("  ", depth)
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -62,20 +84,28 @@ func writeObjectBody(b *strings.Builder, obj map[string]any, depth int) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
+		if !isValidFieldName(k) {
+			return fmt.Errorf("invalid field name %q: not a legal FHIR element name", k)
+		}
 		b.WriteString(" ;\n")
 		b.WriteString(indent)
 		b.WriteString("fhir:")
 		b.WriteString(k)
 		b.WriteString(" ")
-		writeValue(b, obj[k], depth)
+		if err := writeValue(b, obj[k], depth); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func writeValue(b *strings.Builder, v any, depth int) {
+func writeValue(b *strings.Builder, v any, depth int) error {
 	switch val := v.(type) {
 	case map[string]any:
 		b.WriteString("[")
-		writeObjectBody(b, val, depth+1)
+		if err := writeObjectBody(b, val, depth+1); err != nil {
+			return err
+		}
 		b.WriteString("\n")
 		b.WriteString(strings.Repeat("  ", depth))
 		b.WriteString("]")
@@ -83,7 +113,9 @@ func writeValue(b *strings.Builder, v any, depth int) {
 		b.WriteString("(")
 		for _, item := range val {
 			b.WriteString(" ")
-			writeValue(b, item, depth+1)
+			if err := writeValue(b, item, depth+1); err != nil {
+				return err
+			}
 		}
 		b.WriteString(" )")
 	case string:
@@ -101,6 +133,7 @@ func writeValue(b *strings.Builder, v any, depth int) {
 	default:
 		b.WriteString(quote(fmt.Sprintf("%v", val)))
 	}
+	return nil
 }
 
 func quote(s string) string {

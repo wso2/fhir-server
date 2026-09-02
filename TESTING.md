@@ -27,7 +27,7 @@ All 107 **unit tests** have no database, no Docker, no network (IG cache-miss te
 |---|---|---|
 | `internal/fhirpath` | 20 | FHIRPath evaluator — path traversal, array flattening, union (`\|`), `where()`, `extension()`, `ofType()`, `EvaluatePolymorphic` |
 | `internal/searchparam` | 10 | Registry `Upsert` / `Lookup` / `ForResource` / `Remove`, overwrite semantics, concurrent access |
-| `internal/store` | 24 | `mergePatch` (RFC 7396), `setMeta`, `unmarshalWithMeta`, date-range expansion, `splitModifier`, `extractComparatorPrefix`, `looksLikeDate/Number`, `NotFoundError` |
+| `internal/store` | 24+ | `mergePatch` (RFC 7396), `setMeta`, `unmarshalWithMeta`, date-range expansion, `splitModifier`, `extractComparatorPrefix`, `looksLikeDate/Number`, `NotFoundError`; referential-integrity reference walk (`collectLocalRefs`: local/absolute/urn/fragment/conditional/logical shapes, Bundle exemption) and error messages |
 | `internal/ig` | 17 | `parseSpec`, `parsePackage` (synthetic .tgz), disk-cache hit/miss/write, explicit URL fetch, HTTP 404, registry URL path |
 | `internal/config` | 14 | All env vars, defaults, `DATABASE_URL` vs component vars, `SERVER_PORT` validation, `IG_PACKAGES` comma-splitting, `BASE_URL` default includes port |
 | `internal/handler` | 22 | All REST endpoints (read, vread, create, update, patch, delete, search, history, $everything, metadata), health probes, FHIR content-type, error shapes |
@@ -43,7 +43,7 @@ Run with `go test -tags integration -timeout 300s <package>`. Requires Docker.
 |---|---|---|
 | `internal/db` | 3 | `CreateTables` creates all 12 expected tables; `search_param_definitions` has all required columns; table creation is idempotent |
 | `internal/seed` | 4 | `SeedSearchParams` inserts ≥100 FHIR R4 base params; seeding is idempotent; 8 known params are present; all 5 param types exist |
-| `internal/store` | ~30 | Full CRUD lifecycle (create→read→update→patch→delete); version history; pagination; search by string/token/date params; `_id` search; deleted resources excluded; `FetchReferences` forward and reverse; `SearchParameter` sync and delete |
+| `internal/store` | ~40 | Full CRUD lifecycle (create→read→update→patch→delete); version history; pagination; search by string/token/date params; `_id` search; deleted resources excluded; `FetchReferences` forward and reverse; `SearchParameter` sync and delete; referential integrity (dangling create/update rejected 422, referenced delete rejected 409, soft-deleted targets, transaction-bundle order-independence and rollback, disable flags) |
 | `internal/index` | 6 | `Extractor.Index` writes to `sp_string`, `sp_token`, `sp_date`, `sp_reference`; CodeableConcept token extraction; `Delete` clears all `sp_*` tables for a resource |
 | **Total** | **~43** | **Real PostgreSQL, no mocks** |
 

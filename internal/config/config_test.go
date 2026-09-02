@@ -302,6 +302,9 @@ func clearIGEnv(t *testing.T) {
 		"FHIR_SERVER_CONFIG",
 		"SEARCH_PROBE_CAP", "SEARCH_DEFAULT_PAGE_SIZE", "SEARCH_MAX_PAGE_SIZE",
 		"SEARCH_MAX_CHAIN_DEPTH", "DATABASE_PLAN_CACHE_MODE",
+		"FHIR_VALIDATION_BASE", "FHIR_VALIDATION_PROFILE",
+		"FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_WRITE", "FHIR_VALIDATION_REFERENTIAL_INTEGRITY_ON_DELETE",
+		"FHIR_BASE_VALIDATION", "FHIR_VALIDATE_ON_WRITE",
 	} {
 		t.Setenv(k, "")
 	}
@@ -322,6 +325,29 @@ func TestLoad_Timeouts_Defaults(t *testing.T) {
 	}
 	if cfg.IdleTimeout != 120*time.Second {
 		t.Errorf("default IdleTimeout: got %v, want 120s", cfg.IdleTimeout)
+	}
+	if cfg.MaxRequestBodyBytes != 200<<20 {
+		t.Errorf("default MaxRequestBodyBytes: got %d, want %d (200 MiB)", cfg.MaxRequestBodyBytes, 200<<20)
+	}
+}
+
+func TestLoad_MaxRequestBodyBytes_EnvOverride(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("SERVER_MAX_REQUEST_BODY_BYTES", "524288000") // 500 MiB
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != 500<<20 {
+		t.Errorf("MaxRequestBodyBytes: got %d, want %d (env should win)", cfg.MaxRequestBodyBytes, 500<<20)
+	}
+}
+
+func TestLoad_MaxRequestBodyBytes_RejectsOutOfRange(t *testing.T) {
+	clearIGEnv(t)
+	t.Setenv("SERVER_MAX_REQUEST_BODY_BYTES", "1024") // below the 1 MiB minimum
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected an error for an out-of-range MaxRequestBodyBytes, got nil")
 	}
 }
 

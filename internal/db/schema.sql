@@ -725,8 +725,7 @@ ALTER TABLE sp_composite_token_quantity SET (autovacuum_vacuum_scale_factor = 0.
 -- on write.
 --
 -- NOTE: the server (and any tooling that touches these tables at runtime) MUST
--- connect as a NON-superuser role — superusers and roles with BYPASSRLS ignore
--- Row-Level Security entirely.
+-- connect as a NOSUPERUSER, NOBYPASSRLS role.
 DO $rls$
 DECLARE
     t             text;

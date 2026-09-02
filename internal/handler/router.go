@@ -42,6 +42,13 @@ type Options struct {
 	// StructureDefinitions on write. Base validation is on by default, so the
 	// zero value keeps it enabled; set via FHIR_BASE_VALIDATION=false.
 	DisableBaseValidation bool
+	// ReferentialIntegrityEnforced reflects the store's referential-integrity
+	// setting so the CapabilityStatement can advertise referencePolicy
+	// "enforced". Purely informational: enforcement itself lives in the store.
+	ReferentialIntegrityEnforced bool
+	// MaxRequestBodyBytes caps how much of any request body is read before a 413.
+	// Zero selects the built-in default (defaultMaxRequestBodyBytes).
+	MaxRequestBodyBytes int64
 }
 
 // NewRouter constructs the chi router. An optional Options controls validation
@@ -62,6 +69,10 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	maxBodyBytes := opt.MaxRequestBodyBytes
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = defaultMaxRequestBodyBytes
+	}
 	h := &fhirHandler{
 		store:           s,
 		pool:            pool,
@@ -70,7 +81,9 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 		igReady:         igReady,
 		validateOnWrite: opt.ValidateOnWrite,
 		baseValidation:  !opt.DisableBaseValidation,
+		refIntegrity:    opt.ReferentialIntegrityEnforced,
 		baseDefs:        basedef.NewCache(pool),
+		maxBodyBytes:    maxBodyBytes,
 	}
 
 	// Health probes
@@ -204,5 +217,7 @@ type fhirHandler struct {
 	igReady         *atomic.Int32
 	validateOnWrite bool           // enforce profile validation on create/update when true
 	baseValidation  bool           // validate writes against base FHIR R4 SDs when true
+	refIntegrity    bool           // referential integrity enforced by the store (CapabilityStatement advertisement)
 	baseDefs        *basedef.Cache // memoized base StructureDefinition lookup by resource type
+	maxBodyBytes    int64          // request body cap in bytes (413 on overflow)
 }

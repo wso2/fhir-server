@@ -29,6 +29,7 @@ package validate
 import (
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/wso2/fhir-server/internal/fhirpath"
@@ -67,6 +68,23 @@ type sliceEntry struct {
 	min     int
 }
 
+// elemInfo is the per-element type metadata used by instance type/shape
+// checking (CheckTypes): the declared type codes, whether the element repeats,
+// and a contentReference target for BackboneElement reuse (e.g.
+// Questionnaire.item.item → #Questionnaire.item).
+type elemInfo struct {
+	types      []string
+	repeats    bool
+	contentRef string
+}
+
+// choiceElem is one choice-typed element ("value[x]") within a parent path,
+// indexed so instance keys like "valueBoolean" can be resolved to it.
+type choiceElem struct {
+	base string // element name without the [x] marker, e.g. "value"
+	path string // full SD path, e.g. "Parameters.parameter.value[x]"
+}
+
 // Profile is a compiled StructureDefinition. Everything derived solely from the
 // SD — the constraint map, invariants and slice groups — is extracted once by
 // Compile, so validating many resources of the same type does not re-parse the
@@ -76,6 +94,8 @@ type Profile struct {
 	constraints map[string]elemConstraint
 	invariants  []invariant
 	sliceGroups map[string][]sliceEntry
+	elements    map[string]elemInfo     // SD path → type metadata (first, non-slice entry wins)
+	choices     map[string][]choiceElem // parent SD path → choice elements at that level
 }
 
 // Compile extracts the SD-derived validation data from a StructureDefinition.
@@ -100,6 +120,8 @@ func Compile(sd map[string]any) *Profile {
 		rootType:    rootType,
 		constraints: make(map[string]elemConstraint, len(elements)),
 		sliceGroups: map[string][]sliceEntry{},
+		elements:    make(map[string]elemInfo, len(elements)),
+		choices:     map[string][]choiceElem{},
 	}
 
 	for _, raw := range elements {
@@ -133,6 +155,38 @@ func Compile(sd map[string]any) *Profile {
 			}
 		}
 		p.constraints[path] = c
+
+		// Type metadata for instance type/shape checking. Named slices repeat
+		// their parent element's path with narrower constraints — the base
+		// (first) entry is the one that describes the element itself.
+		sliceName, _ := el["sliceName"].(string)
+		if _, seen := p.elements[path]; !seen && sliceName == "" {
+			info := elemInfo{}
+			if maxV, ok := el["max"].(string); ok {
+				info.repeats = maxV != "1" && maxV != "0"
+			}
+			if ref, _ := el["contentReference"].(string); ref != "" {
+				info.contentRef = strings.TrimPrefix(ref, "#")
+			}
+			if typeArr, _ := el["type"].([]any); len(typeArr) > 0 {
+				for _, tRaw := range typeArr {
+					tm, _ := tRaw.(map[string]any)
+					if tm == nil {
+						continue
+					}
+					if code, _ := tm["code"].(string); code != "" {
+						info.types = append(info.types, normalizeTypeCode(code))
+					}
+				}
+			}
+			p.elements[path] = info
+			if base, ok := strings.CutSuffix(path, "[x]"); ok {
+				if i := strings.LastIndex(base, "."); i > 0 {
+					parent, leaf := base[:i], base[i+1:]
+					p.choices[parent] = append(p.choices[parent], choiceElem{base: leaf, path: path})
+				}
+			}
+		}
 
 		// FHIRPath invariants declared on this element.
 		constArr, _ := el["constraint"].([]any)
@@ -179,6 +233,84 @@ func Compile(sd map[string]any) *Profile {
 // SD should Compile once and reuse the returned *Profile.
 func AgainstProfile(resource, sd map[string]any) []Issue {
 	return Compile(sd).Validate(resource)
+}
+
+// CoercePrimitives converts primitive values in resource that arrived as JSON
+// strings to the Go type matching the element's declared FHIR type, so a
+// resource's stored shape does not depend on the wire format it was submitted
+// through. Values whose element type is unknown, or that do not parse as their
+// declared type, are left unchanged for downstream validation to handle.
+func (p *Profile) CoercePrimitives(resource map[string]any) {
+	if p == nil {
+		return
+	}
+	p.coerceObject(resource, p.rootType, 0)
+}
+
+// coerceObject walks obj against the profile's element metadata at sdPath,
+// mirroring CheckTypes' descent, and converts string primitives to their
+// declared FHIR type.
+func (p *Profile) coerceObject(obj map[string]any, sdPath string, depth int) {
+	if depth > maxCheckDepth {
+		return
+	}
+	for key, val := range obj {
+		if key == "resourceType" || strings.HasPrefix(key, "_") {
+			continue
+		}
+		info, choiceType, choiceBase := resolveElement(p, sdPath, key)
+		if info == nil {
+			continue
+		}
+		childSD := sdPath + "." + key
+		if choiceType != "" {
+			childSD = sdPath + "." + choiceBase + "[x]"
+		}
+		fhirType := choiceType
+		if fhirType == "" {
+			fhirType = firstType(info)
+		}
+		switch v := val.(type) {
+		case string:
+			if nv, ok := coercePrimitive(fhirType, v); ok {
+				obj[key] = nv
+			}
+		case map[string]any:
+			p.coerceObject(v, childSD, depth+1)
+		case []any:
+			for i, item := range v {
+				switch iv := item.(type) {
+				case string:
+					if nv, ok := coercePrimitive(fhirType, iv); ok {
+						v[i] = nv
+					}
+				case map[string]any:
+					p.coerceObject(iv, childSD, depth+1)
+				}
+			}
+		}
+	}
+}
+
+func coercePrimitive(fhirType, raw string) (any, bool) {
+	switch fhirType {
+	case "boolean":
+		if raw == "true" {
+			return true, true
+		}
+		if raw == "false" {
+			return false, true
+		}
+	case "integer", "unsignedInt", "positiveInt":
+		if n, err := strconv.Atoi(raw); err == nil {
+			return float64(n), true
+		}
+	case "decimal":
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f, true
+		}
+	}
+	return nil, false
 }
 
 // Validate checks resource against the compiled profile. A nil profile (an SD

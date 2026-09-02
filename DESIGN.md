@@ -172,6 +172,9 @@ recorded in history.
 - **Why:** preserves history and referential context, and lets a subsequent `PUT`
   resurrect the id with a new version. A partial index `WHERE is_deleted = FALSE` keeps
   the common "active resources only" search path fast.
+- Whether a delete is *allowed* while other resources still reference the target is a
+  separate, configurable question — see [Referential integrity](#referential-integrity-configurable-on-by-default)
+  in §8.
 
 ### What lives where
 
@@ -256,7 +259,7 @@ the base search path simple matters more than micro-optimizing the traversal cas
 
 ## 5. Multi-tenancy
 
-The server supports two deployment models (`internal/tenant`, README §5):
+The server supports two deployment models (`internal/tenant`, README §6):
 
 1. **One database (or server) per tenant** — ignore tenancy; everything uses the
    `default` tenant. Simplest, strongest isolation.
@@ -379,7 +382,7 @@ The server has two layers, and the profile layer is intentionally narrow.
 ### Structural validation (always on)
 
 Basic structural checks apply to create, update, and `$validate`
-(`internal/handler`, README §"Validation rules"): correct `Content-Type`, body
+(`internal/handler`, README §9 Validation): correct `Content-Type`, body
 `resourceType` matches the URL, required fields present, and body `id` matches URL `id`
 on `PUT`. These guard the store from obviously malformed input.
 
@@ -405,6 +408,34 @@ When a loaded profile is violated, the write fails with **422** and an `Operatio
   from an IG this server hasn't loaded; rejecting it would be wrong. The trade-off is
   that a typo'd profile URL is silently ignored rather than flagged.
 
+### Referential integrity (configurable, on by default)
+
+Enforcement lives in the **store**, not the validator (`internal/store/integrity.go`):
+referential integrity is a property of what the database is allowed to contain, not of
+any one resource body, so it belongs with the transaction that changes that state.
+
+- **On write** (`validation.referentialIntegrityOnWrite`, default on): every local
+  literal reference (`Type/id`) carried by a written resource must resolve to a live
+  resource, or the transaction aborts with a 422. Absolute URLs, `urn:` values, `#`
+  fragments, conditional and identifier-only references are out of scope, as are
+  `Bundle`-typed resources (entry-local reference semantics).
+- **On delete** (`validation.referentialIntegrityOnDelete`, default on): a resource
+  still referenced through `sp_reference` cannot be deleted (409, naming referrers).
+- **Why post-flush verification:** both checks run once per transaction, *after* the
+  batched flush, against the transaction's final state. This makes transaction Bundles
+  order-independent (create target and referrer in any order; delete a target while
+  re-pointing its referrers in the same Bundle) and keeps the write-path cost bounded:
+  one target-lookup query per 5,000 unique reference targets plus one referrer query
+  when the transaction deletes anything — independent of entry count.
+- **Why the store option defaults to off while the config defaults to on:** the zero
+  value of `store.RefIntegrity` preserves the store's historical behavior for embedded
+  callers and tests; `internal/config` resolves the production default (both on) and
+  `cmd/server` wires it through `store.WithReferentialIntegrity`.
+- **Trade-off:** the delete-side check reads `sp_reference`, so an absolute reference
+  to *another server* whose URL tail happens to match a local `Type/id` can block a
+  delete spuriously (references are indexed by their parsed tail). Accepted: rare, and
+  conservative in the safe direction.
+
 ### `$validate`
 
 The `$validate` operation validates an arbitrary resource against profiles named by a
@@ -415,7 +446,7 @@ The `$validate` operation validates an arbitrary resource against profiles named
 
 ## 9. Terminology
 
-**The server is not a terminology server, by design** (`internal/terminology`, README §9).
+**The server is not a terminology server, by design** (`internal/terminology`, README §11).
 
 - It does **not** host `CodeSystem`/`ValueSet`/`ConceptMap`, expose `$lookup`/`$translate`,
   or validate coded values against their bound value sets. Structural validation is
@@ -584,6 +615,7 @@ Consolidated here so they're easy to find. Each is a conscious choice, not an ov
 | Terminology | No local code-system/value-set logic; delegate to external TX server | Terminology is a large, separately-maintained problem |
 | JSON indexing | No GIN index on `resource_json` | ~2.4× write cost for no benefit to the query patterns used |
 | Validation | Profile validation off by default, and only for resources declaring `meta.profile` | Interoperability first; strictness is opt-in |
+| Referential integrity | Enforced by default on write (422) and delete (409); each independently disableable via `validation.*` | Safe by default — dangling references corrupt clinical data silently; bulk loaders can opt out |
 | Unknown profile URL | Soft-skip, not 422 | A resource may reference an IG this server hasn't loaded |
 | Reindex | No reindex of existing data when params change ([#11](https://github.com/wso2/fhir-server/issues/11)) | Indexing is write-time; bulk reindex is future work |
 | Search params | Composite & special (e.g. `Location.near` without support) fail closed | Don't silently widen result sets |

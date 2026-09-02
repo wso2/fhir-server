@@ -87,7 +87,6 @@ type bundleOp struct {
 	ifMatch      int        // parsed If-Match version, or -1 for none
 	query        url.Values // GET search / conditional delete filter
 	isSearch     bool       // GET against a type (search) vs GET of an instance (read)
-	allowCreate  bool       // PUT may create when the target is missing (conditional update, 0 matches)
 
 	// conditional-create / -update that matched an existing resource: no write
 	// is performed and the entry resolves to the matched resource.
@@ -189,7 +188,7 @@ func (s *Store) executeTransaction(ctx context.Context, baseURL string, entries 
 	// Flush the whole bundle's buffered index, resources, and history writes as a
 	// handful of batched INSERT / DELETE statements before COMMIT. A row-limit
 	// overflow surfaces here as a 413 (WriteLimitError → storeErrToBundleErr).
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		be := storeErrToBundleErr(err)
 		be.EntryIndex = -1
 		return nil, be
@@ -253,10 +252,12 @@ func (s *Store) runOpInTx(ctx context.Context, tx pgx.Tx, op bundleOp, w *bundle
 	case "PUT":
 		res, err := s.updateInTx(ctx, tx, op.resourceType, op.id, op.body, op.ifMatch, w)
 		if err != nil {
-			// A conditional update that matched zero resources creates the target;
-			// a plain PUT to a missing id is a 404 (the server does not do
-			// update-as-create), which in a transaction rolls everything back.
-			if _, ok := err.(NotFoundError); ok && op.allowCreate {
+			// A missing target creates the resource at the requested id (FHIR
+			// "update as create"): a conditional update that matched zero
+			// resources, or a plain PUT to a new id. A PUT with an If-Match
+			// precondition never creates — the version check against a missing
+			// resource stays a 404, which rolls the transaction back.
+			if _, ok := err.(NotFoundError); ok && op.ifMatch < 0 {
 				op.body["id"] = op.id
 				// Write this created row immediately (deferResource=false): the
 				// conditional target id may be referenced by a later entry.
@@ -383,7 +384,7 @@ func (s *Store) executeBatch(ctx context.Context, baseURL string, entries []Bund
 			results[i] = batchFailure(berr)
 			continue
 		}
-		if ferr := w.flush(ctx, tx); ferr != nil {
+		if ferr := s.flushAndVerify(ctx, tx, w); ferr != nil {
 			tx.Rollback(ctx)
 			results[i] = batchFailure(storeErrToBundleErr(ferr))
 			continue
@@ -470,6 +471,10 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 			if op.body == nil {
 				op.body = map[string]any{}
 			}
+			if existingRT, ok := op.body["resourceType"].(string); ok && existingRT != "" && existingRT != rt {
+				return nil, nil, &BundleError{HTTPStatus: 422, Code: "invalid", EntryIndex: i,
+					Diagnostics: fmt.Sprintf("body resourceType %q does not match request.url resource type %q", existingRT, rt)}
+			}
 			op.body["id"] = newID
 			op.body["resourceType"] = rt
 			if e.FullURL != "" {
@@ -496,7 +501,6 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 					op.id = existingID
 				} else {
 					op.id = assignedID(e.Resource) // create with a fresh (or body-supplied) id
-					op.allowCreate = true
 				}
 			}
 			if op.id == "" {
@@ -577,6 +581,13 @@ func (s *Store) conditionalMatch(ctx context.Context, resourceType, rawQuery str
 }
 
 // ─── URL / reference helpers ───────────────────────────────────────────────────
+
+// ParseEntryURL splits a Bundle entry.request.url into its parts, exposing
+// parseEntryURL to the handler layer so both layers derive an entry's resource
+// type the same way.
+func ParseEntryURL(baseURL, raw string) (resourceType, id, versionID string, query url.Values, errMsg string) {
+	return parseEntryURL(baseURL, raw)
+}
 
 // parseEntryURL splits a Bundle entry.request.url (relative to the FHIR base,
 // or absolute under baseURL) into its parts. On a malformed URL it returns a
@@ -734,6 +745,10 @@ func storeErrToBundleErr(err error) *BundleError {
 		return &BundleError{HTTPStatus: 412, Code: "conflict", Diagnostics: e.Error()}
 	case WriteLimitError:
 		return &BundleError{HTTPStatus: 413, Code: "too-costly", Diagnostics: e.Error()}
+	case ReferentialIntegrityError:
+		return &BundleError{HTTPStatus: 422, Code: "processing", Diagnostics: e.Error()}
+	case ReferencedByError:
+		return &BundleError{HTTPStatus: 409, Code: "conflict", Diagnostics: e.Error()}
 	default:
 		return &BundleError{HTTPStatus: 500, Code: "exception", Diagnostics: err.Error()}
 	}
@@ -755,6 +770,8 @@ func httpReason(status int) string {
 		return "Method Not Allowed"
 	case 410:
 		return "Gone"
+	case 409:
+		return "Conflict"
 	case 412:
 		return "Precondition Failed"
 	case 422:

@@ -226,6 +226,76 @@ func TestUpdate_NotFound(t *testing.T) {
 	}
 }
 
+func TestUpdateOrCreate_CreatesWhenMissing(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	res, created, err := s.UpdateOrCreate(ctx, "Patient", "client-chosen-id", map[string]any{
+		"resourceType": "Patient",
+		"active":       true,
+	}, -1)
+	if err != nil {
+		t.Fatalf("UpdateOrCreate: %v", err)
+	}
+	if !created {
+		t.Error("expected created=true for a missing id")
+	}
+	if res["id"] != "client-chosen-id" {
+		t.Errorf("expected id=client-chosen-id, got %v", res["id"])
+	}
+	meta := res["meta"].(map[string]any)
+	if meta["versionId"] != "1" {
+		t.Errorf("expected versionId=1, got %v", meta["versionId"])
+	}
+
+	// The created resource must be readable and searchable like any other.
+	got, err := s.Read(ctx, "Patient", "client-chosen-id")
+	if err != nil {
+		t.Fatalf("Read after update-as-create: %v", err)
+	}
+	if got["active"] != true {
+		t.Errorf("expected active=true, got %v", got["active"])
+	}
+}
+
+func TestUpdateOrCreate_UpdatesExisting(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	created, _ := s.Create(ctx, "Patient", map[string]any{
+		"resourceType": "Patient",
+		"active":       true,
+	})
+	id := created["id"].(string)
+
+	res, wasCreated, err := s.UpdateOrCreate(ctx, "Patient", id, map[string]any{
+		"resourceType": "Patient",
+		"id":           id,
+		"active":       false,
+	}, -1)
+	if err != nil {
+		t.Fatalf("UpdateOrCreate: %v", err)
+	}
+	if wasCreated {
+		t.Error("expected created=false for an existing id")
+	}
+	meta := res["meta"].(map[string]any)
+	if meta["versionId"] != "2" {
+		t.Errorf("expected versionId=2, got %v", meta["versionId"])
+	}
+}
+
+func TestUpdateOrCreate_IfMatchNeverCreates(t *testing.T) {
+	s := newStore(t)
+	_, _, err := s.UpdateOrCreate(context.Background(), "Patient", "ghost-id", map[string]any{
+		"resourceType": "Patient",
+	}, 2)
+	var nfe store.NotFoundError
+	if !errors.As(err, &nfe) {
+		t.Fatalf("expected NotFoundError when If-Match targets a missing resource, got %T: %v", err, err)
+	}
+}
+
 // ─── Patch ────────────────────────────────────────────────────────────────────
 
 func TestPatch_MergesFields(t *testing.T) {

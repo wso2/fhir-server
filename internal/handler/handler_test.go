@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -36,10 +37,12 @@ type mockStore struct {
 	getVersionFn        func(ctx context.Context, rt, id string, vid int) (map[string]any, error)
 	createFn            func(ctx context.Context, rt string, body map[string]any) (map[string]any, error)
 	updateFn            func(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, error)
+	updateOrCreateFn    func(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error)
 	patchFn             func(ctx context.Context, rt, id string, patch map[string]any) (map[string]any, error)
 	deleteFn            func(ctx context.Context, rt, id string) error
 	getHistoryFn        func(ctx context.Context, rt, id string) ([]store.HistoryEntry, error)
 	getTypeHistoryFn    func(ctx context.Context, p store.HistoryParams) (store.HistoryResult, error)
+	aggregateMetaFn     func(ctx context.Context, resourceType string) (map[string]any, error)
 	searchFn            func(ctx context.Context, sp store.SearchParams) (store.SearchResult, error)
 	lastNFn             func(ctx context.Context, params map[string][]string, maxN int) (store.SearchResult, error)
 	conditionalMatchFn  func(ctx context.Context, rt, rawQuery string) (string, int, error)
@@ -61,6 +64,9 @@ func (m *mockStore) Create(ctx context.Context, rt string, body map[string]any) 
 func (m *mockStore) Update(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, error) {
 	return m.updateFn(ctx, rt, id, body, ifMatchVersion)
 }
+func (m *mockStore) UpdateOrCreate(ctx context.Context, rt, id string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+	return m.updateOrCreateFn(ctx, rt, id, body, ifMatchVersion)
+}
 func (m *mockStore) Patch(ctx context.Context, rt, id string, patch map[string]any) (map[string]any, error) {
 	return m.patchFn(ctx, rt, id, patch)
 }
@@ -75,6 +81,12 @@ func (m *mockStore) GetTypeHistory(ctx context.Context, p store.HistoryParams) (
 		return m.getTypeHistoryFn(ctx, p)
 	}
 	return store.HistoryResult{}, nil
+}
+func (m *mockStore) AggregateMeta(ctx context.Context, resourceType string) (map[string]any, error) {
+	if m.aggregateMetaFn != nil {
+		return m.aggregateMetaFn(ctx, resourceType)
+	}
+	return map[string]any{}, nil
 }
 func (m *mockStore) Search(ctx context.Context, sp store.SearchParams) (store.SearchResult, error) {
 	return m.searchFn(ctx, sp)
@@ -115,10 +127,10 @@ func (m *mockStore) ExecuteBundle(ctx context.Context, bundleType, baseURL strin
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-func newRouter(s handler.StoreAPI) http.Handler {
+func newRouter(s handler.StoreAPI, opts ...handler.Options) http.Handler {
 	var ready atomic.Int32
 	ready.Store(1)
-	return handler.NewRouter(s, nil, nil, "http://localhost:9090/fhir/r4", &ready)
+	return handler.NewRouter(s, nil, nil, "http://localhost:9090/fhir/r4", &ready, opts...)
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -138,6 +150,28 @@ func doWithCT(t *testing.T, h http.Handler, method, path string, body any, conte
 	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
 	if body != nil {
 		req.Header.Set("Content-Type", contentType)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+func doWithHeaders(t *testing.T, h http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var bodyBytes []byte
+	if body != nil {
+		var err error
+		bodyBytes, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/fhir+json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -280,13 +314,175 @@ func TestCreate_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestCreate_RequiredFields_Condition_MissingSubject(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{"resourceType": "Condition", "code": map[string]any{"text": "headache"}}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+	body := decodeJSON(t, w)
+	issue := body["issue"].([]any)[0].(map[string]any)
+	if got := issue["diagnostics"]; got != `missing or empty required field "subject" for Condition` {
+		t.Errorf("unexpected diagnostics: %v", got)
+	}
+}
+
+func TestCreate_RequiredFields_Condition_NullSubject(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      nil,
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_Condition_EmptySubjectObject(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      map[string]any{},
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_AllergyIntolerance_EmptyPatientArray(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "AllergyIntolerance",
+		"patient":      []any{},
+		"code":         map[string]any{"text": "peanuts"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/AllergyIntolerance", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_MissingStatus(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"code":         map[string]any{"text": "blood panel"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_EmptyStatus(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"status":       "",
+		"code":         map[string]any{"text": "blood panel"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_MissingCode(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"status":       "final",
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_AllergyIntolerance_MissingPatient(t *testing.T) {
+	h := newRouter(&mockStore{})
+	payload := map[string]any{
+		"resourceType": "AllergyIntolerance",
+		"code":         map[string]any{"text": "peanuts"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/AllergyIntolerance", payload)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_DiagnosticReport_Valid(t *testing.T) {
+	ms := &mockStore{}
+	ms.createFn = func(_ context.Context, rt string, body map[string]any) (map[string]any, error) {
+		body["id"] = "generated-id"
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{
+		"resourceType": "DiagnosticReport",
+		"status":       "final",
+		"code":         map[string]any{"text": "blood panel"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/DiagnosticReport", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_Condition_Valid(t *testing.T) {
+	ms := &mockStore{}
+	ms.createFn = func(_ context.Context, rt string, body map[string]any) (map[string]any, error) {
+		body["id"] = "generated-id"
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{
+		"resourceType": "Condition",
+		"subject":      map[string]any{"reference": "Patient/p1"},
+		"code":         map[string]any{"text": "headache"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Condition", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+}
+
+func TestCreate_RequiredFields_AllergyIntolerance_Valid(t *testing.T) {
+	ms := &mockStore{}
+	ms.createFn = func(_ context.Context, rt string, body map[string]any) (map[string]any, error) {
+		body["id"] = "generated-id"
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{
+		"resourceType": "AllergyIntolerance",
+		"patient":      map[string]any{"reference": "Patient/p1"},
+		"code":         map[string]any{"text": "peanuts"},
+	}
+	w := do(t, h, http.MethodPost, "/fhir/r4/AllergyIntolerance", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+}
+
 // ─── Update ───────────────────────────────────────────────────────────────────
 
 func TestUpdate_Success(t *testing.T) {
 	ms := &mockStore{}
-	ms.updateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, error) {
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, bool, error) {
 		body["meta"] = map[string]any{"versionId": "2"}
-		return body, nil
+		return body, false, nil
 	}
 
 	h := newRouter(ms)
@@ -297,17 +493,98 @@ func TestUpdate_Success(t *testing.T) {
 	}
 }
 
-func TestUpdate_NotFound(t *testing.T) {
+func TestUpdate_CreatesWhenMissing(t *testing.T) {
 	ms := &mockStore{}
-	ms.updateFn = func(_ context.Context, rt, id string, _ map[string]any, _ int) (map[string]any, error) {
-		return nil, store.NotFoundError{ResourceType: rt, ResourceID: id}
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, body map[string]any, _ int) (map[string]any, bool, error) {
+		body["meta"] = map[string]any{"versionId": "1"}
+		return body, true, nil
+	}
+
+	h := newRouter(ms)
+	payload := map[string]any{"resourceType": "Patient", "id": "new-id", "active": true}
+	w := do(t, h, http.MethodPut, "/fhir/r4/Patient/new-id", payload)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d", w.Code)
+	}
+	if loc := w.Header().Get("Location"); !strings.HasSuffix(loc, "/Patient/new-id/_history/1") {
+		t.Errorf("want Location ending in /Patient/new-id/_history/1, got %q", loc)
+	}
+	if et := w.Header().Get("ETag"); et != `W/"1"` {
+		t.Errorf(`want ETag W/"1", got %q`, et)
+	}
+}
+
+func TestUpdate_IfMatchMissingResourceIs404(t *testing.T) {
+	ms := &mockStore{}
+	ms.updateOrCreateFn = func(_ context.Context, rt, id string, _ map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+		if ifMatchVersion != 2 {
+			t.Errorf("want ifMatchVersion=2 passed through, got %d", ifMatchVersion)
+		}
+		return nil, false, store.NotFoundError{ResourceType: rt, ResourceID: id}
 	}
 
 	h := newRouter(ms)
 	payload := map[string]any{"resourceType": "Patient", "id": "missing"}
-	w := do(t, h, http.MethodPut, "/fhir/r4/Patient/missing", payload)
+	w := doWithHeaders(t, h, http.MethodPut, "/fhir/r4/Patient/missing", payload,
+		map[string]string{"If-Match": `W/"2"`})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", w.Code)
+	}
+}
+
+// ─── $validate: Parameters envelope ─────────────────────────────────────────────
+
+func wrapInParameters(resource map[string]any) map[string]any {
+	return map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{map[string]any{"name": "resource", "resource": resource}},
+	}
+}
+
+func TestValidate_ParametersWrappedValidResource(t *testing.T) {
+	h := newRouter(&mockStore{})
+	patient := map[string]any{"resourceType": "Patient", "id": "example"}
+
+	for _, path := range []string{"/fhir/r4/Patient/$validate", "/fhir/r4/$validate"} {
+		w := do(t, h, http.MethodPost, path, wrapInParameters(patient))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: want 200, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestValidate_ParametersWrappedTypeMismatchIs422(t *testing.T) {
+	h := newRouter(&mockStore{})
+	obs := map[string]any{"resourceType": "Observation", "code": map[string]any{"text": "x"}}
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", wrapInParameters(obs))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", w.Code)
+	}
+}
+
+func TestValidate_ParametersWithoutResourceIsRejected(t *testing.T) {
+	h := newRouter(&mockStore{})
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", w.Code)
+	}
+	body := decodeJSON(t, w)
+	if body["resourceType"] != "OperationOutcome" {
+		t.Fatalf("want OperationOutcome, got %v", body["resourceType"])
+	}
+}
+
+func TestValidate_ParametersModeDeleteWithoutResourceIsValid(t *testing.T) {
+	h := newRouter(&mockStore{})
+	w := do(t, h, http.MethodPost, "/fhir/r4/Patient/$validate", map[string]any{
+		"resourceType": "Parameters",
+		"parameter":    []any{map[string]any{"name": "mode", "valueCode": "delete"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

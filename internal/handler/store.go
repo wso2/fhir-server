@@ -29,10 +29,12 @@ type StoreAPI interface {
 	GetVersion(ctx context.Context, resourceType, resourceID string, versionID int) (map[string]any, error)
 	Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error)
 	Update(ctx context.Context, resourceType, resourceID string, body map[string]any, ifMatchVersion int) (map[string]any, error)
+	UpdateOrCreate(ctx context.Context, resourceType, resourceID string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error)
 	Patch(ctx context.Context, resourceType, resourceID string, patch map[string]any) (map[string]any, error)
 	Delete(ctx context.Context, resourceType, resourceID string) error
 	GetHistory(ctx context.Context, resourceType, resourceID string) ([]store.HistoryEntry, error)
 	GetTypeHistory(ctx context.Context, p store.HistoryParams) (store.HistoryResult, error)
+	AggregateMeta(ctx context.Context, resourceType string) (map[string]any, error)
 	Search(ctx context.Context, sp store.SearchParams) (store.SearchResult, error)
 	LastN(ctx context.Context, params map[string][]string, maxN int) (store.SearchResult, error)
 	ConditionalMatch(ctx context.Context, resourceType, rawQuery string) (string, int, error)

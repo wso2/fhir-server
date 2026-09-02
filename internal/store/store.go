@@ -80,12 +80,13 @@ func defaultWriteTuning() WriteTuning {
 }
 
 type Store struct {
-	pool        *pgxpool.Pool
-	extractor   *index.Extractor
-	registry    *searchparam.Registry
-	terminology *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
-	tuning      SearchTuning
-	writeTuning WriteTuning
+	pool         *pgxpool.Pool
+	extractor    *index.Extractor
+	registry     *searchparam.Registry
+	terminology  *terminology.Client // may be nil if FHIR_TERMINOLOGY_URL is unset
+	tuning       SearchTuning
+	writeTuning  WriteTuning
+	refIntegrity RefIntegrity
 }
 
 func New(pool *pgxpool.Pool, registry *searchparam.Registry, opts ...func(*Store)) *Store {
@@ -161,9 +162,7 @@ func setTenantTx(ctx context.Context, tx pgx.Tx) error {
 }
 
 // tenantConn acquires a pooled connection with the request's tenant applied,
-// for read paths that run outside a transaction. The caller must Release it;
-// the next acquirer overwrites app.current_tenant before use, so the value
-// never leaks across tenants.
+// for read paths that run outside a transaction. The caller must Release it.
 func (s *Store) tenantConn(ctx context.Context) (*pgxpool.Conn, error) {
 	c, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -217,6 +216,15 @@ type bundleWriter struct {
 	resources [][]any // deferred resources creates
 	history   [][]any // every create/update/patch/delete history row
 
+	// Referential-integrity bookkeeping (populated only when a RefIntegrity
+	// flag is on; verified post-flush by Store.verifyIntegrity). Both maps are
+	// keyed by "Type/id" and always reflect each resource's FINAL state in the
+	// transaction: a later write replaces the references of an earlier version
+	// and cancels a pending delete (resurrection); a delete drops the
+	// resource's outgoing references.
+	refs    map[string][]pendingRef // outgoing local refs of each written resource
+	deletes map[string][2]string    // (resourceType, id) soft-deleted in this transaction
+
 	maxRowsPerStmt   int
 	maxRowsPerBundle int
 }
@@ -236,6 +244,31 @@ func (s *Store) newBundleWriter(ctx context.Context) *bundleWriter {
 // index, resources, and history tables.
 func (w *bundleWriter) totalRows() int {
 	return w.rs.Count() + len(w.resources) + len(w.history)
+}
+
+// recordWrite tracks a create/update/patch for referential-integrity checking:
+// refs are the resource's outgoing local references (nil when the write-side
+// check is off). A write supersedes any earlier version written in the same
+// transaction and cancels a pending delete of the same id (resurrection).
+func (w *bundleWriter) recordWrite(resourceType, resourceID string, refs []pendingRef) {
+	key := resourceType + "/" + resourceID
+	if w.refs == nil {
+		w.refs = map[string][]pendingRef{}
+	}
+	w.refs[key] = refs
+	delete(w.deletes, key)
+}
+
+// recordDelete tracks a soft-delete for referential-integrity checking. The
+// deleted resource's own outgoing references vanish with it, so any refs an
+// earlier write in this transaction recorded for it are dropped.
+func (w *bundleWriter) recordDelete(resourceType, resourceID string) {
+	key := resourceType + "/" + resourceID
+	if w.deletes == nil {
+		w.deletes = map[string][2]string{}
+	}
+	w.deletes[key] = [2]string{resourceType, resourceID}
+	delete(w.refs, key)
 }
 
 // flush writes the buffer to tx in FK-safe order: parent resources first (sp_*
@@ -284,6 +317,17 @@ func (w *bundleWriter) flush(ctx context.Context, tx pgx.Tx) error {
 	return qb.Send(ctx, tx)
 }
 
+// flushAndVerify flushes the buffered writes and then runs the enabled
+// referential-integrity checks against the transaction's final state. Every
+// write path (single CRUD and Bundle processing) funnels through this so no
+// path can skip enforcement.
+func (s *Store) flushAndVerify(ctx context.Context, tx pgx.Tx, w *bundleWriter) error {
+	if err := w.flush(ctx, tx); err != nil {
+		return err
+	}
+	return s.verifyIntegrity(ctx, tx, w)
+}
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error) {
@@ -305,7 +349,7 @@ func (s *Store) Create(ctx context.Context, resourceType string, body map[string
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -359,6 +403,7 @@ func (s *Store) createInTx(ctx context.Context, tx pgx.Tx, resourceType string, 
 	}
 
 	s.extractor.Extract(w.rs, resourceType, resourceID, body, now)
+	s.recordWriteIntegrity(w, resourceType, resourceID, body)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, 1, "POST", raw, now})
 
 	return body, nil
@@ -418,7 +463,7 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -428,6 +473,45 @@ func (s *Store) Update(ctx context.Context, resourceType, resourceID string, bod
 
 	slog.Debug("updated resource", "type", resourceType, "id", resourceID, "version", metaVersionID(result))
 	return result, nil
+}
+
+// UpdateOrCreate replaces a resource, creating it at the given id when no
+// resource exists there (FHIR "update as create"). The created return reports
+// which of the two happened, so the handler can answer 201 instead of 200.
+// A version precondition (ifMatchVersion >= 0) never creates: If-Match asserts
+// the client has seen a specific version, so a missing target stays a
+// NotFoundError exactly as in Update.
+func (s *Store) UpdateOrCreate(ctx context.Context, resourceType, resourceID string, body map[string]any, ifMatchVersion int) (map[string]any, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := setTenantTx(ctx, tx); err != nil {
+		return nil, false, err
+	}
+
+	w := s.newBundleWriter(ctx)
+	created := false
+	result, err := s.updateInTx(ctx, tx, resourceType, resourceID, body, ifMatchVersion, w)
+	if _, missing := err.(NotFoundError); missing && ifMatchVersion < 0 {
+		created = true
+		result, err = s.createInTx(ctx, tx, resourceType, body, w, false)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
+		return nil, false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+
+	slog.Debug("upserted resource", "type", resourceType, "id", resourceID, "created", created, "version", metaVersionID(result))
+	return result, created, nil
 }
 
 // updateInTx performs an update within an existing transaction. Shared by the
@@ -484,6 +568,7 @@ func (s *Store) updateInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 // rest. If the stored JSON cannot be parsed it falls back to the full
 // clear-and-reinsert of every table.
 func (s *Store) mergeReindex(w *bundleWriter, resourceType, resourceID string, oldRaw []byte, body map[string]any, lastUpdated time.Time) {
+	s.recordWriteIntegrity(w, resourceType, resourceID, body)
 	// Unbounded (cap 0): the stored version already passed the row cap when it
 	// was written, and a LimitHit from re-extracting it must not abort this
 	// transaction — only the incoming version's rows count against the cap.
@@ -523,7 +608,7 @@ func (s *Store) Patch(ctx context.Context, resourceType, resourceID string, patc
 	if err != nil {
 		return nil, err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return nil, err
 	}
 
@@ -589,6 +674,7 @@ func (s *Store) patchInTx(ctx context.Context, tx pgx.Tx, resourceType, resource
 	newRS := index.NewRowSet(w.tenant, w.maxRowsPerBundle)
 	s.extractor.Extract(newRS, resourceType, resourceID, merged, now)
 	w.rs.MergeReindex(oldRS, newRS, resourceType, resourceID)
+	s.recordWriteIntegrity(w, resourceType, resourceID, merged)
 	w.history = append(w.history, []any{w.tenant, resourceID, resourceType, newVersion, "PATCH", mergedRaw, now})
 
 	return merged, newVersion, nil
@@ -633,7 +719,7 @@ func (s *Store) Delete(ctx context.Context, resourceType, resourceID string) err
 	if err := s.deleteInTx(ctx, tx, resourceType, resourceID, w); err != nil {
 		return err
 	}
-	if err := w.flush(ctx, tx); err != nil {
+	if err := s.flushAndVerify(ctx, tx, w); err != nil {
 		return err
 	}
 
@@ -669,6 +755,9 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 	if isDeleted {
 		return nil // idempotent: already deleted
 	}
+	if s.refIntegrity.OnWrite || s.refIntegrity.OnDelete {
+		w.recordDelete(resourceType, resourceID)
+	}
 
 	// DELETE is a new version in FHIR — bump to avoid UNIQUE(fhir_id, resource_type, version_id) conflict.
 	deleteVersion := versionID + 1
@@ -701,6 +790,12 @@ func (s *Store) deleteInTx(ctx context.Context, tx pgx.Tx, resourceType, resourc
 
 // ─── History ──────────────────────────────────────────────────────────────────
 
+// histTenant is the explicit tenant predicate applied to every resource_history
+// read, matching the pattern used for every resources and sp_* read. It binds no
+// placeholder, so argument numbering is unaffected; an unset tenant yields NULL,
+// which matches no rows.
+const histTenant = `tenant_id = current_setting('app.current_tenant', true)`
+
 type HistoryEntry struct {
 	VersionID int
 	Operation string
@@ -717,7 +812,7 @@ func (s *Store) GetHistory(ctx context.Context, resourceType, resourceID string)
 	rows, err := c.Query(ctx, `
 		SELECT version_id, operation, resource_json, recorded_at
 		FROM resource_history
-		WHERE resource_type = $1 AND fhir_id = $2
+		WHERE resource_type = $1 AND fhir_id = $2 AND `+histTenant+`
 		ORDER BY version_id DESC`,
 		resourceType, resourceID,
 	)
@@ -763,26 +858,27 @@ func (s *Store) GetTypeHistory(ctx context.Context, p HistoryParams) (HistoryRes
 	system := p.ResourceType == ""
 	switch {
 	case system && p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history ORDER BY recorded_at DESC LIMIT $1 OFFSET $2`
+		           FROM resource_history WHERE ` + histTenant + `
+		           ORDER BY recorded_at DESC LIMIT $1 OFFSET $2`
 		args = []any{}
 	case system && !p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE recorded_at > $1`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND recorded_at > $1`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE recorded_at > $1
+		           FROM resource_history WHERE ` + histTenant + ` AND recorded_at > $1
 		           ORDER BY recorded_at DESC LIMIT $2 OFFSET $3`
 		args = []any{p.Since}
 	case !system && p.Since.IsZero():
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE resource_type = $1`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE resource_type = $1
+		           FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1
 		           ORDER BY recorded_at DESC LIMIT $2 OFFSET $3`
 		args = []any{p.ResourceType}
 	default:
-		countQ = `SELECT COUNT(*) FROM resource_history WHERE resource_type = $1 AND recorded_at > $2`
+		countQ = `SELECT COUNT(*) FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1 AND recorded_at > $2`
 		fetchQ = `SELECT version_id, operation, resource_json, recorded_at
-		           FROM resource_history WHERE resource_type = $1 AND recorded_at > $2
+		           FROM resource_history WHERE ` + histTenant + ` AND resource_type = $1 AND recorded_at > $2
 		           ORDER BY recorded_at DESC LIMIT $3 OFFSET $4`
 		args = []any{p.ResourceType, p.Since}
 	}
@@ -824,7 +920,7 @@ func (s *Store) GetVersion(ctx context.Context, resourceType, resourceID string,
 	defer c.Release()
 	err = c.QueryRow(ctx, `
 		SELECT resource_json, recorded_at FROM resource_history
-		WHERE resource_type = $1 AND fhir_id = $2 AND version_id = $3`,
+		WHERE resource_type = $1 AND fhir_id = $2 AND version_id = $3 AND `+histTenant,
 		resourceType, resourceID, versionID,
 	).Scan(&raw, &recordedAt)
 	if err != nil {
