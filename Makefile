@@ -58,6 +58,14 @@ tidy: ## Tidy go.mod / go.sum
 docker: ## Build the Docker image
 	docker build -t $(DOCKER_IMAGE) .
 
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart (a database secret ref is required; see helm/README.md)
+	helm lint helm --set database.existingSecret.name=placeholder
+
+.PHONY: helm-template
+helm-template: ## Render the Helm chart with the CI values file
+	helm template fhir-server helm -f helm/ci/values-external-db.yaml
+
 .PHONY: refresh-definitions
 refresh-definitions: ## Regenerate the embedded FHIR R4 definition bundles (internal/basedef/*.gz)
 	python3 scripts/refresh-definitions.py

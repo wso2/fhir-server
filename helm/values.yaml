@@ -1,0 +1,191 @@
+# Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
+#
+# WSO2 LLC. licenses this file to you under the Apache License,
+# Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Default values for fhir-server.
+
+replicaCount: 1
+
+image:
+  # -- Container image repository, registry host included (no separate registry field).
+  repository: ghcr.io/wso2/fhir-server
+  # -- Image tag. Released tags carry a "v" prefix (e.g. v2.0.0), unlike
+  # Chart.yaml's appVersion -- set explicitly rather than relying on a fallback.
+  tag: "v2.0.0"
+  # -- Image digest (sha256:...). Takes precedence over tag when set.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# -- Names of pre-existing imagePullSecrets to attach to the pod (e.g. a private registry mirror).
+imagePullSecrets: []
+# - name: my-registry-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automount: true
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod-level security context. The upstream image runs as a distroless nonroot user.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context. readOnlyRootFilesystem is safe because the
+# only thing the process writes to disk (the IG package cache) is always
+# volume-mounted, whether or not persistence.igCache is enabled.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 9090
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: fhir.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: fhir-server-tls
+  #   hosts:
+  #     - fhir.example.com
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 75
+  targetMemoryUtilizationPercentage: 75
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# NetworkPolicy is off by default. If enabled, remember the server needs egress
+# to reach its PostgreSQL database (and, if configured, the IG package registry
+# and/or the terminology server) -- add those via extraEgress.
+networkPolicy:
+  enabled: false
+  extraIngress: []
+  extraEgress: []
+
+persistence:
+  igCache:
+    # -- Persist the downloaded Implementation Guide package cache across pod
+    # restarts. Safe to leave disabled: packages are simply re-downloaded on
+    # next boot from the configured IG_REGISTRY_URL.
+    enabled: false
+    size: 1Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+
+# Probes target the server's own health endpoints (see internal/handler/router.go):
+# /health/live is 200 as soon as the process is up; /health/ready is 503 until any
+# configured Implementation Guides finish loading, then 200 -- a real signal, not
+# a stub, so readiness should gate traffic.
+probes:
+  startup:
+    enabled: true
+    path: /health/live
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 12
+  liveness:
+    enabled: true
+    path: /health/live
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /health/ready
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Database connection. The server must connect as a least-privilege role that is
+# NOT a superuser and does NOT have BYPASSRLS (see the main README's
+# "Multi-Tenancy" section) -- either bypasses Row-Level Security and silently
+# breaks tenant isolation. Schema setup (internal/db/schema.sql) is a separate,
+# out-of-band runbook step run by an admin/DDL-capable role; this chart never
+# creates tables and never handles that admin credential.
+database:
+  # -- Full DSN, e.g. postgres://fhir_app:...@host:5432/fhirdb?sslmode=require.
+  # Dev/quickstart only: this value is stored in a Secret the chart creates, and
+  # in the Helm release history. Prefer existingSecret for anything beyond local use.
+  url: ""
+  existingSecret:
+    # -- Name of a pre-existing Secret containing the database DSN. Recommended
+    # for any non-throwaway install; leaves the credential out of `helm` state.
+    name: ""
+    # -- Key within that Secret holding the DSN.
+    key: "database-url"
+
+config:
+  # -- Extra environment variables, verbatim name/value pairs, covering any of the
+  # knobs documented in config.example.yaml (LOG_LEVEL, BASE_URL, IG_PACKAGES,
+  # IG_REGISTRY_URL, SEARCH_PROBE_CAP, FHIR_VALIDATION_*, FHIR_TERMINOLOGY_URL,
+  # WRITE_*, ...) without the chart needing a bespoke value per setting.
+  env:
+    LOG_LEVEL: info
+
+# -- Additional environment variables as raw {name, value|valueFrom} entries.
+extraEnv: []
+# -- Additional envFrom entries (configMapRef / secretRef).
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+terminationGracePeriodSeconds: 30
+
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
