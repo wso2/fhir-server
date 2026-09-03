@@ -10,7 +10,26 @@ const config: Config = {
   organizationName: 'wso2',
   projectName: 'fhir-server',
   onBrokenLinks: 'throw',
-  markdown: {hooks: {onBrokenMarkdownLinks: 'throw'}},
+  markdown: {mermaid: true, hooks: {onBrokenMarkdownLinks: 'throw'}},
+  themes: [
+    '@docusaurus/theme-mermaid',
+    [
+      '@easyops-cn/docusaurus-search-local',
+      {
+        // Offline search: the index is built at `docusaurus build` time and
+        // shipped with the site, so there is no external search service.
+        hashed: true,
+        language: ['en'],
+        indexBlog: false,
+        indexPages: false,
+        // Docs are served from the site root (routeBasePath: '/').
+        docsRouteBasePath: '/',
+        highlightSearchTermsOnTargetPage: true,
+        explicitSearchResultPath: true,
+        searchBarShortcutHint: false,
+      },
+    ],
+  ],
 
   presets: [
     [
@@ -31,8 +50,18 @@ const config: Config = {
   ],
 
   themeConfig: {
+    mermaid: {
+      // Follow the site's light/dark mode so the diagram stays legible in both.
+      theme: {light: 'neutral', dark: 'dark'},
+    },
     navbar: {
-      title: 'WSO2 FHIR Server',
+      title: 'FHIR Server',
+      logo: {
+        alt: 'WSO2',
+        src: 'img/logo.svg',
+        srcDark: 'img/logo-dark.svg',
+        href: '/',
+      },
       items: [
         {
           href: 'https://hl7.org/fhir/R4/',
