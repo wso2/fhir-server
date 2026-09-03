@@ -1,11 +1,11 @@
 ---
 title: Deployment
-description: Prepare the server and PostgreSQL for a controlled deployment.
+description: Best practices for running the server and PostgreSQL in production.
 ---
 
-# Prepare a controlled deployment
+# Deployment best practices
 
-The server ships as a Go binary and container image. A production deployment also needs PostgreSQL, schema provisioning, ingress and identity controls, backups, secrets, monitoring, and a deliberate tenant model.
+The server ships as a Go binary and container image. A production deployment also needs PostgreSQL, schema provisioning, ingress and identity controls, backups, secrets, monitoring, and a deliberate tenant model. The practices below cover each of those.
 
 ## Deployment checklist
 

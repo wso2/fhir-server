@@ -7,12 +7,12 @@ description: How FHIR resources, history, and search values live in your Postgre
 
 Everything the server stores lives in a small, fixed set of PostgreSQL tables — around a dozen, no matter how many resource types you use. Adding a new resource type, profile, or search parameter never requires a schema migration.
 
-## What this means for you
-
-- **One database to operate.** Backups, monitoring, and capacity planning cover a handful of tables, not one table per resource type.
-- **Nothing to migrate when your data model grows.** Start storing a new resource type, load a new Implementation Guide, or add a custom SearchParameter without touching the schema.
-- **Every write is atomic.** A resource, its history snapshot, and its search-index entries commit in one transaction — a resource is never searchable in a state that was not stored.
-- **Full version history.** Creates, updates, and deletes append immutable snapshots, which is what powers versioned reads (`/{type}/{id}/_history/{version}`), history interactions, optimistic locking with `If-Match`, and audit workflows. Deletes are soft, so history stays available.
+Every write is atomic: the resource, its history snapshot, and its search-index entries all commit
+in one transaction, so a resource is never searchable in a state that was not stored. Creates,
+updates, and deletes each append an immutable snapshot, which is what powers
+[versioned reads](../api/interactions.md#versioned-read), `If-Match`
+[optimistic locking](../api/conditional.md#optimistic-locking-with-if-match), and audit trails.
+Deletes are soft, so history remains readable after one.
 
 ## The tables you will see
 
