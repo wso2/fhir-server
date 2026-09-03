@@ -11,7 +11,7 @@ The server validates basic FHIR resource structure and can apply loaded profile 
 
 Validate a resource without storing it:
 
-```bash
+```bash title="Request"
 curl -sS -X POST 'http://localhost:9090/fhir/r4/Observation/$validate' \
   -H "Content-Type: application/fhir+json" \
   -d '{
@@ -20,6 +20,24 @@ curl -sS -X POST 'http://localhost:9090/fhir/r4/Observation/$validate' \
     "code": {"text": "Heart rate"}
   }' | jq
 ```
+
+```json title="Response"
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "warning",
+      "code": "invariant",
+      "diagnostics": "A resource should have narrative for robust management",
+      "expression": ["Observation"]
+    }
+  ]
+}
+```
+
+A passing resource still reports FHIRPath `invariant` findings as warnings, so check for
+`severity: "error"` rather than an empty outcome — see
+[Operations](../api/operations.md#validate).
 
 The response is an OperationOutcome:
 

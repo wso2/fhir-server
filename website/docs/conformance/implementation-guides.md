@@ -5,7 +5,7 @@ description: Load FHIR packages and expose their profiles through the server.
 
 # FHIR Implementation Guides
 
-The server can load FHIR npm packages at startup. Loaded packages contribute profiles and search definitions used by validation and the generated CapabilityStatement.
+The server can load FHIR packages from your preferred IGs at startup. Loaded packages contribute profiles and search definitions used by validation and the generated CapabilityStatement.
 
 ## Configure packages
 
@@ -45,15 +45,23 @@ Previously loaded packages are skipped unless `IG_FORCE_RELOAD=true`.
 
 Read the server CapabilityStatement:
 
-```bash
+```bash title="Request"
 curl -sS http://localhost:9090/fhir/r4/metadata | jq
 ```
 
 Loaded packages appear as canonical URLs in `CapabilityStatement.implementationGuide`; supported profiles and search parameters appear under the per-type entries in `rest[0].resource`:
 
-```bash
+```bash title="Request"
 curl -sS http://localhost:9090/fhir/r4/metadata | jq '.implementationGuide'
 ```
+
+```json title="Response"
+[
+  "http://hl7.org/fhir/ig/hl7.fhir.us.core/6.1.0"
+]
+```
+
+An empty array means no packages are loaded — check the startup logs for load failures.
 
 :::tip
 Pin package versions. An unpinned package source makes startup behavior and validation rules harder to reproduce across environments.

@@ -21,14 +21,30 @@ For local evaluation, use a non-production terminology endpoint and verify its l
 
 Token searches can use terminology modifiers when the external service is configured. Examples include ValueSet membership and CodeSystem hierarchy searches:
 
-```bash
+```bash title="Request"
 curl -sS --get "http://localhost:9090/fhir/r4/Observation" \
   --data-urlencode "code:in=http://example.org/fhir/ValueSet/lab-codes"
 ```
 
-```bash
+```bash title="Request"
 curl -sS --get "http://localhost:9090/fhir/r4/Condition" \
   --data-urlencode "code:below=http://snomed.info/sct|73211009"
+```
+
+When no terminology server is configured, these modifiers fail loudly rather than returning a
+misleading result set:
+
+```json title="Response"
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "error",
+      "code": "not-supported",
+      "diagnostics": "modifier :in on param \"code\" requires FHIR_TERMINOLOGY_URL to be configured"
+    }
+  ]
+}
 ```
 
 ## Operational considerations

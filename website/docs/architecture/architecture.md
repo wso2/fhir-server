@@ -1,11 +1,13 @@
 ---
 title: Architecture
-description: What WSO2 FHIR Server does and how its main parts fit together.
+description: The server's components, how a request flows through them, and where its boundaries are.
 ---
 
-# A blazing-fast, lightweight FHIR server written in Go
+# Architecture overview
 
 WSO2 FHIR Server is a single binary that speaks FHIR R4 over REST and stores everything in PostgreSQL. There is nothing else to deploy: one service, one database.
+
+This page covers the components a request passes through, how they share one storage model, and which concerns are deliberately handled outside the server.
 
 ## What it can do
 
@@ -19,22 +21,33 @@ WSO2 FHIR Server is a single binary that speaks FHIR R4 over REST and stores eve
 - Single-tenant and shared multi-tenant deployment models.
 - JSON, XML, and Turtle representations negotiated per request.
 
-See [supported resource types](../reference/resource-types.md) for what you can store and the [FHIR API reference](../reference/api.md) for how to call it.
+See [supported resource types](../conformance/resource-types.md) for what you can store and the [FHIR API reference](../api/interactions.md) for how to call it.
 
 ## How it fits together
 
 ```mermaid
 flowchart LR
-    Client["FHIR client"] --> API["FHIR REST API"]
-    API --> Validation["Validation"]
-    API --> Search["Search"]
-    API --> Storage["Resource storage"]
-    Storage --> DB[("PostgreSQL")]
-    Search --> DB
-    API -.-> TX["External terminology server"]
-    IG["FHIR IG packages"] --> Validation
-    IG --> Search
+    Client["🔥 FHIR client"]
+    IG["📦 FHIR IG packages"]
+    TX["🌐 Terminology server"]
+
+    subgraph Server["⚙️ FHIR Server"]
+        direction LR
+        API["🔥 FHIR REST API"]
+        DB[("🗄️ PostgreSQL")]
+        API -- "resources, history,<br/>search indexes" --> DB
+    end
+
+    Client -- "FHIR R4 over REST" --> API
+    IG -. "profiles and search parameters,<br/>loaded at startup" .-> API
+    API -. "code validation and<br/>ValueSet expansion" .-> TX
 ```
+
+The box is what you deploy: the server process and its PostgreSQL database. Everything outside it
+is either a caller or an optional integration, shown with dashed lines — load
+[Implementation Guide](../conformance/implementation-guides.md) packages to add profiles and search
+parameters, and connect a [terminology server](../conformance/terminology.md) to enable code-aware
+search modifiers. Neither is required for the server to run.
 
 All resource types share one storage model: resources are stored as JSON documents with their full version history, and the values used by search are extracted into typed indexes at write time. A write and its history snapshot and search-index updates commit in a single database transaction, so a resource is never searchable in a state that was not stored.
 
@@ -45,6 +58,6 @@ Searches run against the typed indexes first and load the matching JSON document
 The server deliberately delegates two concerns:
 
 - **Terminology reasoning** — ValueSet expansion and code hierarchy questions go to a FHIR terminology server you configure.
-- **Identity and policy** — authentication, authorization, and TLS termination belong to the gateway or ingress in front of the server. See [Deployment](../operations/deployment.md).
+- **Identity and policy** — authentication, authorization, and TLS termination belong to the gateway or ingress in front of the server. See [Deployment](../administration/deployment.md).
 
 For design rationale and accepted tradeoffs, read [`DESIGN.md`](https://github.com/wso2/fhir-server/blob/main/DESIGN.md).

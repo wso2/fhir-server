@@ -74,4 +74,4 @@ Configuration precedence is:
 environment variable > configuration file > built-in default
 ```
 
-See the complete [configuration reference](../reference/configuration.md) before deploying the server.
+See the complete [configuration reference](../administration/configuration.md) before deploying the server.
