@@ -1,0 +1,92 @@
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0;
+  margin-bottom: 0.75rem;
+}
+
+.copyButton,
+.menuButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.2;
+  color: var(--ifm-font-color-secondary, var(--ifm-color-emphasis-700));
+  background: var(--ifm-background-surface-color);
+  border: 1px solid var(--ifm-color-emphasis-300);
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.copyButton {
+  border-radius: 4px 0 0 4px;
+}
+
+.menuButton {
+  border-radius: 0 4px 4px 0;
+  border-left: none;
+  padding-inline: 0.45rem;
+}
+
+.copyButton:hover,
+.menuButton:hover {
+  background: var(--ifm-color-emphasis-100);
+  color: var(--ifm-font-color-base);
+}
+
+.copyButton:focus-visible,
+.menuButton:focus-visible {
+  outline: 2px solid var(--ifm-color-primary);
+  outline-offset: 1px;
+}
+
+.icon {
+  font-size: 0.9rem;
+}
+
+.menuWrapper {
+  position: relative;
+  display: inline-flex;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  z-index: 10;
+  min-width: 12rem;
+  margin: 0;
+  padding: 0.3rem;
+  list-style: none;
+  background: var(--ifm-background-surface-color);
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 6px;
+  box-shadow: var(--ifm-global-shadow-lw);
+}
+
+.menu a {
+  display: block;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8125rem;
+  color: var(--ifm-font-color-base);
+  border-radius: 4px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.menu a:hover {
+  background: var(--ifm-color-emphasis-100);
+  text-decoration: none;
+}
+
+/* On narrow screens the buttons sit above the title with room to tap. */
+@media (max-width: 576px) {
+  .actions {
+    justify-content: flex-start;
+  }
+}
