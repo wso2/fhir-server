@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkfhir_server_docs=self.webpackChunkfhir_server_docs||[]).push([[7089],{7089(e,r,s){s.d(r,{createArchitectureServices:()=>c.S});var c=s(5796);s(4954)}}]);
