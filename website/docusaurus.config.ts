@@ -6,7 +6,7 @@ const config: Config = {
   title: 'WSO2 FHIR Server',
   tagline: 'A production-oriented FHIR R4 REST server built in Go and backed by PostgreSQL',
   url: 'https://wso2.github.io',
-  baseUrl: '/',
+  baseUrl: '/fhir-server/',
   organizationName: 'wso2',
   projectName: 'fhir-server',
   onBrokenLinks: 'throw',
@@ -22,8 +22,8 @@ const config: Config = {
         language: ['en'],
         indexBlog: false,
         indexPages: false,
-        // Docs are served from the site root (routeBasePath: '/').
-        docsRouteBasePath: '/',
+        // Docs are served at /fhir-server/docs on GitHub Pages.
+        docsRouteBasePath: '/docs',
         highlightSearchTermsOnTargetPage: true,
         explicitSearchResultPath: true,
         searchBarShortcutHint: false,
@@ -37,7 +37,7 @@ const config: Config = {
       {
         docs: {
           path: 'docs',
-          routeBasePath: '/',
+          routeBasePath: '/docs',
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/wso2/fhir-server/edit/main/website/',
         },
@@ -60,7 +60,7 @@ const config: Config = {
         alt: 'WSO2',
         src: 'img/logo.svg',
         srcDark: 'img/logo-dark.svg',
-        href: '/',
+        href: '/docs/',
       },
       items: [
         {
