@@ -60,6 +60,13 @@ type UnsupportedParamError struct{ Msg string }
 
 func (e *UnsupportedParamError) Error() string { return e.Msg }
 
+// InvalidParamError is returned when a search parameter value cannot be parsed
+// (e.g. a malformed date). The HTTP layer should map this to a 400
+// OperationOutcome rather than execute a query built from a garbage value.
+type InvalidParamError struct{ Msg string }
+
+func (e *InvalidParamError) Error() string { return e.Msg }
+
 // newQueryBuilder constructs a query builder carrying the store's configured
 // search tunables, so every search built here honors search.probeCap /
 // search.maxChainDepth (see SearchTuning).
@@ -1576,7 +1583,11 @@ const storedDateRange = "tstzrange(s.value_low, s.value_high, '[]')"
 
 func (b *queryBuilder) buildDateExists(param, value string) string {
 	prefix, dateStr := extractComparatorPrefix(value)
-	low, high := expandDateRange(dateStr)
+	low, high, err := expandDateStringForSearch(dateStr)
+	if err != nil {
+		b.err = &InvalidParamError{Msg: fmt.Sprintf("invalid date value %q for param %q", dateStr, param)}
+		return "FALSE"
+	}
 	rtP := b.next(b.rt)
 	pP := b.next(param)
 
@@ -1905,7 +1916,11 @@ func parseSearchReference(value string) (resourceType, id string) {
 
 func (b *queryBuilder) applyLastUpdated(value string) {
 	prefix, dateStr := extractComparatorPrefix(value)
-	low, high := expandDateRange(dateStr)
+	low, high, err := expandDateStringForSearch(dateStr)
+	if err != nil {
+		b.err = &InvalidParamError{Msg: fmt.Sprintf("invalid date value %q for _lastUpdated", dateStr)}
+		return
+	}
 	switch prefix {
 	case "gt":
 		highP := b.next(high)
@@ -2639,7 +2654,7 @@ func extractComparatorPrefix(s string) (prefix, rest string) {
 func quantizeBand(x float64) float64 { return math.Round(x*1e6) / 1e6 }
 
 // searchBandEnd converts the inclusive, second-truncated band high from
-// expandDateRange into the exclusive end of a half-open search band [low, end):
+// expandDateStringForSearch into the exclusive end of a half-open search band [low, end):
 // the next precision boundary for whole-second highs, so a stored value in the
 // band's final fractional second (e.g. 23:59:59.9 on a day query) stays inside
 // the band; a fractional-second instant advances one microsecond (timestamptz
@@ -2653,11 +2668,6 @@ func searchBandEnd(high time.Time) time.Time {
 		return high.Add(time.Second)
 	}
 	return high.Add(time.Microsecond)
-}
-
-func expandDateRange(s string) (low, high time.Time) {
-	low, high, _ = expandDateStringForSearch(s)
-	return
 }
 
 func expandDateStringForSearch(s string) (low, high time.Time, err error) {
@@ -2684,6 +2694,15 @@ func expandDateStringForSearch(s string) (low, high time.Time, err error) {
 			t, e = time.Parse("2006-01-02T15:04:05", s)
 		}
 		if e != nil {
+			// Minute precision — search values may omit seconds ("minutes
+			// SHALL be present if an hour is present"); the value denotes
+			// the whole minute.
+			for _, layout := range []string{"2006-01-02T15:04Z07:00", "2006-01-02T15:04"} {
+				if t, e = time.Parse(layout, s); e == nil {
+					low, high = t, t.Add(time.Minute-time.Second)
+					return
+				}
+			}
 			return time.Time{}, time.Time{}, e
 		}
 		low, high = t, t

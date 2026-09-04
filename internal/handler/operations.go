@@ -131,6 +131,11 @@ func (h *fhirHandler) lastN(w http.ResponseWriter, r *http.Request) {
 			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
 			return
 		}
+		var invalid *store.InvalidParamError
+		if errors.As(err, &invalid) {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+			return
+		}
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
 		return
 	}

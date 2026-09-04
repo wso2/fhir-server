@@ -316,10 +316,52 @@ func TestExpandDateStringForSearch_RFC3339(t *testing.T) {
 	}
 }
 
+func TestExpandDateStringForSearch_MinutePrecision(t *testing.T) {
+	low, high, err := expandDateStringForSearch("2028-05-15T14:30")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !low.Equal(time.Date(2028, 5, 15, 14, 30, 0, 0, time.UTC)) {
+		t.Fatalf("low = %v", low)
+	}
+	// Minute precision denotes the whole minute
+	if !high.Equal(time.Date(2028, 5, 15, 14, 30, 59, 0, time.UTC)) {
+		t.Fatalf("high = %v", high)
+	}
+}
+
+func TestExpandDateStringForSearch_MinutePrecisionZulu(t *testing.T) {
+	low, high, err := expandDateStringForSearch("2028-01-01T00:00Z")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !low.Equal(time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("low = %v", low)
+	}
+	if !high.Equal(time.Date(2028, 1, 1, 0, 0, 59, 0, time.UTC)) {
+		t.Fatalf("high = %v", high)
+	}
+}
+
+func TestExpandDateStringForSearch_MinutePrecisionOffset(t *testing.T) {
+	low, high, err := expandDateStringForSearch("2028-05-15T14:30+05:30")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := time.Date(2028, 5, 15, 9, 0, 0, 0, time.UTC)
+	if !low.Equal(want) {
+		t.Fatalf("low = %v, want %v", low, want)
+	}
+	if !high.Equal(want.Add(59 * time.Second)) {
+		t.Fatalf("high = %v", high)
+	}
+}
+
 func TestExpandDateStringForSearch_InvalidDate(t *testing.T) {
-	_, _, err := expandDateStringForSearch("not-a-date")
-	if err == nil {
-		t.Fatal("expected error for invalid date string")
+	for _, s := range []string{"not-a-date", "2028-05-15T14", "2028-05-15T99:99", "2028-05-15Tfoo"} {
+		if _, _, err := expandDateStringForSearch(s); err == nil {
+			t.Fatalf("expected error for invalid date string %q", s)
+		}
 	}
 }
 

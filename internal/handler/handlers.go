@@ -360,6 +360,11 @@ func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
 			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
 			return
 		}
+		var invalid *store.InvalidParamError
+		if errors.As(err, &invalid) {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+			return
+		}
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
 		return
 	}
@@ -402,6 +407,11 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 		var unsup *store.UnsupportedParamError
 		if errors.As(err, &unsup) {
 			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+			return
+		}
+		var invalid *store.InvalidParamError
+		if errors.As(err, &invalid) {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
 			return
 		}
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())

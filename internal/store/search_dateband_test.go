@@ -17,6 +17,7 @@
 package store
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -72,5 +73,55 @@ func TestBuildDateExists_HalfOpenBandOps(t *testing.T) {
 		if got := b.args[2].(time.Time); !got.Equal(tc.bound) {
 			t.Errorf("%s: bound %v, want %v", tc.value, got, tc.bound)
 		}
+	}
+}
+
+// TestBuildDateExists_MinutePrecisionBand pins the minute-precision band
+// (seconds omitted, valid per the FHIR search date format): the value covers
+// its whole minute, so the exclusive band end is the start of the next minute.
+func TestBuildDateExists_MinutePrecisionBand(t *testing.T) {
+	minuteStart := time.Date(2028, 5, 15, 14, 30, 0, 0, time.UTC)
+	nextMinute := time.Date(2028, 5, 15, 14, 31, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		value string
+		frag  string
+		bound time.Time
+	}{
+		{"gt2028-05-15T14:30", "s.value_high >= $3", nextMinute},
+		{"lt2028-05-15T14:30", "s.value_low < $3", minuteStart},
+		{"ge2028-05-15T14:30", "s.value_high >= $3", minuteStart},
+	} {
+		b := &queryBuilder{rt: "Observation"}
+		sql := b.buildDateExists("date", tc.value)
+		if b.err != nil {
+			t.Fatalf("%s: unexpected builder error: %v", tc.value, b.err)
+		}
+		if !strings.Contains(sql, tc.frag) {
+			t.Errorf("%s: missing %q in:\n%s", tc.value, tc.frag, sql)
+		}
+		if got := b.args[2].(time.Time); !got.Equal(tc.bound) {
+			t.Errorf("%s: bound %v, want %v", tc.value, got, tc.bound)
+		}
+	}
+}
+
+// TestBuildDateExists_InvalidDateSetsError pins the failure path: an
+// unparseable date value must surface as an InvalidParamError on the builder
+// (mapped to HTTP 400), never build a predicate from a zero time.
+func TestBuildDateExists_InvalidDateSetsError(t *testing.T) {
+	b := &queryBuilder{rt: "Observation"}
+	b.buildDateExists("date", "gt2028-05-15T99:99")
+	var invalid *InvalidParamError
+	if !errors.As(b.err, &invalid) {
+		t.Fatalf("b.err = %v, want *InvalidParamError", b.err)
+	}
+}
+
+func TestApplyLastUpdated_InvalidDateSetsError(t *testing.T) {
+	b := &queryBuilder{rt: "Observation"}
+	b.applyLastUpdated("gt2028-05-15T99:99")
+	var invalid *InvalidParamError
+	if !errors.As(b.err, &invalid) {
+		t.Fatalf("b.err = %v, want *InvalidParamError", b.err)
 	}
 }
