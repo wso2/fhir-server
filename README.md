@@ -1,10 +1,10 @@
 # FHIR Server — Developer Guide
 
-A FHIR R4 REST server written in Go, backed by PostgreSQL. It replaces a legacy architecture of 150+ per-resource tables with a normalized 11-table schema, reducing write amplification and enabling cross-resource search without schema changes.
+**A blazing-fast, lightweight FHIR server written in Go.** An open-source FHIR R4 REST server backed by PostgreSQL. It accepts every concrete FHIR R4 resource type out of the box — storage is schema-generic, so no type needs enabling and using a new one takes no migration — and Implementation Guides can be configured to load at startup, contributing their profiles and search parameters to validation and the generated CapabilityStatement.
 
 **FHIR version:** R4 (4.0.1)  
-**Language:** Go 1.25  
-**Database:** PostgreSQL 14+ (tested through 18)
+**Documentation:** [wso2.github.io/fhir-server/docs](https://wso2.github.io/fhir-server/docs/)
+
 
 ---
 
