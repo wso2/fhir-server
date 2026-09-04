@@ -9,8 +9,12 @@ fhir-server has been deployed as "{{ include "fhir-server.fullname" . }}" in nam
 
 {{- if .Values.ingress.enabled }}
 2. The FHIR API is exposed via Ingress:
+   {{- $scheme := "http" }}
+   {{- if .Values.ingress.tls }}
+   {{- $scheme = "https" }}
+   {{- end }}
    {{- range .Values.ingress.hosts }}
-   http://{{ .host }}{{ (first .paths).path | trimSuffix "/" }}/fhir/r4
+   {{ $scheme }}://{{ .host }}{{ (first .paths).path | trimSuffix "/" }}/fhir/r4
    {{- end }}
 {{- else }}
 2. No Ingress is enabled. Reach the server with a port-forward:

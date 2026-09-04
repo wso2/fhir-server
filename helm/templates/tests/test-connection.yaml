@@ -28,9 +28,11 @@ spec:
   containers:
     - name: wget
       image: busybox:1.36
-      command: ["wget"]
+      command: ["sh", "-ec"]
       args:
-        - "-qO-"
-        - "--tries=1"
-        - "--timeout=5"
-        - "http://{{ include "fhir-server.fullname" . }}:{{ .Values.service.port }}/health/ready"
+        - |
+          for i in $(seq 1 24); do
+            wget -qO- --timeout=5 "http://{{ include "fhir-server.fullname" . }}:{{ .Values.service.port }}/health/ready" && exit 0
+            sleep 5
+          done
+          exit 1

@@ -15,6 +15,12 @@
 # under the License.
 
 {{- if .Values.persistence.igCache.enabled }}
+{{- if eq .Values.persistence.igCache.accessMode "ReadWriteOnce" }}
+{{- $maxReplicas := ternary (int .Values.autoscaling.maxReplicas) (int .Values.replicaCount) .Values.autoscaling.enabled }}
+{{- if gt $maxReplicas 1 }}
+{{- fail "persistence.igCache.accessMode=ReadWriteOnce can only be attached to one node at a time, but replicaCount/autoscaling.maxReplicas allows more than one replica -- every pod mounts this same PVC, so a replica scheduled on another node would stay Pending. Use accessMode=ReadWriteMany, or keep replicas at 1." }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

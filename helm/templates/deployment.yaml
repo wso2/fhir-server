@@ -17,6 +17,9 @@
 {{- if and (not .Values.database.url) (not .Values.database.existingSecret.name) }}
 {{- fail "Set either database.url (dev/quickstart) or database.existingSecret.name (recommended) so the server has a DATABASE_URL to connect with." }}
 {{- end }}
+{{- if and .Values.database.url .Values.database.existingSecret.name }}
+{{- fail "Set only one of database.url or database.existingSecret.name -- both are set, which would leave an unused chart-managed Secret rendered from database.url alongside the existingSecret the Deployment actually uses." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

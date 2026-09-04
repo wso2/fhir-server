@@ -51,3 +51,7 @@ networkPolicy:
 persistence:
   igCache:
     enabled: true
+    # ReadWriteMany: this file also enables autoscaling (maxReplicas > 1), and
+    # every replica mounts this same PVC -- ReadWriteOnce would fail the chart's
+    # own guard (see templates/pvc.yaml) since it only attaches to one node.
+    accessMode: ReadWriteMany

@@ -94,7 +94,7 @@ Key within the database Secret holding the DSN.
 {{- define "fhir-server.databaseSecretKey" -}}
 {{- if .Values.database.existingSecret.name }}
 {{- .Values.database.existingSecret.key | default "database-url" }}
-{{- else }}
+{{- else -}}
 database-url
 {{- end }}
 {{- end }}

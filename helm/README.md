@@ -38,7 +38,7 @@ both are out-of-band, one-time steps, run against an admin/DDL-capable role,
 psql "$ADMIN_DATABASE_URL" -c "CREATE ROLE fhir_app LOGIN PASSWORD '...';"
 
 # 2. Apply the schema (idempotent, safe to re-run on upgrade).
-psql "$ADMIN_DATABASE_URL" -f ../internal/db/schema.sql
+psql "$ADMIN_DATABASE_URL" -f internal/db/schema.sql
 
 # 3. Create a Secret the chart will reference (recommended path -- see below).
 kubectl create secret generic fhir-server-db-credentials \
