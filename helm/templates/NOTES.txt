@@ -1,0 +1,31 @@
+fhir-server has been deployed as "{{ include "fhir-server.fullname" . }}" in namespace "{{ .Release.Namespace }}".
+
+1. Wait for the rollout to finish:
+   kubectl rollout status deployment/{{ include "fhir-server.fullname" . }} -n {{ .Release.Namespace }}
+
+   Note: readinessProbe only turns green once any Implementation Guides configured
+   via config.env.IG_PACKAGES finish loading (GET /health/ready) -- with none
+   configured this happens immediately.
+
+{{- if .Values.ingress.enabled }}
+2. The FHIR API is exposed via Ingress:
+   {{- $scheme := "http" }}
+   {{- if .Values.ingress.tls }}
+   {{- $scheme = "https" }}
+   {{- end }}
+   {{- range .Values.ingress.hosts }}
+   {{ $scheme }}://{{ .host }}{{ (first .paths).path | trimSuffix "/" }}/fhir/r4
+   {{- end }}
+{{- else }}
+2. No Ingress is enabled. Reach the server with a port-forward:
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "fhir-server.fullname" . }} 9090:{{ .Values.service.port }}
+   curl http://localhost:9090/health/ready
+   curl http://localhost:9090/fhir/r4/metadata
+{{- end }}
+
+IMPORTANT: this chart does NOT create the database schema. Before installing,
+apply internal/db/schema.sql (or an equivalent out-of-band step) using a
+DDL-capable admin role, then point database.url / database.existingSecret at a
+separate least-privilege runtime role that is NOT a superuser and does NOT have
+BYPASSRLS. See the main repository README, section 6 "Multi-Tenancy", for the
+exact role/grant statements.

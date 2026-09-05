@@ -76,3 +76,21 @@ jobs:
       # detector permanently (longer timeout: race slows containerized tests).
       - name: Integration tests (race detector, store + handler)
         run: go test -race -tags integration -timeout 1200s ./internal/store/... ./internal/handler/...
+
+  helm:
+    name: Lint Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: helm lint
+        # database.existingSecret.name has no meaningful default (see
+        # templates/deployment.yaml's `fail` guard) -- set a placeholder so
+        # lint exercises the rest of the chart.
+        run: helm lint helm --set database.existingSecret.name=placeholder
+      - name: helm template (default values)
+        run: helm template fhir-server helm --set database.existingSecret.name=placeholder
+      - name: helm template (full CI values)
+        run: helm template fhir-server helm -f helm/ci/values-external-db.yaml
