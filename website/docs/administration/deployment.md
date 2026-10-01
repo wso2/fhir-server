@@ -39,7 +39,17 @@ Apply the schema separately:
 psql "$DATABASE_URL" -f internal/db/schema.sql
 ```
 
-`FHIR_CREATE_TABLES=true` is intended for controlled first-start or local workflows, not as a default runtime privilege.
+`FHIR_CREATE_TABLES` remains off by default. `FHIR_CREATE_TABLES=true` is intended for controlled
+first-start or local workflows, not as a default runtime privilege.
+
+When upgrading to a version with `$reindex`, reapply `internal/db/schema.sql` with the schema owner
+before starting the new runtime. It adds `reindex_jobs` and `reindex_queue` without rewriting
+resource data. Grant the runtime role access to the new tables; earlier
+`GRANT ... ON ALL TABLES` commands do not cover tables created afterward:
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reindex_jobs, reindex_queue TO fhir_app;
+```
 
 ## Network and identity boundary
 
@@ -80,6 +90,32 @@ Propagation is best-effort and eventual — a replica learns of a change when it
 notification or reconnects, with no fixed lag bound — but it does not backfill resources already
 written without the new parameter. See
 [Custom search parameters](../api/search.md#custom-search-parameters).
+
+## Reindex jobs
+
+Start a [`$reindex` job](../api/operations.md#reindex) for each affected tenant after changing custom
+or IG search parameters. Jobs do not start on definition changes. Choose an optional resource type
+to restrict the pass and a batch size from 1 to 1000 resources (default 100).
+
+Each replica runs one worker, and PostgreSQL locks coordinate work across replicas. A worker
+commits each batch's index replacement and progress together. Jobs resume from the last committed
+batch after a restart, including when another replica takes over. The server accepts one unfinished
+job per tenant.
+
+Requests remain available during a pass. Writes to resources in the current batch can wait for
+its locks; affected searches can return incomplete results until completion. Larger batches hold
+locks longer and use more memory. The worker also holds a lock on search definitions during a
+batch, so configuration writes can wait for the batch to finish.
+
+Before starting a job, let the write replicas converge through `SEARCH_PARAM_WATCH=true` or
+restart replicas with stale definitions. The reindex worker reads current definitions from
+PostgreSQL, but a later resource write on a stale replica can omit new indexes. If definitions
+change after a job starts, the worker fails it; poll the status for its error and start a new job
+once the definitions have settled. A failed batch rolls back, while prior committed work remains.
+
+Job status reports committed resource counts without a total or percentage. Include `reindex_jobs`
+and `reindex_queue` in database backups alongside resource and index tables so restore preserves
+job progress.
 
 ## After bulk loading
 

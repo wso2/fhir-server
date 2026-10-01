@@ -93,6 +93,37 @@ CREATE INDEX IF NOT EXISTS idx_res_active       ON resources (tenant_id, resourc
 -- Full-text search over search_text (_text / _content).
 CREATE INDEX IF NOT EXISTS idx_res_search_text  ON resources USING GIN (search_text);
 
+CREATE TABLE IF NOT EXISTS reindex_jobs (
+    tenant_id TEXT NOT NULL DEFAULT current_setting('app.current_tenant', true),
+    job_id UUID NOT NULL,
+    resource_type TEXT NOT NULL DEFAULT '',
+    batch_size INT NOT NULL CHECK (batch_size BETWEEN 1 AND 1000),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    resources_reindexed BIGINT NOT NULL DEFAULT 0,
+    queued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    error TEXT NOT NULL DEFAULT '',
+    cursor_type TEXT NOT NULL DEFAULT '',
+    cursor_id TEXT NOT NULL DEFAULT '',
+    end_type TEXT NOT NULL,
+    end_id TEXT NOT NULL,
+    definition_hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, job_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reindex_active_tenant ON reindex_jobs (tenant_id)
+    WHERE status IN ('queued', 'running');
+
+-- Shared scheduling metadata lets workers discover jobs without bypassing tenant RLS.
+CREATE TABLE IF NOT EXISTS reindex_queue (
+    job_id UUID PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (tenant_id, job_id) REFERENCES reindex_jobs (tenant_id, job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_queue_scheduled ON reindex_queue (scheduled_at, job_id);
+
 -- ─── resource_history ────────────────────────────────────────────────────────
 -- Append-only log of every create, update, and delete. Each row is a full
 -- snapshot of resource_json at that version, enabling vread and audit trails.
@@ -729,7 +760,7 @@ ALTER TABLE sp_composite_token_quantity SET (autovacuum_vacuum_scale_factor = 0.
 DO $rls$
 DECLARE
     t             text;
-    tenant_tables text[] := ARRAY['resources','resource_history','sp_string','sp_token',
+    tenant_tables text[] := ARRAY['resources','resource_history','reindex_jobs','sp_string','sp_token',
                                   'sp_date','sp_number','sp_quantity','sp_uri',
                                   'sp_reference','sp_coords','sp_composite_token_quantity'];
 BEGIN

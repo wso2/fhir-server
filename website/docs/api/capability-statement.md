@@ -109,8 +109,10 @@ curl -sS http://localhost:9090/fhir/r4/metadata | jq '[.rest[0].operation[].name
 ```
 
 ```json title="Response"
-["convert", "document", "everything", "lastn", "meta", "meta-add", "meta-delete", "validate"]
+["convert", "document", "everything", "lastn", "meta", "meta-add", "meta-delete", "reindex", "validate"]
 ```
+
+The `$reindex` definition is published at [`https://wso2.github.io/fhir-server/OperationDefinition/reindex.json`](https://wso2.github.io/fhir-server/OperationDefinition/reindex.json).
 
 Verify which Implementation Guides loaded successfully:
 

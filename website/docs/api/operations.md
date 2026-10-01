@@ -1,15 +1,16 @@
 ---
 title: Operations
-description: Reference for $validate, $everything, $lastn, $document, $convert, and the $meta family.
+description: Reference for $reindex, $validate, $everything, $lastn, $document, $convert, and the $meta family.
 ---
 
 # Operations
 
-Alongside the REST interactions, the server supports eight FHIR operations out of the box. Each one
+Alongside the REST interactions, the server supports nine FHIR operations out of the box. Each one
 is advertised in the [CapabilityStatement](./capability-statement.md) under `rest[0].operation`.
 
 | Operation | Scopes | Method |
 | --- | --- | --- |
+| [`$reindex`](#reindex) | system (selected tenant) | `POST` |
 | [`$validate`](#validate) | system · type · instance | `POST` |
 | [`$everything`](#everything) | type (Patient, Encounter, Group) · instance (any type) | `GET` |
 | [`$lastn`](#lastn) | type (`Observation` only) | `GET` |
@@ -22,6 +23,142 @@ is advertised in the [CapabilityStatement](./capability-statement.md) under `res
 Only the method shown is registered for each path; another method on the same path returns
 `405 Method Not Allowed`. Every operation is also available under a tenant prefix
 (`/t/{tenant}/fhir/r4/…`) and honours the usual [format negotiation](./interactions.md).
+
+## $reindex
+
+[OperationDefinition](https://wso2.github.io/fhir-server/OperationDefinition/reindex.json).
+
+Start a background job to rebuild search indexes for the selected tenant. Use it after adding or
+changing a custom or IG search parameter to make existing resources searchable with that definition.
+The server rebuilds all search parameters for each selected resource and preserves its content,
+`meta.versionId`, `meta.lastUpdated`, and history.
+
+| Request | Path |
+| --- | --- |
+| Start a job | `POST /t/{tenant}/fhir/r4/$reindex` |
+| Read its status | `GET /t/{tenant}/fhir/r4/_operations/reindex/{jobId}` |
+
+The bare paths under `/fhir/r4` select the default tenant. A job covers that tenant alone; its status
+returns `404` from another tenant's path. The server uses the deployment's existing external
+authorization layer for these routes. It has no built-in admin role.
+
+### Start a job
+
+An empty body selects all resource types with a batch size of 100. To restrict the pass or choose a
+batch size, send a FHIR `Parameters` resource:
+
+| Input | FHIR value | Meaning |
+| --- | --- | --- |
+| `resourceType` | `valueCode` | Optional single FHIR R4 resource type; omit for all types |
+| `batchSize` | `valueInteger` | Resources selected per transaction; defaults to `100`, range `1`–`1000` |
+
+```bash title="Request"
+curl -i -X POST 'http://localhost:9090/t/acme/fhir/r4/$reindex' \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {"name": "resourceType", "valueCode": "Patient"},
+      {"name": "batchSize", "valueInteger": 100}
+    ]
+  }'
+```
+
+The server returns `202 Accepted` with a status resource and both `Location` and `Content-Location`
+pointing to its polling URL:
+
+```text title="Response headers"
+HTTP/1.1 202 Accepted
+Location: http://localhost:9090/t/acme/fhir/r4/_operations/reindex/9eea24ec-2469-4e09-b9da-493c9f441122
+Content-Location: http://localhost:9090/t/acme/fhir/r4/_operations/reindex/9eea24ec-2469-4e09-b9da-493c9f441122
+```
+
+```json title="Response"
+{
+  "resourceType": "Parameters",
+  "parameter": [
+    {"name": "id", "valueString": "9eea24ec-2469-4e09-b9da-493c9f441122"},
+    {"name": "status", "valueString": "queued"},
+    {"name": "resourceType", "valueCode": "Patient"},
+    {"name": "batchSize", "valueInteger": 100},
+    {"name": "resourcesReindexed", "valueInteger": 0},
+    {"name": "queuedTime", "valueInstant": "2026-09-30T10:00:00Z"},
+    {"name": "lastModified", "valueInstant": "2026-09-30T10:00:00Z"}
+  ]
+}
+```
+
+The server accepts one queued or running job per tenant. Starting another returns `409 Conflict`;
+jobs in other tenants can proceed. Invalid inputs return `400 Bad Request` with an `OperationOutcome`.
+
+### Read status
+
+Poll the URL from the response headers:
+
+```bash title="Request"
+curl -sS \
+  'http://localhost:9090/t/acme/fhir/r4/_operations/reindex/9eea24ec-2469-4e09-b9da-493c9f441122' | jq
+```
+
+A known job returns `200 OK`, including when it has failed. Its FHIR `Parameters` resource contains:
+
+| Output | FHIR value | Meaning |
+| --- | --- | --- |
+| `id` | `valueString` | Job identifier |
+| `status` | `valueString` | `queued`, `running`, `completed`, or `failed` |
+| `resourceType` | `valueCode` | Present when the request selected one type |
+| `batchSize` | `valueInteger` | Requested or default batch size |
+| `resourcesReindexed` | `valueInteger` | Active resources reindexed in committed batches |
+| `queuedTime` | `valueInstant` | Time the server accepted the job |
+| `lastModified` | `valueInstant` | Time of the latest committed job update |
+| `startTime` | `valueInstant` | Present after the worker starts the job |
+| `endTime` | `valueInstant` | Present after completion or failure |
+| `error` | `valueString` | Failure details, present for a failed job |
+
+For example, a completed pass includes:
+
+```json title="Response"
+{
+  "resourceType": "Parameters",
+  "parameter": [
+    {"name": "id", "valueString": "9eea24ec-2469-4e09-b9da-493c9f441122"},
+    {"name": "status", "valueString": "completed"},
+    {"name": "resourceType", "valueCode": "Patient"},
+    {"name": "batchSize", "valueInteger": 100},
+    {"name": "resourcesReindexed", "valueInteger": 250},
+    {"name": "queuedTime", "valueInstant": "2026-09-30T10:00:00Z"},
+    {"name": "lastModified", "valueInstant": "2026-09-30T10:00:04Z"},
+    {"name": "startTime", "valueInstant": "2026-09-30T10:00:01Z"},
+    {"name": "endTime", "valueInstant": "2026-09-30T10:00:04Z"}
+  ]
+}
+```
+
+`resourcesReindexed` counts completed work, not a percentage. The worker scans stored resource rows
+up to the highest key captured when you start the job, skipping deleted resources. Concurrent creates
+and deletes can change the number of active rows it encounters.
+
+### Execution and recovery
+
+Each batch locks its selected resource rows, replaces their index rows, and commits the index changes
+with the job's progress. Concurrent writes to those resources wait for that transaction; other
+requests remain available. Searches using an affected parameter can return incomplete results until
+the pass completes.
+
+The server persists jobs in PostgreSQL. After a restart, a worker resumes unfinished jobs from the
+last committed batch. Workers across replicas coordinate through database locks, so two workers
+cannot process the same job batch concurrently. A failed batch rolls back while earlier batches
+remain committed. Inspect `error`, correct the cause, and start a new job to retry a failed pass.
+
+The worker reloads definitions from the database for each batch. If definitions change after you
+start the job, it marks the job `failed`; start a new pass once the definitions have settled. In a
+multiple-replica deployment, first let the write replicas converge through `SEARCH_PARAM_WATCH=true`,
+or restart replicas with stale definitions. Reindexing cannot prevent later writes from a stale
+replica from omitting new indexes. See [Deployment](../administration/deployment.md#reindex-jobs).
+
+This operation uses the existing search extractor and its supported FHIRPath subset. Reindexing does
+not extend expression support. The server starts jobs only when you call `$reindex`; registering a
+search parameter does not start one.
 
 ## $validate
 

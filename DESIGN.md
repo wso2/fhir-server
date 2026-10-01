@@ -332,7 +332,7 @@ retries a failed reload with backoff, and keeps its connection alive with TCP ke
 a silent partition becomes a reconnect. Writers emit the notification inside their
 transaction, so it fires only if the change commits. Invalidation bounds the staleness
 window but cannot repair it: writes handled by a replica that did not yet know a parameter
-still miss that parameter's index rows, which is the reindex limitation in section 7. The watcher
+still miss that parameter's index rows. A tenant-scoped reindex pass repairs those rows (§7). The watcher
 is off by default; enable it with `SEARCH_PARAM_WATCH=true` for multi-replica deployments.
 
 ### Custom `SearchParameter` resources
@@ -378,14 +378,44 @@ For each configured `name@version` (or direct `.tgz` URL):
 - **CapabilityStatement:** `/metadata` advertises the loaded packages, supported
   profiles, and the IG's search parameters.
 
-### Known limitation: no reindex of existing data
+### Reindexing existing data
 
-Indexing happens at write time against the registry as it stood *then*. Loading an IG (or
-adding a custom param) **after** data already exists does not reindex pre-existing
-resources, so searches by a newly added parameter only match resources written since the
-load — until those rows are rewritten. This is tracked as
-[wso2/fhir-server#11](https://github.com/wso2/fhir-server/issues/11); a `$reindex`-style
-operation is the intended fix.
+Indexing happens at write time. Loading an IG or changing a custom parameter does not backfill
+existing resources. `POST /t/{tenant}/fhir/r4/$reindex` starts an explicit background pass for that
+tenant, optionally restricted to one resource type. `GET` on
+`/t/{tenant}/fhir/r4/_operations/reindex/{jobId}` returns its persisted status. The bare FHIR base
+selects the default tenant. The CapabilityStatement advertises the system operation.
+
+`reindex_jobs` stores tenant-scoped status, cursor, committed counts, and a fingerprint of the
+search definitions. Row-level security protects the job records. The internal `reindex_queue`
+contains tenant and job identifiers plus scheduling times so workers can discover work across tenants without
+reading their resources or status records outside a tenant transaction.
+
+Each replica runs one worker. A worker claims a queue row with `FOR UPDATE SKIP LOCKED`, establishes
+the tenant scope, and processes at most `batchSize` stored resource rows (default 100, maximum 1000).
+The pass stops at the highest resource key recorded at enqueue time. Deleted resources do not
+contribute to the reindexed count. Locking selected resource rows serializes each batch against
+concurrent writes; rebuilding replaces all search indexes for those resources while preserving
+resource JSON, versions, `lastUpdated`, and history.
+
+The cursor, progress, and index replacement commit in one transaction. A restart rolls back an
+unfinished batch, and a worker on any replica resumes from the last committed cursor. Database
+locks prevent simultaneous batches for the same job. Only one queued or running job per tenant
+is accepted; other tenants can have jobs in progress. A failed batch rolls back, earlier batches
+remain committed, and the failed job retains its progress and error for polling. Retrying a failed
+pass requires a new request and job identifier.
+
+For each batch the worker loads a private registry from the database and holds a `SHARE` lock on
+search definitions, which can delay definition writes until the batch commits. If the fingerprint
+has changed since enqueue, the worker fails the job so an operator can start a pass against the
+new definitions. Normal resource requests remain available, but affected searches can return
+partial results until completion. Before starting a pass, let write replicas converge through
+`SEARCH_PARAM_WATCH=true` or restart stale replicas; later writes with stale definitions can still
+omit new indexes. The extractor's existing FHIRPath support and error behavior also apply here.
+
+Provision the additive job and queue tables before upgrading the runtime. Reindexing follows the
+existing external authorization model, without an internal admin role. See the
+[API reference](website/docs/api/operations.md#reindex) for requests and status fields.
 
 ---
 
@@ -633,7 +663,7 @@ Consolidated here so they're easy to find. Each is a conscious choice, not an ov
 | Validation | Profile validation off by default, and only for resources declaring `meta.profile` | Interoperability first; strictness is opt-in |
 | Referential integrity | Enforced by default on write (422) and delete (409); each independently disableable via `validation.*` | Safe by default — dangling references corrupt clinical data silently; bulk loaders can opt out |
 | Unknown profile URL | Soft-skip, not 422 | A resource may reference an IG this server hasn't loaded |
-| Reindex | No reindex of existing data when params change ([#11](https://github.com/wso2/fhir-server/issues/11)) | Indexing is write-time; bulk reindex is future work |
+| Reindex | Explicit tenant-scoped background jobs; no automatic trigger on definition changes | Operators control when to rebuild existing indexes and monitor completion |
 | Search params | Composite & special (e.g. `Location.near` without support) fail closed | Don't silently widen result sets |
 | Unknown param | Heuristic typing, not rejection | Graceful degradation for not-yet-loaded custom params |
 | FHIRPath | Scoped subset (no arithmetic/string ops) | Engine exists for search extraction, not general evaluation |

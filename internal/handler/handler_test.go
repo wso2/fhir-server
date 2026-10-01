@@ -34,6 +34,8 @@ import (
 // ─── Mock store ───────────────────────────────────────────────────────────────
 
 type mockStore struct {
+	startReindexFn      func(context.Context, store.ReindexOptions) (store.ReindexJob, error)
+	getReindexFn        func(context.Context, string) (store.ReindexJob, error)
 	readFn              func(ctx context.Context, rt, id string) (map[string]any, error)
 	getVersionFn        func(ctx context.Context, rt, id string, vid int) (map[string]any, error)
 	createFn            func(ctx context.Context, rt string, body map[string]any) (map[string]any, error)
@@ -51,6 +53,19 @@ type mockStore struct {
 	syncSearchParamFn   func(ctx context.Context, body map[string]any) error
 	deleteSearchParamFn func(ctx context.Context, id string) error
 	executeBundleFn     func(ctx context.Context, bundleType, baseURL string, entries []store.BundleEntryRequest) ([]store.BundleEntryResult, error)
+}
+
+func (m *mockStore) StartReindex(ctx context.Context, options store.ReindexOptions) (store.ReindexJob, error) {
+	if m.startReindexFn != nil {
+		return m.startReindexFn(ctx, options)
+	}
+	return store.ReindexJob{}, nil
+}
+func (m *mockStore) GetReindex(ctx context.Context, id string) (store.ReindexJob, error) {
+	if m.getReindexFn != nil {
+		return m.getReindexFn(ctx, id)
+	}
+	return store.ReindexJob{}, nil
 }
 
 func (m *mockStore) Read(ctx context.Context, rt, id string) (map[string]any, error) {
