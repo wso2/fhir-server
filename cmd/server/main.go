@@ -260,6 +260,13 @@ func run() error {
 				slog.Warn("IG loading encountered errors", "err", err)
 			}
 
+			// Resync once more so readiness implies a registry that matches the
+			// database even when a package failed to load or another replica
+			// loaded it.
+			if err := registry.Refresh(ctx, pool); err != nil {
+				slog.Warn("registry refresh after IG loading failed", "err", err)
+			}
+
 			igReady.Store(1)
 			slog.Info("all IG packages ready")
 		}()
