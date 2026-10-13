@@ -147,6 +147,32 @@ prefix at the gateway, or accept that the bare path is its own isolated dataset.
 A URL tenant identifier is routing context, not proof of identity or authorization. Place an authenticated gateway or equivalent security layer in front of the service and bind the authenticated tenant to the routed tenant value.
 :::
 
+## Tenant-scoped reindexing
+
+Start and poll [`$reindex` jobs](../api/operations.md#reindex) through the same tenant prefix:
+
+```text
+POST /t/acme/fhir/r4/$reindex
+GET /t/acme/fhir/r4/_operations/reindex/{jobId}
+```
+
+A job rebuilds indexes only for the selected tenant, optionally restricted to one resource type.
+The server accepts one queued or running job per tenant; a job in another tenant can proceed.
+Reading a job ID through a different tenant's path returns `404`. The bare base path starts and
+reads jobs for the default tenant.
+
+Search-parameter definitions are shared across tenants. After adding or changing a definition,
+start a job for each tenant whose existing resources need the new indexes. Reindexing one tenant
+does not repair another tenant's indexes.
+
+`reindex_jobs` uses tenant row-level security. Workers discover pending jobs through an internal
+queue containing tenant and job identifiers plus scheduling times, then enter that tenant's database scope to rebuild
+indexes and update status. Apply the new tables and runtime grants when upgrading; see
+[Database provisioning](./deployment.md#database-provisioning).
+
+Bind these routes to authenticated tenants at the gateway as you do for resource requests. The
+server does not assign an admin role or authorize a caller to choose a tenant.
+
 ## Selection guide
 
 | Concern | Dedicated | Shared |
