@@ -1,6 +1,14 @@
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import {existsSync, readFileSync} from 'node:fs';
+import {resolve} from 'node:path';
 import {themes as prismThemes} from 'prism-react-renderer';
+
+const versionsFile = resolve(process.cwd(), 'versions.json');
+const releasedVersions: string[] = existsSync(versionsFile)
+  ? JSON.parse(readFileSync(versionsFile, 'utf8'))
+  : [];
+const latestRelease = releasedVersions[0];
 
 const config: Config = {
   title: 'WSO2 FHIR Server',
@@ -47,6 +55,9 @@ const config: Config = {
               label: 'main',
               banner: 'unreleased',
             },
+            // With main as the default version, Docusaurus treats every release
+            // as older and would mark the newest one "unmaintained".
+            ...(latestRelease ? {[latestRelease]: {banner: 'none' as const}} : {}),
           },
         },
         blog: false,
