@@ -1587,6 +1587,7 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"code": "history-system"},
 			},
 			"operation": []any{
+				map[string]any{"name": "reindex", "definition": "https://wso2.github.io/fhir-server/OperationDefinition/reindex.json"},
 				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"},
 				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Encounter-everything"},
 				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Group-everything"},
