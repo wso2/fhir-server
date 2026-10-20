@@ -6,9 +6,17 @@ import styles from './styles.module.css';
 
 // The doc's Markdown source is copied to static/md/ at build time
 // (scripts/copy-docs-markdown.mjs), so every page has a retrievable source
-// file at the same relative path it has under docs/.
+// file at the same relative path it has under docs/ or versioned_docs/.
 function sourceToMdPath(source: string): string {
-  return source.replace(/^@site\/docs\//, '');
+  const current = source.match(/^@site\/docs\/(.+)$/);
+  if (current) {
+    return current[1];
+  }
+  const versioned = source.match(/^@site\/versioned_docs\/(version-[^/]+)\/(.+)$/);
+  if (versioned) {
+    return `${versioned[1]}/${versioned[2]}`;
+  }
+  return source;
 }
 
 type CopyState = 'idle' | 'copied' | 'failed';

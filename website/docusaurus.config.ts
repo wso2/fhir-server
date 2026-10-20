@@ -41,6 +41,11 @@ const config: Config = {
           routeBasePath: '/docs',
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/wso2/fhir-server/edit/main/website/',
+          versions: {
+            current: {
+              label: 'Next (main)',
+            },
+          },
         },
         blog: false,
         theme: {
@@ -64,6 +69,7 @@ const config: Config = {
         href: '/docs/',
       },
       items: [
+        {type: 'docsVersionDropdown', position: 'right', dropdownActiveClassDisabled: true},
         {
           href: 'https://hl7.org/fhir/R4/',
           label: 'FHIR R4',

@@ -25,6 +25,7 @@ name: Release
 #      published (never dangling if an earlier step failed).
 #   8. Opens a PR against main bumping version.txt to
 #      <next_version>-dev.
+#   9. Opens a PR freezing the release docs as version <release_version>.
 #
 # Prerequisites (repo/org settings):
 #   - Settings > Actions > General > Workflow permissions:
@@ -247,3 +248,13 @@ jobs:
                 --body "Automated version bump after releasing v${RELEASE_VERSION}. Sets \`version.txt\` to \`${next_dev}\`."; then
             echo "::warning::Could not open the bump PR automatically. Branch '${branch}' is pushed; open the PR manually or enable Actions PR creation in repo settings."
           fi
+
+  docs-version:
+    needs: release
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/cut-docs-version.yml
+    with:
+      version: ${{ inputs.release_version }}
+      ref: v${{ inputs.release_version }}

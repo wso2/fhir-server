@@ -1,0 +1,78 @@
+name: Cut docs version
+
+# Snapshots website/docs at the given ref as a Docusaurus version and opens a
+# pull request against main. Called by the release workflow with the release
+# tag, or dispatched manually to backfill an existing release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to freeze, no leading v (e.g. 2.1.0)'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to snapshot (default: main)'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Freeze docs version
+        env:
+          VERSION: ${{ inputs.version }}
+          REF: ${{ inputs.ref || 'main' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="docs/version-${VERSION}"
+          git fetch origin main --tags
+
+          if ! git cat-file -e "${REF}:website/docs" 2>/dev/null; then
+            echo "::error::${REF} has no website/docs"
+            exit 1
+          fi
+
+          git checkout -B "$branch" origin/main
+          git checkout "$REF" -- website/docs
+          git checkout "$REF" -- website/sidebars.ts 2>/dev/null || true
+
+          (cd website && npm ci && npx docusaurus docs:version "$VERSION" && npm run build)
+
+          git checkout origin/main -- website/docs website/sidebars.ts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/versions.json website/versioned_docs website/versioned_sidebars
+          git commit -m "docs: freeze version ${VERSION}"
+          git push origin "$branch"
+
+          if ! gh pr create --base main --head "$branch" \
+            --title "docs: freeze version ${VERSION}" \
+            --body "Freezes \`website/docs\` at \`${REF}\` as version \`${VERSION}\`. The latest release is served at \`/docs\`; main remains at \`/docs/next\`."; then
+            echo "::warning::Could not open the docs version PR automatically. Branch '${branch}' is pushed; open the PR manually."
+          fi
