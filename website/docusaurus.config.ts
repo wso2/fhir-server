@@ -41,9 +41,11 @@ const config: Config = {
           routeBasePath: '/docs',
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/wso2/fhir-server/edit/main/website/',
+          lastVersion: 'current',
           versions: {
             current: {
-              label: 'Next (main)',
+              label: 'main',
+              banner: 'unreleased',
             },
           },
         },

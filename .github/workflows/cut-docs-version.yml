@@ -73,6 +73,6 @@ jobs:
 
           if ! gh pr create --base main --head "$branch" \
             --title "docs: freeze version ${VERSION}" \
-            --body "Freezes \`website/docs\` at \`${REF}\` as version \`${VERSION}\`. The latest release is served at \`/docs\`; main remains at \`/docs/next\`."; then
+            --body "Freezes \`website/docs\` at \`${REF}\` as version \`${VERSION}\`. Main is served at \`/docs\`; the frozen release is at \`/docs/${VERSION}\`."; then
             echo "::warning::Could not open the docs version PR automatically. Branch '${branch}' is pushed; open the PR manually."
           fi
