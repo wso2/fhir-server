@@ -17,6 +17,7 @@
 package store
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -138,5 +139,45 @@ func TestParseETagVersion(t *testing.T) {
 		if v != exp.want || ok != exp.ok {
 			t.Errorf("parseETagVersion(%q) = (%d,%v), want (%d,%v)", in, v, ok, exp.want, exp.ok)
 		}
+	}
+}
+
+func TestNormalizeConditionalQuery(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{"bare", "identifier=urn:x|1", "identifier=urn:x|1", false},
+		{"leading ?", "?identifier=urn:x|1", "identifier=urn:x|1", false},
+		{"type prefix", "DocumentReference?identifier=urn:x|1", "identifier=urn:x|1", false},
+		{"full URL", "http://localhost/fhir/r4/DocumentReference?identifier=urn:x|1", "identifier=urn:x|1", false},
+		{"multi params", "?a=1&b=2", "a=1&b=2", false},
+		{"bare key", "identifier", "", true},
+		{"empty", "", "", true},
+		{"only ?", "?", "", true},
+		{"type only", "DocumentReference?", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := normalizeConditionalQuery(c.raw)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", c.raw)
+				}
+				var invalid *InvalidParamError
+				if !errors.As(err, &invalid) {
+					t.Fatalf("expected InvalidParamError for %q, got %T: %v", c.raw, err, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", c.raw, err)
+			}
+			if got != c.want {
+				t.Errorf("normalizeConditionalQuery(%q) = %q, want %q", c.raw, got, c.want)
+			}
+		})
 	}
 }

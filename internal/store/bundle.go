@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -448,7 +449,15 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 			if e.IfNoneExist != "" {
 				existingID, count, serr := s.conditionalMatch(ctx, rt, e.IfNoneExist)
 				if serr != nil {
-					return nil, nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					be := &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					var unsup *UnsupportedParamError
+					var invalid *InvalidParamError
+					if errors.As(serr, &unsup) {
+						be.HTTPStatus, be.Code = 400, "not-supported"
+					} else if errors.As(serr, &invalid) {
+						be.HTTPStatus, be.Code = 400, "invalid"
+					}
+					return nil, nil, be
 				}
 				if count > 1 {
 					return nil, nil, &BundleError{HTTPStatus: 412, Code: "conflict", EntryIndex: i, Diagnostics: fmt.Sprintf("If-None-Exist matched %d resources", count)}
@@ -492,7 +501,15 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 			if id == "" && len(query) > 0 {
 				existingID, count, serr := s.conditionalMatch(ctx, rt, query.Encode())
 				if serr != nil {
-					return nil, nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					be := &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					var unsup *UnsupportedParamError
+					var invalid *InvalidParamError
+					if errors.As(serr, &unsup) {
+						be.HTTPStatus, be.Code = 400, "not-supported"
+					} else if errors.As(serr, &invalid) {
+						be.HTTPStatus, be.Code = 400, "invalid"
+					}
+					return nil, nil, be
 				}
 				if count > 1 {
 					return nil, nil, &BundleError{HTTPStatus: 412, Code: "conflict", EntryIndex: i, Diagnostics: fmt.Sprintf("conditional update matched %d resources", count)}
@@ -518,7 +535,15 @@ func (s *Store) planOps(ctx context.Context, baseURL string, entries []BundleEnt
 			if id == "" && len(query) > 0 {
 				existingID, count, serr := s.conditionalMatch(ctx, rt, query.Encode())
 				if serr != nil {
-					return nil, nil, &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					be := &BundleError{HTTPStatus: 500, Code: "exception", EntryIndex: i, Diagnostics: serr.Error()}
+					var unsup *UnsupportedParamError
+					var invalid *InvalidParamError
+					if errors.As(serr, &unsup) {
+						be.HTTPStatus, be.Code = 400, "not-supported"
+					} else if errors.As(serr, &invalid) {
+						be.HTTPStatus, be.Code = 400, "invalid"
+					}
+					return nil, nil, be
 				}
 				if count == 0 {
 					op.skip = true
@@ -557,6 +582,62 @@ func (s *Store) ConditionalMatch(ctx context.Context, resourceType, rawQuery str
 	return s.conditionalMatch(ctx, resourceType, rawQuery)
 }
 
+// normalizeConditionalQuery turns an If-None-Exist / conditional-search value
+// into a bare query string (what follows "?"). Clients sometimes send a leading
+// "?", "Type?query", or a full search URL; those are accepted by stripping
+// through the first "?". Values that cannot be evaluated as search parameters
+// (empty, or a segment with no "=") return InvalidParamError so callers reject
+// the request instead of falling through to an unconditional write.
+func normalizeConditionalQuery(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", &InvalidParamError{Msg: "conditional query is empty"}
+	}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		raw = raw[i+1:]
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", &InvalidParamError{Msg: "conditional query is empty"}
+	}
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "=") {
+			return "", &InvalidParamError{Msg: fmt.Sprintf("conditional query parameter %q is missing a value", part)}
+		}
+	}
+	return raw, nil
+}
+
+// knownConditionalParam reports whether name is a usable search parameter for
+// resourceType. Unknown names must not be ignored: dropping a criterion widens
+// the match and silently defeats the conditional precondition.
+func (s *Store) knownConditionalParam(resourceType, name string) bool {
+	param, _ := splitModifier(name)
+	if param == "" {
+		return false
+	}
+	switch param {
+	case "_id", "_lastUpdated", "_text", "_content", "_list", "_has", "_filter":
+		return true
+	}
+	if _, ok := universalParamType[param]; ok {
+		return true
+	}
+	if s.registry == nil {
+		return true // no registry to check against — defer to Search
+	}
+	if _, ok := s.registry.Lookup(resourceType, param); ok {
+		return true
+	}
+	if _, ok := s.registry.Lookup("Resource", param); ok {
+		return true
+	}
+	return false
+}
+
 // conditionalMatch runs a search and returns the single matched id (if count==1)
 // and the number of matches, capped at 2. FHIR's conditional create/update/delete
 // decision needs only whether zero, exactly one, or more than one resource
@@ -565,9 +646,23 @@ func (s *Store) ConditionalMatch(ctx context.Context, resourceType, rawQuery str
 // The returned count is therefore 0, 1, or 2 (2 meaning "more than one"), which
 // the callers already branch on (>1 → 412, ==1 → reuse/target, ==0 → create).
 func (s *Store) conditionalMatch(ctx context.Context, resourceType, rawQuery string) (id string, count int, err error) {
-	q, perr := url.ParseQuery(rawQuery)
+	normalized, nerr := normalizeConditionalQuery(rawQuery)
+	if nerr != nil {
+		return "", 0, nerr
+	}
+	q, perr := url.ParseQuery(normalized)
 	if perr != nil {
-		return "", 0, perr
+		return "", 0, &InvalidParamError{Msg: "invalid conditional query: " + perr.Error()}
+	}
+	if len(q) == 0 {
+		return "", 0, &InvalidParamError{Msg: "conditional query is empty"}
+	}
+	for rawKey := range q {
+		if !s.knownConditionalParam(resourceType, rawKey) {
+			return "", 0, &UnsupportedParamError{
+				Msg: fmt.Sprintf("unknown search parameter %q for %s", rawKey, resourceType),
+			}
+		}
 	}
 	result, serr := s.Search(ctx, SearchParams{ResourceType: resourceType, Params: valuesToMap(q), PageSize: 2, Total: "none"})
 	if serr != nil {

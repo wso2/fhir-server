@@ -749,6 +749,16 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 	if ifne := strings.TrimSpace(r.Header.Get("If-None-Exist")); ifne != "" {
 		existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, ifne)
 		if err != nil {
+			var unsup *store.UnsupportedParamError
+			if errors.As(err, &unsup) {
+				operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+				return
+			}
+			var invalid *store.InvalidParamError
+			if errors.As(err, &invalid) {
+				operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+				return
+			}
 			slog.Error("conditional create match failed", "resourceType", rt, "err", err)
 			operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 			return
@@ -1040,6 +1050,16 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 
 	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
 	if err != nil {
+		var unsup *store.UnsupportedParamError
+		if errors.As(err, &unsup) {
+			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+			return
+		}
+		var invalid *store.InvalidParamError
+		if errors.As(err, &invalid) {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+			return
+		}
 		slog.Error("conditional update match failed", "resourceType", rt, "err", err)
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 		return
@@ -1093,6 +1113,16 @@ func (h *fhirHandler) conditionalDelete(w http.ResponseWriter, r *http.Request) 
 
 	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
 	if err != nil {
+		var unsup *store.UnsupportedParamError
+		if errors.As(err, &unsup) {
+			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+			return
+		}
+		var invalid *store.InvalidParamError
+		if errors.As(err, &invalid) {
+			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+			return
+		}
 		slog.Error("conditional delete match failed", "resourceType", rt, "err", err)
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 		return
