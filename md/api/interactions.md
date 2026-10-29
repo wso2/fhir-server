@@ -13,7 +13,8 @@ http://localhost:9090/fhir/r4
 
 Examples below use `application/fhir+json`. The server also reads and writes
 `application/fhir+xml` and `application/fhir+turtle` (or `text/turtle`), selected with the
-`Content-Type` and `Accept` headers, or with `?_format=json|xml|turtle`.
+`Content-Type` and `Accept` headers, or with `?_format=json|xml|turtle`. `?_pretty` is accepted
+but has no effect.
 
 ## The interaction set
 
