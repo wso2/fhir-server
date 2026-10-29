@@ -1998,6 +1998,15 @@ func (b *queryBuilder) orderTerms() []orderTerm {
 		table, col := "", ""
 		if b.reg != nil {
 			if def, ok := b.reg.Lookup(b.rt, k.param); ok {
+				// A HumanName `name` is indexed as one row per text part, so MIN/MAX
+				// over it would sort by whichever part is smallest (a prefix, a given
+				// name). Sort people by family name instead.
+				if def.FHIRPath == b.rt+".name" {
+					if fam, ok := b.reg.Lookup(b.rt, "family"); ok {
+						def = fam
+						k.param = "family"
+					}
+				}
 				table = tableForType(def.ParamType)
 				col = sortColumnForTable(table)
 			}
