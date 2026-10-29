@@ -54,6 +54,15 @@ func ApplyJSONPatch(doc map[string]any, ops []map[string]any) (map[string]any, e
 		from, _ := op["from"].(string)
 
 		switch opName {
+		case "add", "replace", "test":
+			// RFC 6902 §4.1/4.3/4.6: these operations MUST carry a "value"
+			// member. An explicit JSON null is allowed; an absent member is not.
+			if _, ok := op["value"]; !ok {
+				return nil, fmt.Errorf("op %d (%s %s): missing required \"value\" member", i, opName, path)
+			}
+		}
+
+		switch opName {
 		case "add":
 			if err := jsonPatchAdd(result, path, op["value"]); err != nil {
 				return nil, fmt.Errorf("op %d (add %s): %w", i, path, err)
