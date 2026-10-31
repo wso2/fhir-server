@@ -461,6 +461,53 @@ func TestIntegration_Search_Pagination_Links(t *testing.T) {
 	}
 }
 
+// TestIntegration_Search_Pagination_UsesStorePageSize pins that following "next"
+// reaches every match when search.maxPageSize or search.defaultPageSize makes the
+// page size differ from _count.
+func TestIntegration_Search_Pagination_UsesStorePageSize(t *testing.T) {
+	pool := testutil.MustSeededDB(t)
+	reg := testutil.MustRegistry(t, pool)
+	var ready atomic.Int32
+	ready.Store(1)
+	newServer := func(tuning store.SearchTuning) *httptest.Server {
+		s := store.New(pool, reg, store.WithSearchTuning(tuning))
+		srv := httptest.NewServer(handler.NewRouter(s, pool, reg, "http://test-server/fhir/r4", &ready))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	clamped := newServer(store.SearchTuning{MaxPageSize: 2})
+	for i := 0; i < 5; i++ {
+		iCreate(t, clamped, "Patient", map[string]any{"resourceType": "Patient"})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		srv   *httptest.Server
+		query string
+	}{
+		{"clamped _count", clamped, "?_count=100"},
+		{"clamped _count with _total", clamped, "?_count=100&_total=accurate"},
+		{"configured default", newServer(store.SearchTuning{DefaultPageSize: 2}), ""},
+	} {
+		path, seen := "/fhir/r4/Patient"+tc.query, 0
+		for i := 0; path != "" && i < 10; i++ {
+			bundle := iJSON(t, iDo(t, tc.srv, http.MethodGet, path, nil))
+			entries, _ := bundle["entry"].([]any)
+			seen += len(entries)
+			path = strings.TrimPrefix(linkRels(bundle)["next"], "http://test-server")
+		}
+		if seen != 5 {
+			t.Errorf("%s: following next reached %d patients, want 5", tc.name, seen)
+		}
+	}
+
+	bundle := iJSON(t, iDo(t, clamped, http.MethodGet, "/fhir/r4/Patient?_count=100&_summary=count", nil))
+	if last := linkRels(bundle)["last"]; !strings.Contains(last, "_page=3") {
+		t.Errorf("_summary=count: last link = %q, want _page=3", last)
+	}
+}
+
 // ─── $validate ────────────────────────────────────────────────────────────────
 
 func TestIntegration_Validate_Valid(t *testing.T) {
