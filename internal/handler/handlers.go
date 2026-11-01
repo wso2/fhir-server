@@ -371,14 +371,7 @@ func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
 		CountOnly:    summary == "count",
 	})
 	if err != nil {
-		var unsup *store.UnsupportedParamError
-		if errors.As(err, &unsup) {
-			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
-			return
-		}
-		var invalid *store.InvalidParamError
-		if errors.As(err, &invalid) {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+		if writeSearchParamError(w, err) {
 			return
 		}
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
@@ -420,14 +413,7 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 		CountOnly:    summary == "count",
 	})
 	if err != nil {
-		var unsup *store.UnsupportedParamError
-		if errors.As(err, &unsup) {
-			operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
-			return
-		}
-		var invalid *store.InvalidParamError
-		if errors.As(err, &invalid) {
-			operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+		if writeSearchParamError(w, err) {
 			return
 		}
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
@@ -755,6 +741,9 @@ func (h *fhirHandler) create(w http.ResponseWriter, r *http.Request) {
 		}
 		existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
 		if err != nil {
+			if writeSearchParamError(w, err) {
+				return
+			}
 			slog.Error("conditional create match failed", "resourceType", rt, "err", err)
 			operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 			return
@@ -1046,6 +1035,9 @@ func (h *fhirHandler) conditionalUpdate(w http.ResponseWriter, r *http.Request) 
 
 	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
 	if err != nil {
+		if writeSearchParamError(w, err) {
+			return
+		}
 		slog.Error("conditional update match failed", "resourceType", rt, "err", err)
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 		return
@@ -1099,6 +1091,9 @@ func (h *fhirHandler) conditionalDelete(w http.ResponseWriter, r *http.Request) 
 
 	existingID, count, err := h.store.ConditionalMatch(r.Context(), rt, query)
 	if err != nil {
+		if writeSearchParamError(w, err) {
+			return
+		}
 		slog.Error("conditional delete match failed", "resourceType", rt, "err", err)
 		operationOutcome(w, http.StatusInternalServerError, "error", "exception", "conditional match failed")
 		return
@@ -1891,8 +1886,10 @@ func (h *fhirHandler) compartmentSearch(w http.ResponseWriter, r *http.Request) 
 			PageSize:     1000, // fetch all for dedup; paginate after
 		})
 		if err != nil {
-			slog.Warn("compartment search failed for param", "param", param, "err", err)
-			continue
+			if !writeSearchParamError(w, err) {
+				operationOutcome(w, http.StatusInternalServerError, "error", "exception", err.Error())
+			}
+			return
 		}
 		for _, entry := range result.Entries {
 			id, _ := entry["id"].(string)
@@ -1953,6 +1950,22 @@ func containsStr(ss []string, s string) bool {
 }
 
 // ─── Error handling ───────────────────────────────────────────────────────────
+
+// writeSearchParamError writes a 400 and returns true when err is a search
+// parameter the store rejected. Any other error is left to the caller.
+func writeSearchParamError(w http.ResponseWriter, err error) bool {
+	var unsup *store.UnsupportedParamError
+	if errors.As(err, &unsup) {
+		operationOutcome(w, http.StatusBadRequest, "error", "not-supported", unsup.Msg)
+		return true
+	}
+	var invalid *store.InvalidParamError
+	if errors.As(err, &invalid) {
+		operationOutcome(w, http.StatusBadRequest, "error", "invalid", invalid.Msg)
+		return true
+	}
+	return false
+}
 
 func handleError(w http.ResponseWriter, err error) {
 	var notFound store.NotFoundError
