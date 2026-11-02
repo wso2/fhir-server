@@ -676,6 +676,45 @@ func TestSearch_EmptyResult(t *testing.T) {
 	}
 }
 
+// TestSearch_LinksUseStorePageSize pins that paging links follow the page size
+// the store ran with, which search.maxPageSize or search.defaultPageSize can make
+// different from _count.
+func TestSearch_LinksUseStorePageSize(t *testing.T) {
+	for _, tc := range []struct {
+		path  string
+		total int
+	}{
+		{"/fhir/r4/Patient?_count=500", -1},
+		{"/fhir/r4/Patient", -1},
+		{"/fhir/r4/Patient?_count=500&_total=accurate", 5},
+	} {
+		ms := &mockStore{}
+		ms.searchFn = func(_ context.Context, sp store.SearchParams) (store.SearchResult, error) {
+			return store.SearchResult{
+				Total:    tc.total,
+				PageSize: 2,
+				Entries: []map[string]any{
+					{"resourceType": "Patient", "id": "p1"},
+					{"resourceType": "Patient", "id": "p2"},
+				},
+			}, nil
+		}
+
+		body := decodeJSON(t, do(t, newRouter(ms), http.MethodGet, tc.path, nil))
+		var next string
+		links, _ := body["link"].([]any)
+		for _, l := range links {
+			lm, _ := l.(map[string]any)
+			if lm["relation"] == "next" {
+				next, _ = lm["url"].(string)
+			}
+		}
+		if !strings.Contains(next, "_count=2&_page=2") {
+			t.Errorf("%s: next link = %q, want _count=2&_page=2", tc.path, next)
+		}
+	}
+}
+
 // ─── History ──────────────────────────────────────────────────────────────────
 
 func TestHistory_ReturnsBundle(t *testing.T) {

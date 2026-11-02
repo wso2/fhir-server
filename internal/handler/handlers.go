@@ -439,6 +439,10 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *fhirHandler) buildBundle(baseURL, rt string, result store.SearchResult, params map[string][]string, page, pageSize int, summary string, elements []string) map[string]any {
+	// Links must use the size the store ran with, not the requested _count.
+	if result.PageSize > 0 {
+		pageSize = result.PageSize
+	}
 	if pageSize <= 0 {
 		pageSize = 20
 	}
