@@ -242,3 +242,23 @@ func TestFHIRPatch_Delete(t *testing.T) {
 		t.Error("gender should be deleted")
 	}
 }
+
+func TestJSONPatch_MissingValueMemberRejected(t *testing.T) {
+	for _, name := range []string{"add", "replace", "test"} {
+		op := map[string]any{"op": name, "path": "/gender"}
+		if _, err := ApplyJSONPatch(doc(), []map[string]any{op}); err == nil {
+			t.Errorf("%s without value member: expected error", name)
+		}
+	}
+}
+
+func TestJSONPatch_ExplicitNullValueAllowed(t *testing.T) {
+	op := map[string]any{"op": "add", "path": "/sex", "value": nil}
+	out, err := ApplyJSONPatch(doc(), []map[string]any{op})
+	if err != nil {
+		t.Fatalf("explicit null value: %v", err)
+	}
+	if v, ok := out["sex"]; !ok || v != nil {
+		t.Fatalf("sex = %#v (present=%v), want explicit null", v, ok)
+	}
+}
