@@ -117,6 +117,36 @@ func TestBuildDateExists_InvalidDateSetsError(t *testing.T) {
 	}
 }
 
+// TestApplyLastUpdated_HalfOpenBand pins _lastUpdated to the same exclusive
+// band end as date params: last_updated has sub-second precision, so a
+// resource written at 10:15:30.123 must match _lastUpdated=…T10:15:30Z.
+func TestApplyLastUpdated_HalfOpenBand(t *testing.T) {
+	second := time.Date(2026, 10, 29, 10, 15, 30, 0, time.UTC)
+	nextSecond := second.Add(time.Second)
+	nextDay := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		value string
+		sql   string
+		args  []time.Time
+	}{
+		{"2026-10-29T10:15:30Z", "r.last_updated >= $1 AND r.last_updated < $2", []time.Time{second, nextSecond}},
+		{"gt2026-10-29T10:15:30Z", "r.last_updated >= $1", []time.Time{nextSecond}},
+		{"le2026-10-29T10:15:30Z", "r.last_updated < $1", []time.Time{nextSecond}},
+		{"le2026-10-29", "r.last_updated < $1", []time.Time{nextDay}},
+	} {
+		b := &queryBuilder{rt: "Patient"}
+		b.applyLastUpdated(tc.value)
+		if got := strings.TrimPrefix(b.where.String(), " AND "); got != tc.sql {
+			t.Errorf("%s: got %q, want %q", tc.value, got, tc.sql)
+		}
+		for i, want := range tc.args {
+			if got := b.args[i].(time.Time); !got.Equal(want) {
+				t.Errorf("%s: arg %d = %v, want %v", tc.value, i, got, want)
+			}
+		}
+	}
+}
+
 func TestApplyLastUpdated_InvalidDateSetsError(t *testing.T) {
 	b := &queryBuilder{rt: "Observation"}
 	b.applyLastUpdated("gt2028-05-15T99:99")

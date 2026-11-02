@@ -1921,10 +1921,12 @@ func (b *queryBuilder) applyLastUpdated(value string) {
 		b.err = &InvalidParamError{Msg: fmt.Sprintf("invalid date value %q for _lastUpdated", dateStr)}
 		return
 	}
+	// last_updated keeps sub-second precision, so compare against the exclusive
+	// band end like buildDateExists does.
 	switch prefix {
 	case "gt":
-		highP := b.next(high)
-		b.and(fmt.Sprintf("r.last_updated > %s", highP))
+		highP := b.next(searchBandEnd(high))
+		b.and(fmt.Sprintf("r.last_updated >= %s", highP))
 	case "lt":
 		lowP := b.next(low)
 		b.and(fmt.Sprintf("r.last_updated < %s", lowP))
@@ -1932,12 +1934,12 @@ func (b *queryBuilder) applyLastUpdated(value string) {
 		lowP := b.next(low)
 		b.and(fmt.Sprintf("r.last_updated >= %s", lowP))
 	case "le":
-		highP := b.next(high)
-		b.and(fmt.Sprintf("r.last_updated <= %s", highP))
+		highP := b.next(searchBandEnd(high))
+		b.and(fmt.Sprintf("r.last_updated < %s", highP))
 	default:
 		lowP := b.next(low)
-		highP := b.next(high)
-		b.and(fmt.Sprintf("r.last_updated >= %s AND r.last_updated <= %s", lowP, highP))
+		highP := b.next(searchBandEnd(high))
+		b.and(fmt.Sprintf("r.last_updated >= %s AND r.last_updated < %s", lowP, highP))
 	}
 }
 
