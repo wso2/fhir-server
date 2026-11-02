@@ -44,6 +44,7 @@ Run with `go test -tags integration -timeout 300s <package>`. Requires Docker.
 | `internal/db` | 3 | `CreateTables` creates all 12 expected tables; `search_param_definitions` has all required columns; table creation is idempotent |
 | `internal/seed` | 4 | `SeedSearchParams` inserts ≥100 FHIR R4 base params; seeding is idempotent; 8 known params are present; all 5 param types exist |
 | `internal/store` | ~40 | Full CRUD lifecycle (create→read→update→patch→delete); version history; pagination; search by string/token/date params; `_id` search; deleted resources excluded; `FetchReferences` forward and reverse; `SearchParameter` sync and delete; referential integrity (dangling create/update rejected 422, referenced delete rejected 409, soft-deleted targets, transaction-bundle order-independence and rollback, disable flags) |
+| `internal/ig` | 2 | Replicas calling `LoadPackage` concurrently serialize on an advisory lock: exactly one loads, and every registry ends up with all IG params; a stale registry catches up when it finds the package already loaded |
 | `internal/index` | 6 | `Extractor.Index` writes to `sp_string`, `sp_token`, `sp_date`, `sp_reference`; CodeableConcept token extraction; `Delete` clears all `sp_*` tables for a resource |
 | **Total** | **~43** | **Real PostgreSQL, no mocks** |
 
@@ -104,6 +105,16 @@ Writing the test suite revealed **4 pre-existing bugs** in production code:
 **Root cause**: The local-file guard `strings.HasSuffix(spec, ".tgz")` ran before the HTTP URL guard `strings.HasPrefix(spec, "http://")`, so any URL ending in `.tgz` (the most common case for FHIR package registries) was mistaken for a filesystem path.
 
 **Fix**: HTTP/HTTPS prefix check moved first; shared download+cache logic extracted to `fetchURL()`.
+
+---
+
+### 5. Replicas starting together lost IG search parameters from their registry (`internal/ig`)
+
+**Symptom**: Two replicas started against a database without an IG each ended up with only part of its search parameters in memory; resources written through the replica missing them were silently not indexed for those parameters.
+
+**Root cause**: `LoadPackage` added to the registry only the rows its own `INSERT ... ON CONFLICT DO NOTHING` affected, and its "already loaded" check was a plain `SELECT` that both replicas could pass. The replica that lost the race, or skipped after the winner committed, never learned the parameters.
+
+**Fix**: Loads of the same package take a per-package advisory lock and re-check `ig_packages` under it. After every call (loaded or skipped) the registry is refreshed from `search_param_definitions`, and once more before the readiness probe flips.
 
 ---
 

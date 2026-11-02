@@ -25,6 +25,10 @@
 //
 // # Loading behaviour
 //
+// Replicas starting together serialize on a per-package advisory lock, and every
+// call leaves the registry matching the database, whether it loaded the package
+// or found it already loaded.
+//
 // Each package is recorded in ig_packages once loaded. On subsequent startups
 // the package is skipped unless ForceReload is set. SearchParameters found in
 // the package are upserted into search_param_definitions with
@@ -112,7 +116,7 @@ func LoadPackage(
 			slog.Warn("IG package existence check failed, proceeding to load", "package", source, "err", err)
 		} else if exists {
 			slog.Info("IG package already loaded, skipping", "package", source)
-			return &PackageResult{Name: name, Version: version, AlreadyLoaded: true}, nil
+			return alreadyLoaded(ctx, pool, registry, name, version)
 		}
 	}
 
@@ -133,17 +137,43 @@ func LoadPackage(
 		pkg.Meta.FHIRVersion = "4.0.1"
 	}
 
-	result := &PackageResult{
-		Name:        name,
-		Version:     version,
-		FHIRVersion: pkg.Meta.FHIRVersion,
-	}
-
+	// Serialize concurrent loads of the same package across replicas. The lock
+	// is held until the transaction ends, so a replica that waits on it sees the
+	// winner's committed rows in the re-check below. The package is fetched and
+	// parsed before this point so no pool connection is held during network I/O;
+	// a replica that loses the race may therefore download a package it discards.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "ig:"+source); err != nil {
+		return nil, fmt.Errorf("lock ig package %s: %w", source, err)
+	}
+	if !opts.ForceReload {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM ig_packages WHERE package_name=$1 AND package_version=$2)`,
+			name, version,
+		).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("re-check ig_packages %s: %w", source, err)
+		}
+		if exists {
+			// Another replica loaded it while this one waited for the lock.
+			if err := tx.Rollback(ctx); err != nil {
+				return nil, fmt.Errorf("release lock for %s: %w", source, err)
+			}
+			slog.Info("IG package loaded by another replica, skipping", "package", source)
+			return alreadyLoaded(ctx, pool, registry, name, version)
+		}
+	}
+
+	result := &PackageResult{
+		Name:        name,
+		Version:     version,
+		FHIRVersion: pkg.Meta.FHIRVersion,
+	}
 
 	// Record the package itself
 	if _, err := tx.Exec(ctx, `
@@ -156,9 +186,9 @@ func LoadPackage(
 		return nil, fmt.Errorf("record ig_packages: %w", err)
 	}
 
-	// Persist SearchParameters. Registry updates are deferred until the commit
-	// so a rolled-back transaction cannot leave the registry ahead of the DB.
-	var defs []searchparam.Definition
+	// Persist SearchParameters. The registry is refreshed from the database
+	// after the commit, so a rolled-back transaction cannot leave it ahead of the
+	// DB and a replica that lost an insert race still sees the winner's rows.
 	for _, sp := range pkg.SearchParams {
 		for _, baseRes := range sp.Base {
 			if baseRes == "" {
@@ -177,17 +207,6 @@ func LoadPackage(
 			}
 			if tag.RowsAffected() > 0 {
 				result.SearchParams++
-				if registry != nil {
-					defs = append(defs, searchparam.Definition{
-						ResourceType: baseRes,
-						ParamName:    sp.Code,
-						ParamType:    sp.Type,
-						FHIRPath:     sp.Expression,
-						IsCustom:     false,
-						IGSource:     source,
-						Targets:      sp.Target,
-					})
-				}
 			}
 		}
 	}
@@ -221,8 +240,10 @@ func LoadPackage(
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	for _, d := range defs {
-		registry.Upsert(d)
+	if registry != nil {
+		if err := registry.Refresh(ctx, pool); err != nil {
+			return nil, fmt.Errorf("refresh registry after loading %s: %w", source, err)
+		}
 	}
 
 	slog.Info("IG package loaded",
@@ -231,6 +252,18 @@ func LoadPackage(
 		"profiles", result.Profiles,
 	)
 	return result, nil
+}
+
+// alreadyLoaded resyncs the registry with the database for a package this call
+// did not load: another replica may have committed its parameters after this
+// replica's startup load, so the registry cannot be assumed current.
+func alreadyLoaded(ctx context.Context, pool *pgxpool.Pool, registry *searchparam.Registry, name, version string) (*PackageResult, error) {
+	if registry != nil {
+		if err := registry.Refresh(ctx, pool); err != nil {
+			return nil, fmt.Errorf("refresh registry for %s@%s: %w", name, version, err)
+		}
+	}
+	return &PackageResult{Name: name, Version: version, AlreadyLoaded: true}, nil
 }
 
 // LoadedPackages returns a summary of all packages currently in the DB.

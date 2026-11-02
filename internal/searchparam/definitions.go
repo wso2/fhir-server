@@ -48,10 +48,14 @@ type Definition struct {
 }
 
 type Registry struct {
-	mu      sync.RWMutex
-	byRes   map[string][]Definition // resource_type → []Definition
-	byKey   map[string]Definition   // "ResourceType.paramName" → Definition
-	revIncl map[string][]string     // targetType → []"SourceType:paramName" for _revinclude
+	// reloadMu serializes full reloads from the database, held from before the
+	// query to after the swap, so an older snapshot can never be published over a
+	// newer one. mu only guards the maps.
+	reloadMu sync.Mutex
+	mu       sync.RWMutex
+	byRes    map[string][]Definition // resource_type → []Definition
+	byKey    map[string]Definition   // "ResourceType.paramName" → Definition
+	revIncl  map[string][]string     // targetType → []"SourceType:paramName" for _revinclude
 }
 
 func NewRegistry() *Registry {
@@ -95,7 +99,17 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// Refresh replaces the cache with the database contents without the startup
+// summary log. Callers use it to resync after changes made by other replicas.
+func (r *Registry) Refresh(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := r.load(ctx, pool)
+	return err
+}
+
 func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, error) {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
 	rows, err := pool.Query(ctx, `
 		SELECT resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source,
 		       COALESCE(target_types, ''), COALESCE(components_json, '')
