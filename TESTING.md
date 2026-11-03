@@ -57,6 +57,15 @@ Integration tests share a test helper in `internal/testutil/postgres.go` (build 
 
 Each test starts its own container for full isolation. If you need faster runs with a shared container, use `TestMain` + `sync.Once` — acceptable for local development.
 
+### Reindex jobs
+
+Handler tests cover `$reindex` request validation, tenant routes, status responses, JSON/XML, and active-job conflicts. PostgreSQL tests cover backfilling existing resources, tenant isolation with a role that cannot bypass RLS, parameter replacement, idempotency, committed-batch recovery, definition changes, failed-batch rollback, concurrent workers, resource locks, and deleted resources. An HTTP integration test starts and polls a job, then verifies the new parameter is searchable only in the selected tenant.
+
+```bash
+go test ./internal/handler -run Reindex -count=1
+go test -tags integration ./internal/store ./internal/handler -run Reindex -count=1 -timeout 300s
+```
+
 ---
 
 ---
