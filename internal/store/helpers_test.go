@@ -227,6 +227,9 @@ func TestLooksLikeDate(t *testing.T) {
 		{"2024-01-15T10:00:00Z", true},
 		{"gt2024-01-01", true},
 		{"le2023", true},
+		{"1abc", false},
+		{"1234-ab", false},
+		{"2024-13", false},
 		{"Smith", false},
 		{"active", false},
 		{"100", false},
@@ -358,9 +361,9 @@ func TestExpandDateStringForSearch_MinutePrecisionOffset(t *testing.T) {
 }
 
 func TestExpandDateStringForSearch_InvalidDate(t *testing.T) {
-	for _, s := range []string{"not-a-date", "2028-05-15T14", "2028-05-15T99:99", "2028-05-15Tfoo"} {
+	for _, s := range []string{"not-a-date", "2028-05-15T14", "2028-05-15T99:99", "2028-05-15Tfoo", "abcd", "garbage", "2024-13", "2024-00", "2024/05"} {
 		if _, _, err := expandDateStringForSearch(s); err == nil {
-			t.Fatalf("expected error for invalid date string %q", s)
+			t.Errorf("expected error for invalid date string %q", s)
 		}
 	}
 }
