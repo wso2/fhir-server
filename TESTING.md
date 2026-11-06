@@ -107,6 +107,16 @@ Writing the test suite revealed **4 pre-existing bugs** in production code:
 
 ---
 
+### 5. Registry reload discarded a concurrent SearchParameter write (`internal/searchparam`)
+
+**Symptom**: A runtime SearchParameter create/update/delete could vanish from a replica's in-memory registry (or a deleted one reappear) until the next reload.
+
+**Root cause**: `Registry.load` queried the database and swapped its maps in later. A write that committed and called `Upsert`/`Remove` between those two steps was overwritten by the older snapshot.
+
+**Fix**: `Upsert`/`Remove` bump a generation counter; a reload swaps only if it is unchanged since the query began, otherwise it discards the snapshot and re-queries (3 attempts, then an error that leaves the previous snapshot in place).
+
+---
+
 ## Test architecture notes
 
 ### No DB required

@@ -48,11 +48,21 @@ type Definition struct {
 }
 
 type Registry struct {
-	mu      sync.RWMutex
+	mu sync.RWMutex
+	// gen counts Upsert/Remove calls; guarded by mu. A reload uses it to detect
+	// a mutation that landed between its query and its swap.
+	gen     uint64
 	byRes   map[string][]Definition // resource_type → []Definition
 	byKey   map[string]Definition   // "ResourceType.paramName" → Definition
 	revIncl map[string][]string     // targetType → []"SourceType:paramName" for _revinclude
+
+	// afterQuery, when set, runs between a reload's query and its swap (tests only).
+	afterQuery func()
 }
+
+// maxReloadAttempts bounds how often a reload re-queries after losing the race
+// to an Upsert/Remove.
+const maxReloadAttempts = 3
 
 func NewRegistry() *Registry {
 	return &Registry{
@@ -95,7 +105,38 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// load replaces the cache with the database contents. A write that commits and
+// calls Upsert/Remove after the query but before the swap would otherwise be
+// overwritten by the older snapshot, so the swap only happens if no mutation
+// occurred since the query started; otherwise the snapshot is discarded and the
+// query re-run, which then reflects the committed change.
 func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, error) {
+	for attempt := 0; attempt < maxReloadAttempts; attempt++ {
+		r.mu.RLock()
+		startGen := r.gen
+		r.mu.RUnlock()
+
+		byRes, byKey, revIncl, stats, err := r.query(ctx, pool)
+		if err != nil {
+			return loadStats{}, err
+		}
+		if r.afterQuery != nil {
+			r.afterQuery()
+		}
+
+		r.mu.Lock()
+		if r.gen == startGen {
+			r.byRes, r.byKey, r.revIncl = byRes, byKey, revIncl
+			r.mu.Unlock()
+			return stats, nil
+		}
+		r.mu.Unlock()
+	}
+	return loadStats{}, fmt.Errorf("reload search parameter definitions: registry changed during %d consecutive attempts", maxReloadAttempts)
+}
+
+// query reads search_param_definitions and builds the replacement indexes.
+func (r *Registry) query(ctx context.Context, pool *pgxpool.Pool) (map[string][]Definition, map[string]Definition, map[string][]string, loadStats, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source,
 		       COALESCE(target_types, ''), COALESCE(components_json, '')
@@ -103,7 +144,7 @@ func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, err
 		ORDER BY resource_type, param_name
 	`)
 	if err != nil {
-		return loadStats{}, fmt.Errorf("query search_param_definitions: %w", err)
+		return nil, nil, nil, loadStats{}, fmt.Errorf("query search_param_definitions: %w", err)
 	}
 	defer rows.Close()
 
@@ -115,7 +156,7 @@ func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, err
 		var d Definition
 		var targetTypes, componentsJSON string
 		if err := rows.Scan(&d.ResourceType, &d.ParamName, &d.ParamType, &d.FHIRPath, &d.IsCustom, &d.IGSource, &targetTypes, &componentsJSON); err != nil {
-			return loadStats{}, fmt.Errorf("scan definition row: %w", err)
+			return nil, nil, nil, loadStats{}, fmt.Errorf("scan definition row: %w", err)
 		}
 		if targetTypes != "" {
 			d.Targets = strings.Split(targetTypes, "|")
@@ -136,7 +177,7 @@ func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return loadStats{}, fmt.Errorf("iterate definitions: %w", err)
+		return nil, nil, nil, loadStats{}, fmt.Errorf("iterate definitions: %w", err)
 	}
 
 	// Build reverse-include index: targetType → []"SourceType:paramName"
@@ -153,13 +194,7 @@ func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, err
 		}
 	}
 
-	r.mu.Lock()
-	r.byRes = byRes
-	r.byKey = byKey
-	r.revIncl = revIncl
-	r.mu.Unlock()
-
-	return stats, nil
+	return byRes, byKey, revIncl, stats, nil
 }
 
 func (r *Registry) ForResource(resourceType string) []Definition {
@@ -208,6 +243,7 @@ func (r *Registry) Lookup(resourceType, paramName string) (Definition, bool) {
 func (r *Registry) Upsert(d Definition) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.gen++
 	key := d.ResourceType + "." + d.ParamName
 	existing := r.byRes[d.ResourceType]
 	for i, e := range existing {
@@ -255,6 +291,7 @@ func (r *Registry) removeRevIncl(d Definition) {
 func (r *Registry) Remove(resourceType, paramName string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.gen++
 	key := resourceType + "." + paramName
 	delete(r.byKey, key)
 	existing := r.byRes[resourceType]
