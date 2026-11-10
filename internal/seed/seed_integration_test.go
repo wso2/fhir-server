@@ -52,7 +52,7 @@ func TestSeedSearchParams_Idempotent(t *testing.T) {
 		t.Fatalf("count before: %v", err)
 	}
 
-	// Re-run seed — ON CONFLICT DO NOTHING should prevent duplicate inserts.
+	// Re-run seed — the base rows are refreshed in place, never duplicated.
 	if err := seed.SeedSearchParams(ctx, pool); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
@@ -64,6 +64,66 @@ func TestSeedSearchParams_Idempotent(t *testing.T) {
 
 	if countAfter != countBefore {
 		t.Errorf("seed not idempotent: before=%d, after=%d", countBefore, countAfter)
+	}
+}
+
+// TestSeedSearchParams_RefreshesStaleBaseRow covers databases seeded by an
+// older CSV: Condition.code once carried AllergyIntolerance.reaction.substance,
+// so every Condition?code search returned nothing. A re-seed must repair the
+// existing base row rather than skip it.
+func TestSeedSearchParams_RefreshesStaleBaseRow(t *testing.T) {
+	pool := testutil.MustDB(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO search_param_definitions
+		(resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source)
+		VALUES ('Condition', 'code', 'token', 'AllergyIntolerance.reaction.substance', FALSE, '')`); err != nil {
+		t.Fatalf("insert stale row: %v", err)
+	}
+	if err := seed.SeedSearchParams(ctx, pool); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var expr string
+	if err := pool.QueryRow(ctx,
+		`SELECT fhirpath_expr FROM search_param_definitions
+		 WHERE resource_type = 'Condition' AND param_name = 'code'`).Scan(&expr); err != nil {
+		t.Fatalf("query expression: %v", err)
+	}
+	if expr != "Condition.code" {
+		t.Errorf("stale base row not refreshed: got %q, want %q", expr, "Condition.code")
+	}
+}
+
+// TestSeedSearchParams_PreservesOverrides verifies the refresh is scoped to
+// base rows: custom and IG-sourced definitions keep their expressions.
+func TestSeedSearchParams_PreservesOverrides(t *testing.T) {
+	pool := testutil.MustDB(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO search_param_definitions
+		(resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source) VALUES
+		('Condition', 'code', 'token', 'Condition.overrideCustom', TRUE, ''),
+		('Observation', 'code', 'token', 'Observation.overrideIG', FALSE, 'hl7.fhir.us.core@7.0.0')`); err != nil {
+		t.Fatalf("insert overrides: %v", err)
+	}
+	if err := seed.SeedSearchParams(ctx, pool); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	for _, tc := range []struct{ rt, param, want string }{
+		{"Condition", "code", "Condition.overrideCustom"},
+		{"Observation", "code", "Observation.overrideIG"},
+	} {
+		var expr string
+		if err := pool.QueryRow(ctx,
+			`SELECT fhirpath_expr FROM search_param_definitions
+			 WHERE resource_type = $1 AND param_name = $2`, tc.rt, tc.param).Scan(&expr); err != nil {
+			t.Fatalf("query %s.%s: %v", tc.rt, tc.param, err)
+		}
+		if expr != tc.want {
+			t.Errorf("%s.%s override was overwritten: got %q, want %q", tc.rt, tc.param, expr, tc.want)
+		}
 	}
 }
 

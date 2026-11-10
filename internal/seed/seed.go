@@ -22,12 +22,14 @@ import (
 	"context"
 	"embed"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,8 +37,10 @@ import (
 var csvFS embed.FS
 
 // SeedSearchParams inserts all standard FHIR R4 search parameters into
-// search_param_definitions. Rows that already exist (by resource_type + param_name)
-// are silently skipped so custom parameters are never overwritten.
+// search_param_definitions. Existing base rows (is_custom = FALSE and
+// ig_source is empty) are refreshed from the embedded spec so a corrected
+// expression reaches databases seeded by an older CSV; custom and IG-sourced
+// rows are never overwritten.
 func SeedSearchParams(ctx context.Context, pool *pgxpool.Pool) error {
 	slog.Debug("seeding base FHIR R4 search parameters from the international (HL7) spec")
 	f, err := csvFS.Open("fhir-r4-search-params.csv")
@@ -77,7 +81,8 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 	defer tx.Rollback(ctx)
 
 	inserted := 0
-	skipped := 0 // already present (ON CONFLICT DO NOTHING) — e.g. on restart or custom override
+	updated := 0
+	skipped := 0 // custom or IG override — never overwritten by the base spec
 	for {
 		row, err := cr.Read()
 		if err == io.EOF {
@@ -111,20 +116,37 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 			componentsJSON = strings.TrimSpace(row[colIdx.componentsJSON])
 		}
 
-		ct, err := tx.Exec(ctx, `
+		// Refresh base rows from the embedded spec so a corrected expression
+		// reaches databases seeded by an older CSV (e.g. Condition.code once
+		// carried another resource's path). Custom and IG-sourced definitions
+		// are left untouched: their is_custom/ig_source marks the row as an
+		// override, and the WHERE drops the update without returning a row.
+		var wasInsert bool
+		err = tx.QueryRow(ctx, `
 			INSERT INTO search_param_definitions
 				(resource_type, param_name, param_type, fhirpath_expr, is_custom, target_types, components_json)
 			VALUES ($1, $2, $3, $4, FALSE, $5, $6)
-			ON CONFLICT (resource_type, param_name) DO NOTHING`,
+			ON CONFLICT (resource_type, param_name) DO UPDATE
+			SET param_type    = EXCLUDED.param_type,
+			    fhirpath_expr = EXCLUDED.fhirpath_expr,
+			    target_types  = EXCLUDED.target_types,
+			    components_json = EXCLUDED.components_json
+			WHERE search_param_definitions.is_custom = FALSE
+			  AND search_param_definitions.ig_source = ''
+			RETURNING (xmax = 0)`,
 			resourceType, paramName, paramType, expression, targetTypes, componentsJSON,
-		)
+		).Scan(&wasInsert)
+		if errors.Is(err, pgx.ErrNoRows) {
+			skipped++
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("insert %s.%s: %w", resourceType, paramName, err)
 		}
-		if ct.RowsAffected() == 1 {
+		if wasInsert {
 			inserted++
 		} else {
-			skipped++
+			updated++
 		}
 	}
 
@@ -133,7 +155,7 @@ func seedFromReader(ctx context.Context, pool *pgxpool.Pool, r io.Reader) error 
 	}
 
 	slog.Info("seeded base FHIR R4 search parameters from the international (HL7) spec",
-		"inserted", inserted, "skipped", skipped, "total", inserted+skipped)
+		"inserted", inserted, "updated", updated, "skipped", skipped, "total", inserted+updated+skipped)
 	return nil
 }
 
