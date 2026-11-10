@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: cut-docs-version
@@ -50,6 +51,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           REF: ${{ inputs.ref || 'main' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch origin main --tags
@@ -78,3 +80,7 @@ jobs:
           git commit -m "docs: freeze version ${VERSION}"
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # Pushes made with GITHUB_TOKEN do not trigger `push` workflows, so
+          # dispatch the Pages deployment explicitly for the new snapshot.
+          gh workflow run docs-publish.yml --ref main

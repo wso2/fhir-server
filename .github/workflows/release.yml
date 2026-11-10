@@ -254,6 +254,7 @@ jobs:
     needs: release
     permissions:
       contents: write
+      actions: write
     uses: ./.github/workflows/cut-docs-version.yml
     with:
       version: ${{ inputs.release_version }}
