@@ -50,6 +50,9 @@ type SearchResult struct {
 	Total    int
 	Entries  []map[string]any
 	Included []map[string]any // _include / _revinclude results
+	// PageSize is the page size the search ran with, after search.defaultPageSize
+	// and search.maxPageSize are applied. It can differ from the requested _count.
+	PageSize int
 }
 
 // UnsupportedParamError is returned when a search request names a registry-known
@@ -102,7 +105,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 			return SearchResult{}, err
 		}
 		if len(ids) == 0 {
-			return SearchResult{Total: 0}, nil
+			return SearchResult{Total: 0, PageSize: sp.PageSize}, nil
 		}
 		params := make(map[string][]string, len(sp.Params))
 		for k, v := range sp.Params {
@@ -159,7 +162,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 			slog.Error("search count failed", "resourceType", sp.ResourceType, "err", err)
 			return SearchResult{}, err
 		}
-		return SearchResult{Total: n}, nil
+		return SearchResult{Total: n, PageSize: sp.PageSize}, nil
 	}
 
 	total := -1
@@ -188,7 +191,7 @@ func (s *Store) Search(ctx context.Context, sp SearchParams) (SearchResult, erro
 		slog.Debug("search completed", "resourceType", sp.ResourceType, "total", total, "returned", len(entries))
 	}
 
-	result := SearchResult{Total: total, Entries: entries}
+	result := SearchResult{Total: total, Entries: entries, PageSize: sp.PageSize}
 
 	// _include / _revinclude
 	if incl := sp.Params["_include"]; len(incl) > 0 {
