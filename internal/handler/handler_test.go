@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -870,6 +871,52 @@ func TestCompartmentSearch_UnknownOperationNotCompartmentType(t *testing.T) {
 	}
 	if strings.Contains(diag, "compartment") {
 		t.Errorf("must not look like a compartment error: %q", diag)
+	}
+}
+
+var searchFailures = []struct {
+	err  error
+	want int
+}{
+	{&store.InvalidParamError{Msg: "invalid date value"}, http.StatusBadRequest},
+	{&store.UnsupportedParamError{Msg: "not supported"}, http.StatusBadRequest},
+	{errors.New("connection refused"), http.StatusInternalServerError},
+}
+
+// TestCompartmentSearch_ReportsSearchErrors pins that a failed search is reported
+// instead of looking like an empty compartment.
+func TestCompartmentSearch_ReportsSearchErrors(t *testing.T) {
+	for _, tc := range searchFailures {
+		ms := &mockStore{}
+		ms.searchFn = func(context.Context, store.SearchParams) (store.SearchResult, error) {
+			return store.SearchResult{}, tc.err
+		}
+		w := do(t, newRouter(ms), http.MethodGet, "/fhir/r4/Patient/p1/Observation?date=garbage", nil)
+		if w.Code != tc.want {
+			t.Errorf("%v: want %d, got %d body=%s", tc.err, tc.want, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestConditional_BadCriteriaReturns400 pins that criteria the search rejects are
+// the client's error on all three conditional interactions, not a server failure.
+func TestConditional_BadCriteriaReturns400(t *testing.T) {
+	patient := map[string]any{"resourceType": "Patient"}
+	for _, tc := range searchFailures {
+		ms := &mockStore{}
+		ms.conditionalMatchFn = func(context.Context, string, string) (string, int, error) {
+			return "", 0, tc.err
+		}
+		h := newRouter(ms)
+		for name, w := range map[string]*httptest.ResponseRecorder{
+			"create": doWithHeaders(t, h, http.MethodPost, "/fhir/r4/Patient", patient, map[string]string{"If-None-Exist": "birthdate=garbage"}),
+			"update": do(t, h, http.MethodPut, "/fhir/r4/Patient?birthdate=garbage", patient),
+			"delete": do(t, h, http.MethodDelete, "/fhir/r4/Patient?birthdate=garbage", nil),
+		} {
+			if w.Code != tc.want {
+				t.Errorf("%s, %v: want %d, got %d body=%s", name, tc.err, tc.want, w.Code, w.Body.String())
+			}
+		}
 	}
 }
 
