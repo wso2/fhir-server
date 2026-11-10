@@ -25,7 +25,8 @@ name: Release
 #      published (never dangling if an earlier step failed).
 #   8. Opens a PR against main bumping version.txt to
 #      <next_version>-dev.
-#   9. Opens a PR freezing the release docs as version <release_version>.
+#   9. Commits the release docs snapshot directly to main as version
+#      <release_version>.
 #
 # Prerequisites (repo/org settings):
 #   - Settings > Actions > General > Workflow permissions:
@@ -253,7 +254,6 @@ jobs:
     needs: release
     permissions:
       contents: write
-      pull-requests: write
     uses: ./.github/workflows/cut-docs-version.yml
     with:
       version: ${{ inputs.release_version }}
