@@ -62,7 +62,7 @@ jobs:
           fi
 
           git checkout -B main origin/main
-          git checkout "$REF" -- website/docs
+          git checkout --no-overlay "$REF" -- website/docs
           git checkout "$REF" -- website/sidebars.ts 2>/dev/null || true
 
           (cd website && npm ci && npx docusaurus docs:version "$VERSION" && npm run build)
