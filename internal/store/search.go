@@ -2695,13 +2695,19 @@ func expandDateStringForSearch(s string) (low, high time.Time, err error) {
 	s = strings.TrimSpace(s)
 	switch len(s) {
 	case 4:
-		y := mustParseInt(s)
-		low = time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
-		high = time.Date(y, 12, 31, 23, 59, 59, 0, time.UTC)
+		t, e := time.ParseInLocation("2006", s, time.UTC)
+		if e != nil {
+			return time.Time{}, time.Time{}, e
+		}
+		low = t
+		high = time.Date(t.Year(), 12, 31, 23, 59, 59, 0, time.UTC)
 	case 7:
-		y, m := mustParseInt(s[:4]), time.Month(mustParseInt(s[5:7]))
-		low = time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
-		high = time.Date(y, m+1, 1, 0, 0, 0, 0, time.UTC).Add(-time.Second)
+		t, e := time.ParseInLocation("2006-01", s, time.UTC)
+		if e != nil {
+			return time.Time{}, time.Time{}, e
+		}
+		low = t
+		high = t.AddDate(0, 1, 0).Add(-time.Second)
 	case 10:
 		t, e := time.ParseInLocation("2006-01-02", s, time.UTC)
 		if e != nil {
@@ -2731,15 +2737,11 @@ func expandDateStringForSearch(s string) (low, high time.Time, err error) {
 	return
 }
 
-func mustParseInt(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
 func looksLikeDate(s string) bool {
 	// Strip comparator prefix
 	_, rest := extractComparatorPrefix(s)
-	return len(rest) >= 4 && rest[0] >= '1' && rest[0] <= '9' &&
+	_, _, err := expandDateStringForSearch(rest)
+	return err == nil && len(rest) >= 4 && rest[0] >= '1' && rest[0] <= '9' &&
 		(len(rest) == 4 || (len(rest) > 4 && rest[4] == '-'))
 }
 
