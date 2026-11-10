@@ -52,11 +52,11 @@ const config: Config = {
           lastVersion: 'current',
           versions: {
             current: {
-              label: 'main',
+              label: 'latest',
               banner: 'unreleased',
             },
-            // With main as the default version, Docusaurus treats every release
-            // as older and would mark the newest one "unmaintained".
+            // With latest as the default version, Docusaurus treats every
+            // release as older and would mark the newest one "unmaintained".
             ...(latestRelease ? {[latestRelease]: {banner: 'none' as const}} : {}),
           },
         },
