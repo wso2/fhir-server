@@ -240,22 +240,23 @@ func AgainstProfile(resource, sd map[string]any) []Issue {
 // resource's stored shape does not depend on the wire format it was submitted
 // through. Values whose element type is unknown, or that do not parse as their
 // declared type, are left unchanged for downstream validation to handle.
-func (p *Profile) CoercePrimitives(resource map[string]any) {
+func (p *Profile) CoercePrimitives(resource map[string]any, lookup Lookup) {
 	if p == nil {
 		return
 	}
-	p.coerceObject(resource, p.rootType, 0)
+	p.coerceObject(resource, p.rootType, lookup, 0)
 }
 
 // coerceObject walks obj against the profile's element metadata at sdPath,
-// mirroring CheckTypes' descent, and converts string primitives to their
-// declared FHIR type.
-func (p *Profile) coerceObject(obj map[string]any, sdPath string, depth int) {
+// mirroring CheckTypes' descent, converts string primitives to their declared
+// FHIR type, and wraps a single value of a repeating element in an array (XML
+// has no arrays, so one occurrence arrives bare).
+func (p *Profile) coerceObject(obj map[string]any, sdPath string, lookup Lookup, depth int) {
 	if depth > maxCheckDepth {
 		return
 	}
 	for key, val := range obj {
-		if key == "resourceType" || strings.HasPrefix(key, "_") {
+		if key == "resourceType" || strings.HasPrefix(key, "_") || val == nil {
 			continue
 		}
 		info, choiceType, choiceBase := resolveElement(p, sdPath, key)
@@ -266,30 +267,50 @@ func (p *Profile) coerceObject(obj map[string]any, sdPath string, depth int) {
 		if choiceType != "" {
 			childSD = sdPath + "." + choiceBase + "[x]"
 		}
-		fhirType := choiceType
-		if fhirType == "" {
-			fhirType = firstType(info)
-		}
-		switch v := val.(type) {
-		case string:
-			if nv, ok := coercePrimitive(fhirType, v); ok {
-				obj[key] = nv
+		if arr, ok := val.([]any); ok {
+			for i, item := range arr {
+				arr[i] = p.coerceValue(item, info, choiceType, childSD, lookup, depth)
 			}
-		case map[string]any:
-			p.coerceObject(v, childSD, depth+1)
-		case []any:
-			for i, item := range v {
-				switch iv := item.(type) {
-				case string:
-					if nv, ok := coercePrimitive(fhirType, iv); ok {
-						v[i] = nv
-					}
-				case map[string]any:
-					p.coerceObject(iv, childSD, depth+1)
+			continue
+		}
+		val = p.coerceValue(val, info, choiceType, childSD, lookup, depth)
+		if info.repeats {
+			val = []any{val}
+		}
+		obj[key] = val
+	}
+}
+
+func (p *Profile) coerceValue(val any, info *elemInfo, choiceType, childSD string, lookup Lookup, depth int) any {
+	typeCode := choiceType
+	if typeCode == "" {
+		typeCode = firstType(info)
+	}
+	switch v := val.(type) {
+	case string:
+		if nv, ok := coercePrimitive(typeCode, v); ok {
+			return nv
+		}
+	case map[string]any:
+		switch {
+		case len(info.types) == 0 && info.contentRef != "":
+			p.coerceObject(v, info.contentRef, lookup, depth+1)
+		case typeCode == "BackboneElement" || typeCode == "Element":
+			p.coerceObject(v, childSD, lookup, depth+1)
+		case lookup == nil:
+		case typeCode == "Resource" || typeCode == "DomainResource":
+			if rt, _ := v["resourceType"].(string); rt != "" {
+				if sub := lookup(rt); sub != nil {
+					sub.coerceObject(v, rt, lookup, depth+1)
 				}
+			}
+		default:
+			if dt := lookup(typeCode); dt != nil {
+				dt.coerceObject(v, typeCode, lookup, depth+1)
 			}
 		}
 	}
+	return val
 }
 
 func coercePrimitive(fhirType, raw string) (any, bool) {
