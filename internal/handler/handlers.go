@@ -265,7 +265,7 @@ func (h *fhirHandler) coerceStructured(ctx context.Context, r *http.Request, bod
 	if err != nil || prof == nil {
 		return
 	}
-	prof.CoercePrimitives(body)
+	prof.CoercePrimitives(body, h.typeLookup(ctx))
 }
 
 func firstVal(params map[string][]string, key string) string {
@@ -1773,10 +1773,16 @@ func (h *fhirHandler) baseValidationIssues(ctx context.Context, body map[string]
 
 	// Instance type/shape checking: JSON kinds, primitive lexical rules, and
 	// array-vs-scalar shape against the element types declared in the base
-	// definitions. Datatype interiors come from the embedded types bundle;
-	// nested resources (contained, Bundle.entry.resource, …) resolve through
-	// the same base-definition cache.
-	lookup := func(typeName string) *validate.Profile {
+	// definitions.
+	issues = append(issues, prof.CheckTypes(body, h.typeLookup(ctx))...)
+	return issues
+}
+
+// typeLookup resolves datatype interiors from the embedded types bundle and
+// nested resources (contained, Bundle.entry.resource, …) through the
+// base-definition cache.
+func (h *fhirHandler) typeLookup(ctx context.Context) validate.Lookup {
+	return func(typeName string) *validate.Profile {
 		if dt := basedef.Datatype(typeName); dt != nil {
 			return dt
 		}
@@ -1786,8 +1792,6 @@ func (h *fhirHandler) baseValidationIssues(ctx context.Context, body map[string]
 		}
 		return sub
 	}
-	issues = append(issues, prof.CheckTypes(body, lookup)...)
-	return issues
 }
 
 // writeIssues emits a 422 OperationOutcome carrying the given validation issues.

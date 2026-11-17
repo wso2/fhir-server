@@ -148,7 +148,7 @@ func TestCoercePrimitives_XMLTypes(t *testing.T) {
 		"multipleBirthInteger": "3",
 		"name":                 []any{map[string]any{"family": "Smith"}},
 	}
-	p.CoercePrimitives(resource)
+	p.CoercePrimitives(resource, nil)
 
 	if v, ok := resource["active"].(bool); !ok || v != true {
 		t.Errorf("active: want bool true, got %T %v", resource["active"], resource["active"])
@@ -159,6 +159,53 @@ func TestCoercePrimitives_XMLTypes(t *testing.T) {
 	name := resource["name"].([]any)[0].(map[string]any)
 	if name["family"] != "Smith" {
 		t.Errorf("name.family should stay a string, got %T %v", name["family"], name["family"])
+	}
+}
+
+func TestCoercePrimitives_WrapsSingleRepeatingElements(t *testing.T) {
+	repeating := func(path, code string) map[string]any {
+		el := typedEl(path, code)
+		el["max"] = "*"
+		return el
+	}
+	p := Compile(minSD("Patient", []map[string]any{
+		typedEl("Patient.active", "boolean"),
+		repeating("Patient.name", "HumanName"),
+	}))
+	humanName := Compile(minSD("HumanName", []map[string]any{
+		typedEl("HumanName.family", "string"),
+		repeating("HumanName.given", "string"),
+	}))
+	lookup := func(typeName string) *Profile {
+		if typeName == "HumanName" {
+			return humanName
+		}
+		return nil
+	}
+
+	resource := map[string]any{
+		"resourceType": "Patient",
+		"active":       "true",
+		"name":         map[string]any{"family": "Smith", "given": "Jo"},
+	}
+	p.CoercePrimitives(resource, lookup)
+
+	if resource["active"] != true {
+		t.Errorf("active: want bool true, got %T %v", resource["active"], resource["active"])
+	}
+	names, ok := resource["name"].([]any)
+	if !ok || len(names) != 1 {
+		t.Fatalf("name: want a one-item array, got %T %v", resource["name"], resource["name"])
+	}
+	name := names[0].(map[string]any)
+	if name["family"] != "Smith" {
+		t.Errorf("name.family should stay a string, got %T %v", name["family"], name["family"])
+	}
+	if given, ok := name["given"].([]any); !ok || len(given) != 1 || given[0] != "Jo" {
+		t.Errorf("name.given: want [Jo], got %T %v", name["given"], name["given"])
+	}
+	if issues := p.CheckTypes(resource, lookup); len(issues) != 0 {
+		t.Errorf("expected no type issues after coercion, got %v", issues)
 	}
 }
 
@@ -173,7 +220,7 @@ func TestCoercePrimitives_LeavesUnknownAndUnparseable(t *testing.T) {
 		"valueInteger": "not-a-number", // declared integer but unparseable → left as-is
 		"note":         "unmapped",     // no element metadata → untouched
 	}
-	p.CoercePrimitives(resource)
+	p.CoercePrimitives(resource, nil)
 
 	if resource["valueInteger"] != "not-a-number" {
 		t.Errorf("unparseable integer must be left unchanged, got %T %v", resource["valueInteger"], resource["valueInteger"])
