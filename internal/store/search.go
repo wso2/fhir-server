@@ -1372,10 +1372,10 @@ func (b *queryBuilder) buildStringExists(param, modifier, value string) string {
 		vP := b.next(value)
 		return fmt.Sprintf("SELECT 1 FROM sp_string s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_exact = %s", rtP, pP, vP)
 	case "contains":
-		vP := b.next("%" + strings.ToLower(value) + "%")
+		vP := b.next("%" + escapeLike(strings.ToLower(value)) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_string s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_lower LIKE %s", rtP, pP, vP)
 	default:
-		vP := b.next(strings.ToLower(value) + "%")
+		vP := b.next(escapeLike(strings.ToLower(value)) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_string s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND s.value_lower LIKE %s", rtP, pP, vP)
 	}
 }
@@ -1410,7 +1410,7 @@ func (b *queryBuilder) buildTokenExists(param, modifier, value string) string {
 	// substring), not its code — a LIKE range scan, so it stays on the correlated
 	// path and is never captured for the equality walk.
 	if modifier == "text" {
-		vP := b.next("%" + strings.ToLower(value) + "%")
+		vP := b.next("%" + escapeLike(strings.ToLower(value)) + "%")
 		return fmt.Sprintf("SELECT 1 FROM sp_token s WHERE s.resource_id = r.fhir_id AND s.resource_type = %s AND s.param_name = %s AND LOWER(s.display) LIKE %s", rtP, pP, vP)
 	}
 	var cond string
