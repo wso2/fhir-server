@@ -362,6 +362,9 @@ func (h *fhirHandler) search(w http.ResponseWriter, r *http.Request) {
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("_count"))
 
 	summary, elements := projectionFromParams(params)
+	if firstVal(params, "_count") == "0" {
+		summary = "count"
+	}
 	result, err := h.store.Search(r.Context(), store.SearchParams{
 		ResourceType: rt,
 		Params:       params,
@@ -404,6 +407,9 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 	pageSize, _ := strconv.Atoi(firstVal(params, "_count"))
 
 	summary, elements := projectionFromParams(params)
+	if firstVal(params, "_count") == "0" {
+		summary = "count"
+	}
 	result, err := h.store.Search(r.Context(), store.SearchParams{
 		ResourceType: rt,
 		Params:       params,
@@ -425,6 +431,15 @@ func (h *fhirHandler) searchPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *fhirHandler) buildBundle(baseURL, rt string, result store.SearchResult, params map[string][]string, page, pageSize int, summary string, elements []string) map[string]any {
+	if summary == "count" {
+		self := fmt.Sprintf("%s/%s?%s", baseURL, rt, pageQuery(params, 1, pageSize))
+		return map[string]any{
+			"resourceType": "Bundle",
+			"type":         "searchset",
+			"total":        result.Total,
+			"link":         []any{map[string]any{"relation": "self", "url": self}},
+		}
+	}
 	// Links must use the size the store ran with, not the requested _count.
 	if result.PageSize > 0 {
 		pageSize = result.PageSize

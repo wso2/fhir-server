@@ -503,8 +503,8 @@ func TestIntegration_Search_Pagination_UsesStorePageSize(t *testing.T) {
 	}
 
 	bundle := iJSON(t, iDo(t, clamped, http.MethodGet, "/fhir/r4/Patient?_count=100&_summary=count", nil))
-	if last := linkRels(bundle)["last"]; !strings.Contains(last, "_page=3") {
-		t.Errorf("_summary=count: last link = %q, want _page=3", last)
+	if links := linkRels(bundle); bundle["total"] != float64(5) || links["last"] != "" || links["next"] != "" {
+		t.Errorf("_summary=count: total = %v, links = %v, want 5 and no last/next", bundle["total"], links)
 	}
 }
 
