@@ -38,6 +38,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 const fhirNS = "http://hl7.org/fhir"
@@ -111,6 +112,15 @@ func encodeElement(enc *xml.Encoder, name string, value any, isRoot bool) error 
 	}
 	switch v := value.(type) {
 	case map[string]any:
+		// A nested resource (contained, Bundle.entry.resource, ...) sits inside an element named after its type.
+		if rt, _ := v["resourceType"].(string); rt != "" && rt != name {
+			enc.EncodeToken(xml.StartElement{Name: xml.Name{Local: name}})
+			if err := encodeElement(enc, rt, v, false); err != nil {
+				return err
+			}
+			enc.EncodeToken(xml.EndElement{Name: xml.Name{Local: name}})
+			return nil
+		}
 		start := xml.StartElement{Name: xml.Name{Local: name}}
 		if isRoot {
 			start.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: fhirNS}}
@@ -232,6 +242,7 @@ func decodeStartedDepth(dec *xml.Decoder, start xml.StartElement, isRoot bool, d
 	childCounts := map[string]int{}
 	var charData strings.Builder
 	hasChildren := false
+	var nested any
 
 	for {
 		tok, err := dec.Token()
@@ -241,9 +252,15 @@ func decodeStartedDepth(dec *xml.Decoder, start xml.StartElement, isRoot bool, d
 		switch t := tok.(type) {
 		case xml.StartElement:
 			hasChildren = true
-			child, err := decodeStartedDepth(dec, t, false, depth+1)
+			// Element names are lowerCamelCase; only resources start with a capital letter.
+			isResource := t.Name.Local != "" && unicode.IsUpper(rune(t.Name.Local[0]))
+			child, err := decodeStartedDepth(dec, t, isResource, depth+1)
 			if err != nil {
 				return nil, err
+			}
+			if isResource {
+				nested = child
+				continue
 			}
 			childName := t.Name.Local
 			childCounts[childName]++
@@ -262,6 +279,9 @@ func decodeStartedDepth(dec *xml.Decoder, start xml.StartElement, isRoot bool, d
 		}
 	}
 done:
+	if nested != nil {
+		return nested, nil
+	}
 	// If this element had no children and had a value attribute → return the scalar.
 	if !hasChildren && hasValueAttr {
 		return valueAttr, nil
