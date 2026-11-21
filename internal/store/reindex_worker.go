@@ -220,6 +220,14 @@ func (s *Store) recordReindexRetry(ctx context.Context, jobID string, cause erro
 	if err := setTenantTx(ctx, tx); err != nil {
 		return false, err
 	}
+	var queued string
+	err = tx.QueryRow(ctx, `SELECT job_id::text FROM reindex_queue WHERE job_id = $1 FOR UPDATE`, jobID).Scan(&queued)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock reindex queue for retry: %w", err)
+	}
 	var attempts int
 	err = tx.QueryRow(ctx, `UPDATE reindex_jobs SET attempts = attempts + 1, updated_at = NOW()
 		WHERE tenant_id = current_setting('app.current_tenant', true) AND job_id = $1
