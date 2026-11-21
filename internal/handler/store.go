@@ -25,6 +25,8 @@ import (
 // StoreAPI is satisfied by *store.Store; extracted here so handlers can be
 // tested without a real database.
 type StoreAPI interface {
+	StartReindex(ctx context.Context, options store.ReindexOptions) (store.ReindexJob, error)
+	GetReindex(ctx context.Context, id string) (store.ReindexJob, error)
 	Read(ctx context.Context, resourceType, resourceID string) (map[string]any, error)
 	GetVersion(ctx context.Context, resourceType, resourceID string, versionID int) (map[string]any, error)
 	Create(ctx context.Context, resourceType string, body map[string]any) (map[string]any, error)

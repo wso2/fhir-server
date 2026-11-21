@@ -168,6 +168,11 @@ func run() error {
 		slog.Info("terminology server configured", "url", cfg.TerminologyURL)
 	}
 	s := store.New(pool, registry, storeOpts...)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		s.RunReindexJobs(ctx)
+	}()
 	// Log the effective search + write tunables so an operator can confirm overrides
 	// took effect (docs/performance-tuning.md).
 	slog.Info("search tuning",
