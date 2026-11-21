@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS reindex_jobs (
     started_at TIMESTAMPTZ,
     ended_at TIMESTAMPTZ,
     error TEXT NOT NULL DEFAULT '',
+    attempts INT NOT NULL DEFAULT 0,
     cursor_type TEXT NOT NULL DEFAULT '',
     cursor_id TEXT NOT NULL DEFAULT '',
     end_type TEXT NOT NULL,
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS reindex_jobs (
     definition_hash TEXT NOT NULL,
     PRIMARY KEY (tenant_id, job_id)
 );
+ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reindex_active_tenant ON reindex_jobs (tenant_id)
     WHERE status IN ('queued', 'running');
 

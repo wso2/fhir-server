@@ -32,8 +32,11 @@ import (
 )
 
 const (
-	reindexPollInterval = time.Second
-	reindexBatchTimeout = 30 * time.Second
+	reindexPollInterval   = time.Second
+	reindexBatchTimeout   = 30 * time.Second
+	reindexRetryBaseDelay = 2 * time.Second
+	reindexRetryMaxDelay  = 30 * time.Second
+	reindexMaxAttempts    = 5
 )
 
 type reindexCursor struct {
@@ -76,6 +79,7 @@ func (s *Store) processReindexBatch(ctx context.Context) (bool, error) {
 	defer tx.Rollback(ctx)
 	var jobID, tenantID string
 	err = tx.QueryRow(ctx, `SELECT job_id::text, tenant_id FROM reindex_queue
+		WHERE scheduled_at <= clock_timestamp()
 		ORDER BY scheduled_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&jobID, &tenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -108,23 +112,32 @@ func (s *Store) processReindexBatch(ctx context.Context) (bool, error) {
 	}
 	count, next, completed, batchErr := s.rebuildReindexBatch(ctx, batch, job, cursor, end, hash)
 	if batchErr != nil {
-		if err := batch.Rollback(ctx); err != nil {
-			return true, fmt.Errorf("rollback reindex batch: %w", err)
-		}
 		var failure reindexFailure
-		if !errors.As(batchErr, &failure) {
-			return true, batchErr
+		if errors.As(batchErr, &failure) {
+			if err := batch.Rollback(ctx); err != nil {
+				return true, fmt.Errorf("rollback reindex batch: %w", err)
+			}
+			if err := finishReindex(ctx, tx, job.ID, "failed", failure.reason); err != nil {
+				return true, err
+			}
+			return true, tx.Commit(ctx)
 		}
-		if err := finishReindex(ctx, tx, job.ID, "failed", failure.reason); err != nil {
-			return true, err
+		// Release the claim, then persist the retry outside the caller's canceled batch context.
+		retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reindexBatchTimeout)
+		defer cancel()
+		batchRollbackErr := batch.Rollback(retryCtx)
+		claimRollbackErr := tx.Rollback(retryCtx)
+		failed, retryErr := s.recordReindexRetry(retryCtx, job.ID, batchErr)
+		if failed {
+			return true, retryErr
 		}
-		return true, tx.Commit(ctx)
+		return true, errors.Join(batchErr, batchRollbackErr, claimRollbackErr, retryErr)
 	}
 	if err := batch.Commit(ctx); err != nil {
 		return true, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE reindex_jobs SET status = 'running',
-		started_at = COALESCE(started_at, NOW()), updated_at = NOW(),
+		started_at = COALESCE(started_at, NOW()), updated_at = NOW(), attempts = 0,
 		resources_reindexed = resources_reindexed + $1, cursor_type = $2, cursor_id = $3
 		WHERE tenant_id = current_setting('app.current_tenant', true) AND job_id = $4`,
 		count, next.resourceType, next.id, job.ID); err != nil {
@@ -196,6 +209,52 @@ func (s *Store) rebuildReindexBatch(ctx context.Context, tx pgx.Tx, job ReindexJ
 		return 0, cursor, false, fmt.Errorf("write reindex rows: %w", err)
 	}
 	return reindexed, cursor, scanned < job.BatchSize, nil
+}
+
+func (s *Store) recordReindexRetry(ctx context.Context, jobID string, cause error) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin reindex retry: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTenantTx(ctx, tx); err != nil {
+		return false, err
+	}
+	var attempts int
+	err = tx.QueryRow(ctx, `UPDATE reindex_jobs SET attempts = attempts + 1, updated_at = NOW()
+		WHERE tenant_id = current_setting('app.current_tenant', true) AND job_id = $1
+		RETURNING attempts`, jobID).Scan(&attempts)
+	if err != nil {
+		return false, fmt.Errorf("record reindex retry: %w", err)
+	}
+	if attempts >= reindexMaxAttempts {
+		reason := fmt.Sprintf("batch failed after %d attempts: %v", attempts, cause)
+		if err := finishReindex(ctx, tx, jobID, "failed", reason); err != nil {
+			return true, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return true, err
+		}
+		slog.Warn("reindex job failed after repeated batch errors", "job_id", jobID, "attempts", attempts, "err", cause)
+		return true, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE reindex_queue
+		SET scheduled_at = clock_timestamp() + make_interval(secs => $2) WHERE job_id = $1`,
+		jobID, reindexBackoff(attempts).Seconds()); err != nil {
+		return false, fmt.Errorf("reschedule reindex retry: %w", err)
+	}
+	return false, tx.Commit(ctx)
+}
+
+func reindexBackoff(attempts int) time.Duration {
+	delay := reindexRetryBaseDelay
+	for i := 1; i < attempts && delay < reindexRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > reindexRetryMaxDelay {
+		return reindexRetryMaxDelay
+	}
+	return delay
 }
 
 func finishReindex(ctx context.Context, tx pgx.Tx, id, status, reason string) error {

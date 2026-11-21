@@ -83,6 +83,9 @@ func reindexDefinition(t *testing.T, admin *pgxpool.Pool, rt, name, kind, expres
 func drainReindex(t *testing.T, s *Store) {
 	t.Helper()
 	for i := 0; i < 30; i++ {
+		if _, err := s.pool.Exec(context.Background(), `UPDATE reindex_queue SET scheduled_at = clock_timestamp()`); err != nil {
+			t.Fatal(err)
+		}
 		worked, err := s.processReindexBatch(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -406,6 +409,95 @@ func TestReindexInterruptedBatchDoesNotAdvance(t *testing.T) {
 	complete, err := s.GetReindex(ctx, job.ID)
 	if err != nil || complete.Status != "completed" || complete.ResourcesReindexed != 1 {
 		t.Fatalf("complete=%+v err=%v", complete, err)
+	}
+}
+
+func TestReindexRetryableErrorReschedulesAndUnblocksQueue(t *testing.T) {
+	s, admin := reindexTestStore(t)
+	ctx := context.Background()
+	a := tenant.WithTenant(ctx, "hospital-a")
+	b := tenant.WithTenant(ctx, "hospital-b")
+	reindexPatient(t, s, a, "a", "Smith")
+	jobA, err := s.StartReindex(a, ReindexOptions{BatchSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobB, err := s.StartReindex(b, ReindexOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM resources WHERE tenant_id='hospital-a' AND fhir_id='a' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	batchCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := s.processReindexBatch(batchCtx); err == nil {
+		t.Fatal("expected retryable batch error")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var scheduledIn time.Duration
+	if err := admin.QueryRow(ctx, `SELECT scheduled_at - clock_timestamp() FROM reindex_queue WHERE job_id=$1`, jobA.ID).Scan(&scheduledIn); err != nil {
+		t.Fatal(err)
+	}
+	if scheduledIn < reindexRetryBaseDelay/2 {
+		t.Fatalf("retry not scheduled into the future: %v", scheduledIn)
+	}
+	var attempts int
+	if err := admin.QueryRow(ctx, `SELECT attempts FROM reindex_jobs WHERE job_id=$1`, jobA.ID).Scan(&attempts); err != nil || attempts != 1 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+	if _, err := s.processReindexBatch(ctx); err != nil {
+		t.Fatalf("process other tenant job: %v", err)
+	}
+	bJob, err := s.GetReindex(b, jobB.ID)
+	if err != nil || bJob.Status != "completed" {
+		t.Fatalf("other tenant job=%+v err=%v", bJob, err)
+	}
+	aJob, err := s.GetReindex(a, jobA.ID)
+	if err != nil || aJob.Status != "queued" || aJob.ResourcesReindexed != 0 {
+		t.Fatalf("retried job=%+v err=%v", aJob, err)
+	}
+}
+
+func TestReindexRetryableErrorsFailAfterMaxAttempts(t *testing.T) {
+	s, admin := reindexTestStore(t)
+	ctx := context.Background()
+	a := tenant.WithTenant(ctx, "hospital-a")
+	reindexPatient(t, s, a, "a", "Smith")
+	job, err := s.StartReindex(a, ReindexOptions{BatchSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE reindex_jobs SET attempts = $1 WHERE job_id = $2`, reindexMaxAttempts-1, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM resources WHERE tenant_id='hospital-a' AND fhir_id='a' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	batchCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := s.processReindexBatch(batchCtx); err != nil {
+		t.Fatalf("terminal retry surfaced as error: %v", err)
+	}
+	failed, err := s.GetReindex(a, job.ID)
+	if err != nil || failed.Status != "failed" || !strings.Contains(failed.Error, "attempts") {
+		t.Fatalf("failed job=%+v err=%v", failed, err)
+	}
+	var queued int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM reindex_queue WHERE job_id=$1`, job.ID).Scan(&queued); err != nil || queued != 0 {
+		t.Fatalf("queue rows=%d err=%v", queued, err)
 	}
 }
 
