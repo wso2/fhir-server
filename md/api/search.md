@@ -188,19 +188,18 @@ against `/metadata` — see [CapabilityStatement](./capability-statement.md).
 
 Create a FHIR `SearchParameter` resource and new writes are indexed against it immediately.
 
-:::warning
-Defining a `SearchParameter` does not backfill existing resources, and there is no `$reindex`
-operation ([wso2/fhir-server#11](https://github.com/wso2/fhir-server/issues/11)). An existing
-resource only becomes findable through the new parameter once it is rewritten — for example by a
-no-op `PUT` of its current content. Plan that pass before exposing the parameter to clients.
-:::
+Defining a `SearchParameter` does not backfill existing resources. Start a tenant-scoped
+[`$reindex` job](./operations.md#reindex) after registering or changing a parameter, then poll its
+status until it completes. Reindexing rebuilds search indexes without changing resource content,
+versions, or history. Searches using the changed parameter can return incomplete results during the
+pass.
 
 :::note
-With multiple replicas, a `SearchParameter` created on one is propagated to the others (over
-PostgreSQL `LISTEN/NOTIFY`), so they index new writes against it too. Convergence is eventual and
-has no fixed lag bound; it does not change the no-backfill behavior above. Propagation is off by
-default;
-enable it with `SEARCH_PARAM_WATCH=true` when running multiple replicas — see
+With multiple replicas, enable `SEARCH_PARAM_WATCH=true` so a `SearchParameter` created on one
+replica reaches the others through PostgreSQL `LISTEN/NOTIFY`. Convergence is eventual and has no
+fixed lag bound. Let write replicas converge, or restart replicas with stale definitions, before
+reindexing; a later write from a stale replica can omit the new parameter's index rows. The watcher
+does not backfill existing resources or start reindex jobs. See
 [Configuration](../administration/configuration.md#search-parameter-registry).
 :::
 

@@ -131,6 +131,16 @@ their copy over PostgreSQL `LISTEN/NOTIFY` instead of staying stale until a rest
 search parameters](../api/search.md#custom-search-parameters). It is off by default, so a
 single-node deployment is unaffected; enable it when running more than one replica.
 
+## Reindex jobs
+
+| YAML key | Environment variable | Default | Effect |
+| --- | --- | --- | --- |
+| `reindex.enabled` | `REINDEX_ENABLED` | `false` | Expose the `$reindex` routes and start the background worker. |
+
+Reindexing rebuilds search indexes for existing resources, so it is off by default. Enable it only
+when you need it, and restrict `$reindex` to administrators at your external authorization layer:
+the server has no built-in roles. See [Reindex jobs](deployment.md#reindex-jobs).
+
 ## Implementation Guides
 
 | YAML key | Environment variable | Default |
