@@ -1,0 +1,116 @@
+{
+  "resourceType": "OperationDefinition",
+  "id": "reindex",
+  "url": "https://wso2.github.io/fhir-server/OperationDefinition/reindex.json",
+  "name": "Reindex",
+  "title": "Rebuild tenant search indexes",
+  "status": "draft",
+  "kind": "operation",
+  "date": "2026-09-30",
+  "publisher": "WSO2",
+  "description": "Starts a durable background job that rebuilds all search indexes for selected resources in the current tenant. Returns HTTP 202 with a Parameters resource and Location and Content-Location headers identifying the status endpoint. Poll that endpoint with GET to receive the same output parameters. Normal requests remain available; searches using changed definitions can return incomplete results until the job completes. Reindexing preserves resource content, version, lastUpdated, and history.",
+  "affectsState": true,
+  "code": "reindex",
+  "comment": "Available at the tenant FHIR base and the default tenant base. Only one queued or running job is permitted per tenant. Unfinished jobs resume from their last committed batch after restart. The deployment provides external authorization; the server has no built-in admin role.",
+  "system": true,
+  "type": false,
+  "instance": false,
+  "parameter": [
+    {
+      "name": "resourceType",
+      "use": "in",
+      "min": 0,
+      "max": "1",
+      "type": "code",
+      "documentation": "Select one concrete FHIR R4 resource type. Omit to rebuild all resource types in the selected tenant."
+    },
+    {
+      "name": "batchSize",
+      "use": "in",
+      "min": 0,
+      "max": "1",
+      "type": "integer",
+      "documentation": "Maximum resources selected per database transaction. Defaults to 100; permitted range is 1 through 1000."
+    },
+    {
+      "name": "id",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "string",
+      "documentation": "Job UUID. Read status at [tenant base]/_operations/reindex/{id}."
+    },
+    {
+      "name": "status",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "string",
+      "documentation": "Job state: queued, running, completed, or failed."
+    },
+    {
+      "name": "resourceType",
+      "use": "out",
+      "min": 0,
+      "max": "1",
+      "type": "code",
+      "documentation": "Selected resource type. Omitted for a job covering all resource types."
+    },
+    {
+      "name": "batchSize",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "integer",
+      "documentation": "Requested or default batch size."
+    },
+    {
+      "name": "resourcesReindexed",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "integer",
+      "documentation": "Number of active resources reindexed in committed batches. This is a work counter, not a percentage or an exact total."
+    },
+    {
+      "name": "queuedTime",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "instant",
+      "documentation": "Time the server accepted the job."
+    },
+    {
+      "name": "lastModified",
+      "use": "out",
+      "min": 1,
+      "max": "1",
+      "type": "instant",
+      "documentation": "Time of the latest committed job update."
+    },
+    {
+      "name": "startTime",
+      "use": "out",
+      "min": 0,
+      "max": "1",
+      "type": "instant",
+      "documentation": "Time the worker started the job. Present after processing starts."
+    },
+    {
+      "name": "endTime",
+      "use": "out",
+      "min": 0,
+      "max": "1",
+      "type": "instant",
+      "documentation": "Time the job completed or failed. Present for a terminal job."
+    },
+    {
+      "name": "error",
+      "use": "out",
+      "min": 0,
+      "max": "1",
+      "type": "string",
+      "documentation": "Failure details. Present when a job fails."
+    }
+  ]
+}

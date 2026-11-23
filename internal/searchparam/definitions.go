@@ -27,7 +27,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 )
 
 // ComponentDef describes one component of a composite search parameter.
@@ -83,8 +83,12 @@ type loadStats struct {
 	custom int
 }
 
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // Load reads all definitions from the DB and replaces the current cache.
-func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
+func (r *Registry) Load(ctx context.Context, pool Querier) error {
 	slog.Debug("loading search parameter definitions from database into the in-memory registry")
 	stats, err := r.load(ctx, pool)
 	if err != nil {
@@ -95,7 +99,7 @@ func (r *Registry) Load(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-func (r *Registry) load(ctx context.Context, pool *pgxpool.Pool) (loadStats, error) {
+func (r *Registry) load(ctx context.Context, pool Querier) (loadStats, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT resource_type, param_name, param_type, fhirpath_expr, is_custom, ig_source,
 		       COALESCE(target_types, ''), COALESCE(components_json, '')

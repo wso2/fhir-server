@@ -1600,6 +1600,24 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 		resources = append(resources, entry)
 	}
 
+	operations := []any{
+		map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"},
+		map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Encounter-everything"},
+		map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Group-everything"},
+		map[string]any{"name": "validate", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"},
+		map[string]any{"name": "meta", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta"},
+		map[string]any{"name": "meta-add", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-add"},
+		map[string]any{"name": "meta-delete", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete"},
+		map[string]any{"name": "convert", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-convert"},
+		map[string]any{"name": "lastn", "definition": "http://hl7.org/fhir/OperationDefinition/Observation-lastn"},
+		map[string]any{"name": "document", "definition": "http://hl7.org/fhir/OperationDefinition/Composition-document"},
+	}
+	if h.reindexEnabled {
+		operations = append([]any{
+			map[string]any{"name": "reindex", "definition": "https://wso2.github.io/fhir-server/OperationDefinition/reindex.json"},
+		}, operations...)
+	}
+
 	cs := map[string]any{
 		"resourceType": "CapabilityStatement",
 		"status":       "active",
@@ -1626,18 +1644,7 @@ func (h *fhirHandler) metadata(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"code": "batch"},
 				map[string]any{"code": "history-system"},
 			},
-			"operation": []any{
-				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"},
-				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Encounter-everything"},
-				map[string]any{"name": "everything", "definition": "http://hl7.org/fhir/OperationDefinition/Group-everything"},
-				map[string]any{"name": "validate", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"},
-				map[string]any{"name": "meta", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta"},
-				map[string]any{"name": "meta-add", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-add"},
-				map[string]any{"name": "meta-delete", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete"},
-				map[string]any{"name": "convert", "definition": "http://hl7.org/fhir/OperationDefinition/Resource-convert"},
-				map[string]any{"name": "lastn", "definition": "http://hl7.org/fhir/OperationDefinition/Observation-lastn"},
-				map[string]any{"name": "document", "definition": "http://hl7.org/fhir/OperationDefinition/Composition-document"},
-			},
+			"operation": operations,
 		}},
 	}
 	writeFHIR(w, r, http.StatusOK, cs)

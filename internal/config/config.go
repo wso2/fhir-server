@@ -48,6 +48,7 @@ type Config struct {
 	IGCacheDir     string   // local .tgz cache dir (default: .fhir-ig-cache)
 	Validation     ValidationConfig
 	SearchParams   SearchParamsConfig
+	Reindex        ReindexConfig
 	TerminologyURL string // base URL of the FHIR terminology server for :in/:not-in (empty = disabled)
 	CreateTables   bool   // create database tables on startup (requires a DB role with DDL privileges; default off)
 
@@ -107,6 +108,15 @@ type SearchParamsConfig struct {
 	// changes made by other replicas over Postgres LISTEN/NOTIFY. Off by default;
 	// enable it when running more than one replica. Env: SEARCH_PARAM_WATCH.
 	Watch bool
+}
+
+// ReindexConfig groups the reindex job settings.
+type ReindexConfig struct {
+	// Enabled exposes the $reindex routes and starts the background worker.
+	// Off by default: reindexing rewrites search indexes for existing resources,
+	// so it should be enabled deliberately and restricted to administrators.
+	// Env: REINDEX_ENABLED.
+	Enabled bool
 }
 
 // FileConfig is the on-disk YAML schema. Each field is optional — anything
@@ -178,6 +188,12 @@ type FileConfig struct {
 	SearchParams struct {
 		Watch *bool `yaml:"watch"`
 	} `yaml:"searchParams"`
+
+	// Reindex settings. Pointer so an absent key is distinguishable from an
+	// explicit `false`.
+	Reindex struct {
+		Enabled *bool `yaml:"enabled"`
+	} `yaml:"reindex"`
 }
 
 // Load reads configuration using the env-var-based discovery path. The
@@ -338,6 +354,11 @@ func resolve(fc *FileConfig) (*Config, error) {
 		return nil, err
 	}
 
+	reindexEnabled, err := resolveBoolSetting(false, fc.Reindex.Enabled, "REINDEX_ENABLED")
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		DatabaseURL:         dbURL,
 		Port:                serverPort,
@@ -349,6 +370,7 @@ func resolve(fc *FileConfig) (*Config, error) {
 		IGCacheDir:          igCacheDir,
 		Validation:          validation,
 		SearchParams:        SearchParamsConfig{Watch: searchParamsWatch},
+		Reindex:             ReindexConfig{Enabled: reindexEnabled},
 		TerminologyURL:      terminologyURL,
 		CreateTables:        createTables,
 		ReadTimeout:         readTimeout,
