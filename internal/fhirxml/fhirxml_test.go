@@ -148,6 +148,43 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFromXML_NestedResources(t *testing.T) {
+	m, err := FromXML([]byte(`<Bundle xmlns="http://hl7.org/fhir"><type value="transaction"/><entry><resource><Patient><name><family value="A"/></name></Patient></resource></entry></Bundle>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, _ := m["entry"].(map[string]any)
+	resource, _ := entry["resource"].(map[string]any)
+	if resource["resourceType"] != "Patient" {
+		t.Fatalf("entry.resource: want a Patient, got %v", entry["resource"])
+	}
+	name, _ := resource["name"].(map[string]any)
+	if name["family"] != "A" {
+		t.Errorf("entry.resource.name.family: got %v", resource["name"])
+	}
+}
+
+func TestToXML_NestedResources(t *testing.T) {
+	out, err := ToXML(map[string]any{
+		"resourceType": "Patient",
+		"contained":    []any{map[string]any{"resourceType": "Practitioner", "id": "p1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "<Practitioner") {
+		t.Fatalf("contained resource must be wrapped in an element named after its type, got %s", out)
+	}
+	back, err := FromXML(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contained, _ := back["contained"].(map[string]any)
+	if contained["resourceType"] != "Practitioner" || contained["id"] != "p1" {
+		t.Errorf("round trip: got contained %v", back["contained"])
+	}
+}
+
 func TestToXML_RejectsInvalidElementName(t *testing.T) {
 	cases := []map[string]any{
 		{"resourceType": "Patient", "injected><forged": "x"},
