@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wso2/fhir-server/internal/handler"
 	"github.com/wso2/fhir-server/internal/store"
 	"github.com/wso2/fhir-server/internal/tenant"
 )
@@ -52,7 +53,7 @@ func TestReindexStart(t *testing.T) {
 				}
 				return store.ReindexJob{ID: reindexJobID, Status: "queued", ResourceType: options.ResourceType, BatchSize: 100, QueuedTime: queued, LastModified: queued}, nil
 			}}
-			rr := do(t, newRouter(s), http.MethodPost, tc.path, tc.body)
+			rr := do(t, newRouter(s, handler.Options{ReindexEnabled: true}), http.MethodPost, tc.path, tc.body)
 			if rr.Code != http.StatusAccepted {
 				t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
 			}
@@ -96,7 +97,7 @@ func TestReindexRejectsInvalidBody(t *testing.T) {
 			}}
 			rr := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/fhir/r4/$reindex", strings.NewReader(tc.body))
-			newRouter(s).ServeHTTP(rr, req)
+			newRouter(s, handler.Options{ReindexEnabled: true}).ServeHTTP(rr, req)
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
 			}
@@ -120,7 +121,7 @@ func TestReindexStartErrors(t *testing.T) {
 			s := &mockStore{startReindexFn: func(context.Context, store.ReindexOptions) (store.ReindexJob, error) {
 				return store.ReindexJob{}, tc.err
 			}}
-			rr := do(t, newRouter(s), http.MethodPost, "/fhir/r4/$reindex", nil)
+			rr := do(t, newRouter(s, handler.Options{ReindexEnabled: true}), http.MethodPost, "/fhir/r4/$reindex", nil)
 			if rr.Code != tc.status {
 				t.Fatalf("status = %d", rr.Code)
 			}
@@ -137,7 +138,7 @@ func TestReindexStatusTenantIsolation(t *testing.T) {
 		}
 		return store.ReindexJob{ID: id, Status: "failed", ResourceType: "Patient", BatchSize: 25, ResourcesReindexed: 50, QueuedTime: started, LastModified: ended, StartTime: &started, EndTime: &ended, Error: "search parameter definitions changed; start a new reindex job"}, nil
 	}}
-	router := newRouter(s)
+	router := newRouter(s, handler.Options{ReindexEnabled: true})
 	rr := do(t, router, http.MethodGet, "/t/hospital-a/fhir/r4/_operations/reindex/"+reindexJobID, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
@@ -150,6 +151,22 @@ func TestReindexStatusTenantIsolation(t *testing.T) {
 		rr := do(t, router, http.MethodGet, path, nil)
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d", path, rr.Code)
+		}
+	}
+}
+
+func TestReindexRoutesDisabledByDefault(t *testing.T) {
+	router := newRouter(&mockStore{})
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodPost, "/fhir/r4/$reindex"},
+		{http.MethodPost, "/t/hospital-a/fhir/r4/$reindex"},
+		{http.MethodGet, "/fhir/r4/_operations/reindex/" + reindexJobID},
+	} {
+		rr := do(t, router, tc.method, tc.path, nil)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want 404", tc.method, tc.path, rr.Code)
 		}
 	}
 }
@@ -178,7 +195,7 @@ func TestReindexStructuredBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/fhir/r4/$reindex", strings.NewReader(`<Parameters xmlns="http://hl7.org/fhir"><parameter><name value="resourceType"/><valueCode value="Patient"/></parameter><parameter><name value="batchSize"/><valueInteger value="25"/></parameter></Parameters>`))
 	req.Header.Set("Content-Type", "application/fhir+xml")
 	rr := httptest.NewRecorder()
-	newRouter(s).ServeHTTP(rr, req)
+	newRouter(s, handler.Options{ReindexEnabled: true}).ServeHTTP(rr, req)
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
 	}

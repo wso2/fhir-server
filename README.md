@@ -31,7 +31,7 @@ Key capabilities:
 - **Full FHIR REST API** — CRUD with versioning and history, conditional interactions, batch/transaction bundles, `$everything`, `$validate`, and a generated CapabilityStatement.
 - **Rich search** — string, token, date, reference, number, quantity, URI and composite parameters, with modifiers, chaining, `_include`/`_revinclude`, and custom `SearchParameter` registration.
 - **Validation** — base-spec checks and referential integrity (on both writes and deletes) enforced by default, opt-in profile validation against loaded Implementation Guides, and `$validate` to test resources without storing them.
-- **Reindexing** — tenant-scoped background `$reindex` jobs with progress polling and restart recovery to rebuild existing search indexes.
+- **Reindexing** — tenant-scoped background `$reindex` jobs with progress polling and restart recovery to rebuild existing search indexes. Disabled by default; opt in with `REINDEX_ENABLED=true`.
 - **Implementation Guides** — configure IG packages to load at startup; their profiles and search parameters feed validation and the CapabilityStatement.
 - **Terminology** — externalized by design: point the server at any standard FHIR terminology service (e.g. the [WSO2 FHIR terminology service](https://github.com/wso2/open-healthcare-prebuilt-services/tree/main/miscellaneous/terminology-service)) and searches like `code:in=<value-set>` (any code in a value set) or `code:below=<code>` (a code and its descendants) just work.
 - **Multi-tenancy** — physical (per-tenant server and database) or logical (shared) isolation models.
@@ -65,6 +65,12 @@ curl -s -X POST http://localhost:9090/fhir/r4/Patient \
 Follow the **[Quickstart Guide](https://wso2.github.io/fhir-server/docs/get-started/quickstart/)** for the full walkthrough, or the **[Deployment Guide](https://wso2.github.io/fhir-server/docs/administration/deployment/)** to build from source and run against your own PostgreSQL. For Kubernetes, deploy with the **[Helm chart](./helm/)**.
 
 Don't want to set anything up yourself? Try the hosted demo at **[fhir-explorer.openhealthcare.wso2.com](https://fhir-explorer.openhealthcare.wso2.com/)**.
+
+## Security model
+
+The server does not perform authentication or authorization itself. It assumes a gateway, service mesh, or reverse proxy in front of it terminates TLS and enforces identity, roles, and access policy. Run it only behind such a layer.
+
+Administrative operations must be restricted there. In particular, `$reindex` rewrites search indexes for existing resources and is disabled by default; enable it with `REINDEX_ENABLED=true` only when your gateway allows the route to administrators. See the **[Deployment Guide](https://wso2.github.io/fhir-server/docs/administration/deployment/)** for details.
 
 ## Documentation
 

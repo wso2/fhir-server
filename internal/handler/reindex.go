@@ -117,6 +117,10 @@ func (h *fhirHandler) reindexOptions(body map[string]any, empty, structured bool
 	return options, nil
 }
 
+func (h *fhirHandler) reindexDisabled(w http.ResponseWriter, _ *http.Request) {
+	operationOutcome(w, http.StatusNotFound, "error", "not-found", "reindex is disabled")
+}
+
 func (h *fhirHandler) reindexStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "jobId")
 	jobID, err := uuid.Parse(id)

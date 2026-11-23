@@ -39,8 +39,9 @@ The server rebuilds all search parameters for each selected resource and preserv
 | Read its status | `GET /t/{tenant}/fhir/r4/_operations/reindex/{jobId}` |
 
 The bare paths under `/fhir/r4` select the default tenant. A job covers that tenant alone; its status
-returns `404` from another tenant's path. The server uses the deployment's existing external
-authorization layer for these routes. It has no built-in admin role.
+returns `404` from another tenant's path. Reindexing is disabled by default: set `REINDEX_ENABLED=true`
+to expose these routes and advertise the operation. The server has no built-in roles, so restrict
+`$reindex` to administrators in the deployment's external authorization layer.
 
 ### Start a job
 

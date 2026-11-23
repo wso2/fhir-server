@@ -93,6 +93,12 @@ written without the new parameter. See
 
 ## Reindex jobs
 
+Reindexing is off by default. Set `REINDEX_ENABLED=true` to expose the
+[`$reindex` routes](../api/operations.md#reindex) and start the worker; the
+CapabilityStatement advertises the operation only when it is enabled. The server has no built-in
+roles, so restrict `$reindex` to administrators in the external authorization layer described in the
+deployment checklist.
+
 Start a [`$reindex` job](../api/operations.md#reindex) for each affected tenant after changing custom
 or IG search parameters. Jobs do not start on definition changes. Choose an optional resource type
 to restrict the pass and a batch size from 1 to 1000 resources (default 100).

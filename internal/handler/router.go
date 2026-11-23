@@ -53,6 +53,10 @@ type Options struct {
 	// MaxRequestBodyBytes caps how much of any request body is read before a 413.
 	// Zero selects the built-in default (defaultMaxRequestBodyBytes).
 	MaxRequestBodyBytes int64
+	// ReindexEnabled exposes the $reindex routes and advertises the operation.
+	// Controlled by REINDEX_ENABLED; default off. Reindexing should be an
+	// administrator-only operation, so enable it deliberately.
+	ReindexEnabled bool
 }
 
 // NewRouter constructs the chi router. An optional Options controls validation
@@ -89,6 +93,7 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 		baseDefs:        basedef.NewCache(pool),
 		maxBodyBytes:    maxBodyBytes,
 		serverVersion:   version.Current(),
+		reindexEnabled:  opt.ReindexEnabled,
 	}
 
 	// Health probes
@@ -127,8 +132,13 @@ func NewRouter(s StoreAPI, pool *pgxpool.Pool, registry *searchparam.Registry, b
 			r.Post("/$validate", h.validateSystem) // POST [base]/$validate
 			r.Post("/$convert", h.convert)         // POST [base]/$convert
 			r.Get("/$meta", h.metaSystem)          // GET  [base]/$meta
-			r.Post("/$reindex", h.startReindex)
-			r.Get("/_operations/reindex/{jobId}", h.reindexStatus)
+			if h.reindexEnabled {
+				r.Post("/$reindex", h.startReindex)
+				r.Get("/_operations/reindex/{jobId}", h.reindexStatus)
+			} else {
+				r.Post("/$reindex", h.reindexDisabled)
+				r.Get("/_operations/reindex/{jobId}", h.reindexDisabled)
+			}
 
 			// System-level transaction / batch Bundle (trailing-slash form)
 			r.Post("/", h.bundle)
@@ -231,7 +241,8 @@ type fhirHandler struct {
 	refIntegrity    bool           // referential integrity enforced by the store (CapabilityStatement advertisement)
 	baseDefs        *basedef.Cache // memoized base StructureDefinition lookup by resource type
 	maxBodyBytes    int64          // request body cap in bytes (413 on overflow)
-	serverVersion   string         // server release version for CapabilityStatement.software.version
+	serverVersion   string         // server release version for CapabilityStatement.software
+	reindexEnabled  bool           // expose $reindex routes and advertise the operation when true
 }
 
 type dbPinger interface {

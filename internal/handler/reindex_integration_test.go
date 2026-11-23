@@ -38,7 +38,7 @@ func TestIntegration_ReindexHTTPBackfillsTenant(t *testing.T) {
 	s := store.New(pool, registry)
 	var ready atomic.Int32
 	ready.Store(1)
-	srv := httptest.NewServer(handler.NewRouter(s, pool, registry, "http://test-server/fhir/r4", &ready, handler.Options{DisableBaseValidation: true}))
+	srv := httptest.NewServer(handler.NewRouter(s, pool, registry, "http://test-server/fhir/r4", &ready, handler.Options{DisableBaseValidation: true, ReindexEnabled: true}))
 	t.Cleanup(srv.Close)
 	base := "/t/hospital-a/fhir/r4"
 	otherBase := "/t/hospital-b/fhir/r4"
