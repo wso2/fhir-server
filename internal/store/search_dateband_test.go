@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wso2/fhir-server/internal/searchparam"
 )
 
 func TestSearchBandEnd(t *testing.T) {
@@ -153,5 +155,18 @@ func TestApplyLastUpdated_InvalidDateSetsError(t *testing.T) {
 	var invalid *InvalidParamError
 	if !errors.As(b.err, &invalid) {
 		t.Fatalf("b.err = %v, want *InvalidParamError", b.err)
+	}
+}
+
+func TestApplyParam_EmptyDateValueIgnored(t *testing.T) {
+	reg := searchparam.NewRegistry()
+	reg.Upsert(searchparam.Definition{ResourceType: "Patient", ParamName: "birthdate", ParamType: "date"})
+
+	for _, key := range []string{"birthdate", "birthdate:not", "_lastUpdated"} {
+		b := &queryBuilder{rt: "Patient", reg: reg}
+		b.applyParam(key, "")
+		if b.err != nil || b.where.Len() != 0 {
+			t.Errorf("Patient?%s=: b.err = %v, where = %q, want no error and no filter", key, b.err, b.where.String())
+		}
 	}
 }
