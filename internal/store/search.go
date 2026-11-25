@@ -499,7 +499,9 @@ func (b *queryBuilder) applyParam(rawKey, value string) {
 			b.and("(" + strings.Join(ors, " OR ") + ")")
 		}
 	case "_lastUpdated":
-		b.applyLastUpdated(value)
+		if value != "" {
+			b.applyLastUpdated(value)
+		}
 	case "_text", "_content":
 		p := b.next(value)
 		b.and(fmt.Sprintf("r.search_text @@ plainto_tsquery('english', %s)", p))
@@ -549,7 +551,7 @@ func (b *queryBuilder) applySearchParam(param, modifier, value string) {
 	// FHIR R4 search: empty parameters are ignored, not an error.
 	if value == "" {
 		switch b.resolvedParamType(param) {
-		case "number", "quantity":
+		case "number", "quantity", "date":
 			return
 		}
 	}
