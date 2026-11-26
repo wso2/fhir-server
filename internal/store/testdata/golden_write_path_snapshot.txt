@@ -13,19 +13,23 @@ pat-new|Patient|1|POST|<TS>|{"birthDate":"1991-06-15","gender":"other","id":"pat
 pat-update|Patient|1|POST|<TS>|{"birthDate":"1980-01-01","gender":"other","id":"pat-update","identifier":[{"system":"http://example.org/mrn","value":"MRN-Original"}],"meta":{"lastUpdated":"<TS>","versionId":"1"},"name":[{"family":"Original","given":["OG"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
 pat-update|Patient|2|PUT|<TS>|{"birthDate":"1980-01-02","gender":"other","id":"pat-update","identifier":[{"system":"http://example.org/mrn","value":"MRN-Updated"}],"meta":{"lastUpdated":"<TS>","versionId":"2"},"name":[{"family":"Updated","given":["Newname"]}],"resourceType":"Patient","telecom":[{"system":"phone","value":"555-0100"}]}
 
-=== sp_string (12 rows) ===
+=== sp_string (16 rows) ===
 org-existing|Organization|name|Existing Org|existing org
 org-existing|Organization|phonetic|Existing Org|existing org
 org-new|Organization|name|Brand New Org|brand new org
 org-new|Organization|phonetic|Brand New Org|brand new org
 pat-new|Patient|family|Newman|newman
 pat-new|Patient|given|Alfred|alfred
-pat-new|Patient|name|map[family:Newman given:[Alfred]]|map[family:newman given:[alfred]]
-pat-new|Patient|phonetic|map[family:Newman given:[Alfred]]|map[family:newman given:[alfred]]
+pat-new|Patient|name|Alfred|alfred
+pat-new|Patient|name|Newman|newman
+pat-new|Patient|phonetic|Alfred|alfred
+pat-new|Patient|phonetic|Newman|newman
 pat-update|Patient|family|Updated|updated
 pat-update|Patient|given|Newname|newname
-pat-update|Patient|name|map[family:Updated given:[Newname]]|map[family:updated given:[newname]]
-pat-update|Patient|phonetic|map[family:Updated given:[Newname]]|map[family:updated given:[newname]]
+pat-update|Patient|name|Newname|newname
+pat-update|Patient|name|Updated|updated
+pat-update|Patient|phonetic|Newname|newname
+pat-update|Patient|phonetic|Updated|updated
 
 === sp_token (15 rows) ===
 obs-new|Observation|category|http://terminology.hl7.org/CodeSystem/observation-category|vital-signs||<TS>

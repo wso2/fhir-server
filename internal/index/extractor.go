@@ -187,14 +187,63 @@ func (e *Extractor) appendParam(rs *RowSet, resourceType, resourceID string, res
 
 // ─── sp_string ────────────────────────────────────────────────────────────────
 
+// appendString buffers sp_string rows for a string search param. A plain string
+// becomes one row; a complex value (HumanName, Address) becomes one row per
+// text part listed in stringParts.
 func appendString(rs *RowSet, rt, rid, param string, vals []any) {
-	for _, v := range vals {
-		s := asString(v)
+	seen := map[string]struct{}{}
+	// add buffers one row, skipping empty and already-seen strings. Complex values
+	// fan out into many rows, so the row cap is enforced here rather than only
+	// between params in Extract.
+	add := func(s string) {
 		if s == "" {
-			continue
+			return
 		}
+		if _, dup := seen[s]; dup {
+			return
+		}
+		if rs.atLimit() {
+			rs.LimitHit = true
+			return
+		}
+		seen[s] = struct{}{}
 		rs.spString = append(rs.spString, []any{rs.tenant, rid, rt, param, s, strings.ToLower(s)})
 	}
+	for _, v := range vals {
+		if rs.LimitHit {
+			return
+		}
+		if m, ok := v.(map[string]any); ok {
+			// HumanName / Address: index each text part (family, given, city, ...)
+			// as its own row, so a search matches if any one part matches.
+			matched := false
+			for _, k := range stringParts {
+				switch p := m[k].(type) {
+				case string:
+					matched = true
+					add(p)
+				case []any:
+					matched = true
+					for _, e := range p {
+						add(asString(e))
+					}
+				}
+			}
+			if matched {
+				continue
+			}
+			// Any other object (e.g. an Identifier behind a custom param) has none
+			// of those parts; keep indexing its text as before rather than dropping it.
+		}
+		add(asString(v))
+	}
+}
+
+// stringParts are the text-bearing fields of HumanName and Address, the complex
+// types a string search param (Patient.name, Patient.address) can point at.
+var stringParts = []string{
+	"family", "given", "prefix", "suffix", "text", // HumanName
+	"line", "city", "district", "state", "postalCode", "country", // Address
 }
 
 // ─── sp_token ─────────────────────────────────────────────────────────────────
